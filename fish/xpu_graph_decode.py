@@ -1,3 +1,5 @@
+# Derived from fishaudio/fish-speech. Licensed under the Fish Audio Research License (patches/LICENSE-FISH-AUDIO.md).
+# Built with Fish Audio.
 """XPU-graph decoding for Fish S2 Pro (DualAR): replaces fish_speech's `generate` with a version whose per-frame step
 (slow transformer + 10 fast-codebook passes + sampling + RAS window + bookkeeping, ~1000 kernels) is captured once per
 KV-length bucket as a torch.xpu.XPUGraph and replayed, so the CPU launches 1 graph per frame instead of ~1000 kernels.

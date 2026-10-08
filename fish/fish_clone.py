@@ -1,3 +1,5 @@
+# Derived from fishaudio/fish-speech. Licensed under the Fish Audio Research License (patches/LICENSE-FISH-AUDIO.md).
+# Built with Fish Audio.
 """Batched Fish Audio S2 Pro voice cloning on an Intel Arc B70 (XPU), from a TSV of lines.
 
 Each row of the lines TSV is `out_name<TAB>voice<TAB>text[<TAB>ref_text]`:

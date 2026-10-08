@@ -1,3 +1,5 @@
+# Derived from fishaudio/fish-speech. Licensed under the Fish Audio Research License (patches/LICENSE-FISH-AUDIO.md).
+# Built with Fish Audio.
 """Single-line Fish Audio S2 Pro benchmark on an Intel Arc B70: the stock fish_speech generate_long path, plus the
 single-line speedups (KV-length bucketing, XPU-graph decode) and the ones that did not help (int8, torch.compile).
 

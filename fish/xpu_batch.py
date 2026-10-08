@@ -1,3 +1,5 @@
+# Derived from fishaudio/fish-speech. Licensed under the Fish Audio Research License (patches/LICENSE-FISH-AUDIO.md).
+# Built with Fish Audio.
 """Batched + XPU-graph generation for Fish Audio S2 Pro (DualAR) on an Intel Arc B70.
 
 At batch 1 the decode is weight-bandwidth bound (~15 GB of bf16 weights read per frame: 36 slow layers + 4 fast

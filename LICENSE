@@ -21,8 +21,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -------------------------------------------------------------------------------
-This MIT license covers the original scripts in this repository (qwen/, fish/,
+This MIT license covers the original scripts in this repository (qwen/,
 setup.sh, bench/, examples/). It does NOT cover:
+
+- fish/, which closely follows fish-speech internals and is distributed under the
+  Fish Audio Research License (patches/LICENSE-FISH-AUDIO.md, NOTICE).
 
 - patches/fish-speech-xpu.patch, which modifies Fish Audio's fish-speech code and
   is distributed under the Fish Audio Research License (patches/LICENSE-FISH-AUDIO.md,

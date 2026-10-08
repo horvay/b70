@@ -14,6 +14,9 @@ This repository contains a patch to Fish Audio's fish-speech software:
     left-padded prompts; an optional sub-vocabulary output head (semantic tokens + <|im_end|>); single-query GQA
     attention without repeat_interleave.
 
+The scripts in fish/ follow fish-speech internals (prompt building, sampling, encode_audio) and are also
+distributed under the Fish Audio Research License.
+
 Built with Fish Audio.
 
 Qwen3-TTS (pip package qwen-tts 0.1.1 and the Qwen/Qwen3-TTS-12Hz-1.7B-* weights) is used unmodified, under the
