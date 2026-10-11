@@ -1,0 +1,4 @@
+[submodule "exllamav3"]
+	path = exllamav3
+	url = https://github.com/horvay/exllamav3.git
+	branch = b70-xpu

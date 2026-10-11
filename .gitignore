@@ -1,0 +1,12 @@
+# local state, logs, caches, backups
+run/
+cache/
+__pycache__/
+*.pyc
+# built extension modules (xpu/build.sh)
+*.so
+# upstream clones and local reference data (not ours / too large)
+glm-flash-lite/
+moetier/
+ref/
+pylib/

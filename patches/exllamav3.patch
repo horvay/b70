@@ -1,0 +1,518 @@
+diff --git a/exllamav3/ext.py b/exllamav3/ext.py
+index a6c6347..40631ad 100644
+--- a/exllamav3/ext.py
++++ b/exllamav3/ext.py
+@@ -26,7 +26,10 @@ def is_precompiled_extension_available():
+         for suffix in importlib.machinery.EXTENSION_SUFFIXES
+     )
+ 
+-if is_precompiled_extension_available():
++if os.environ.get("EXL3_XPU") == "1":
++    # Intel XPU port: a Python shim (glm-b70 xpu/exllamav3_ext) stands in for the CUDA extension
++    import exllamav3_ext
++elif is_precompiled_extension_available():
+     import exllamav3_ext
+ else:
+ 
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index f7ed466..c974b92 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -1119,7 +1119,7 @@ class Generator:
+                 token_logits = batch_logits[a:b, :, :]
+                 sampled = job.receive_logits(token_logits)
+                 next_token = sampled[0]
+-                if next_token.is_cuda and next_token.numel() == 1:
++                if next_token.device.type != "cpu" and next_token.numel() == 1:
+                     k = len(launched)
+                     pinned[k:k + 1].copy_(next_token.view(1, 1), non_blocking = True)
+                     sampled = (pinned[k:k + 1],) + sampled[1:]
+diff --git a/exllamav3/generator/job.py b/exllamav3/generator/job.py
+index 5428773..eb5d60f 100644
+--- a/exllamav3/generator/job.py
++++ b/exllamav3/generator/job.py
+@@ -7,9 +7,12 @@ from ..constants import PAGE_SIZE
+ import numpy as np
+ from .pagetable import Sequence, tensor_hash_checksum, random_hash
+ from .filter import Filter
++import os
+ import random
+ import time
+ from ..ext import exllamav3_ext as ext
++
++_INPASS_CKPT = os.environ.get("EXL3_INPASS_CKPT", "1") == "1"
+ from .loop_detect import LoopDetector
+ from .sampler import Sampler, DefaultSampler
+ from ..util.tensor import SeqTensor
+@@ -1304,10 +1307,16 @@ class Job:
+ 
+             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
+             recurrent_last_page = False
++            inpass_ckpt = None
+             if self.generator.recurrent_cache is not None:
+                 seqlen = len(seq.sequence_ids) - 1
+                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
+-                if prefill_start < last_page_b <= prefill_end:
++                if prefill_start < last_page_b < prefill_end and _INPASS_CKPT and len(self.sequences) == 1 \
++                        and not self.embeddings and not self.generator.draft_model:
++                    # glm-b70: the recurrent layers stash the checkpoint state at last_page_b inside this forward
++                    # (GatedDeltaNet "recurrent_ckpt_offset") instead of a second forward for the last page
++                    inpass_ckpt = last_page_b
++                elif prefill_start < last_page_b <= prefill_end:
+                     prefill_end = last_page_b
+                     recurrent_last_page = True
+                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+@@ -1388,6 +1397,9 @@ class Job:
+                     "inv_freq": self.alt_rope_freqs,
+                     "mm_span_prefix": mm_span_prefix,
+                 }
++                if inpass_ckpt is not None:
++                    params["recurrent_ckpt_offset"] = inpass_ckpt - prefill_start
++                    params["recurrent_ckpt_side"] = {}
+                 if self.generator.draft_model:
+                     params.update(self.generator.draft_model.draft_verifier_params)
+                 if self.generator.mtp_draft:
+@@ -1463,6 +1475,8 @@ class Job:
+ 
+                 if recurrent_last_page:
+                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
++                elif inpass_ckpt is not None:
++                    self._put_inpass_checkpoint(inpass_ckpt, params["recurrent_ckpt_side"])
+ 
+ 
+         if progress:
+@@ -1620,6 +1634,25 @@ class Job:
+             self.last_recurrent_checkpoint_pos = seq.kv_position
+ 
+ 
++    def _put_inpass_checkpoint(self, pos: int, side: dict):
++        """glm-b70: store the checkpoint the recurrent layers stashed at `pos` during the last forward (what
++        maybe_stash_recurrent would store after a separate forward ending at pos)."""
++        rs = self.recurrent_state
++        layers = self.generator.cache.get_all_recurrent_layers()
++        if len(side) != len(layers) or self.last_recurrent_checkpoint_pos == pos:
++            return
++        seq = self.sequences[0]
++        page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
++        assert page.kv_position == PAGE_SIZE
++        stashed = {"position": pos, "checkpoint_size": rs.checkpoint_size, **side}
++
++        class _Stashed:
++            def stash(self):
++                return stashed
++        self.generator.recurrent_cache.put(page.phash, _Stashed())
++        self.last_recurrent_checkpoint_pos = pos
++
++
+     def find_recurrent_stash(self, target_pos: int):
+         """
+         Return the most recent page-aligned recurrent state stash at or before target_pos, refreshing its LRU
+diff --git a/exllamav3/modules/attention_fn/dsa_triton.py b/exllamav3/modules/attention_fn/dsa_triton.py
+index 68e6c39..60812f6 100644
+--- a/exllamav3/modules/attention_fn/dsa_triton.py
++++ b/exllamav3/modules/attention_fn/dsa_triton.py
+@@ -1003,6 +1003,11 @@ def dsa_attn(
+         # halve the head tile (perf is irrelevant with asserts on)
+         num_stages = min(num_stages, 2)
+         block_h = min(block_h, 16)
++    if q.device.type == "xpu":
++        # Intel Xe2 (B70): the one-shot kernel's (32 x 512) fp32 accumulator with 3 stages does not fit the register
++        # file / SLM and the launch fails with UR_RESULT_ERROR_OUT_OF_RESOURCES (fatal, not a Triton OutOfResources)
++        num_stages = min(num_stages, int(os.environ.get("GLM_XPU_DSA_STAGES", "2")))
++        block_h = min(block_h, int(os.environ.get("GLM_XPU_DSA_BLOCK_H", "16")))
+     if dsa_debug_bounds:
+         pool_rows = pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
+         dbg_pages = -(-pool_rows // max(page_size, 1))
+diff --git a/exllamav3/modules/attention_fn/mla_triton.py b/exllamav3/modules/attention_fn/mla_triton.py
+index bf3c114..69f81d1 100644
+--- a/exllamav3/modules/attention_fn/mla_triton.py
++++ b/exllamav3/modules/attention_fn/mla_triton.py
+@@ -783,7 +783,8 @@ _mha_block_m = {}
+ def _get_sm_count(device: torch.device) -> int:
+     idx = device.index if hasattr(device, "index") else device
+     if idx not in _sm_count:
+-        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
++        p = torch.cuda.get_device_properties(idx)
++        _sm_count[idx] = getattr(p, "multi_processor_count", None) or getattr(p, "gpu_subslice_count", None) or getattr(p, "max_compute_units", 256) // 8
+     return _sm_count[idx]
+ 
+ 
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index 359159f..8494f63 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -815,7 +815,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+                 optional = True,
+                 allow_bf16 = True,
+             )
+-        if device is not None and torch.device(device).type == "cuda":
++        if device is not None and torch.device(device).type in ("cuda", "xpu"):
+             self.cpu_post_load()
+             self.load_local(**kwargs)
+             self.load_routing(**kwargs)
+diff --git a/exllamav3/modules/gated_delta_net.py b/exllamav3/modules/gated_delta_net.py
+index f3cc5e9..3e5b14f 100644
+--- a/exllamav3/modules/gated_delta_net.py
++++ b/exllamav3/modules/gated_delta_net.py
+@@ -30,6 +30,9 @@ from ..util import profile_opt
+ from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+ 
+ 
++_KDA_SUB = int(os.environ.get("EXL3_KDA_SUBCHUNK", "2048"))   # glm-b70: prefill split (GatedDeltaNet.forward)
++
++
+ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+     """Split a batch of recurrent-layer states into per-device (conv_jobs, state_jobs) for the
+     batched rewind kernels. With layer-split loading a single cache's GDN layers span multiple
+@@ -40,7 +43,7 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+     falls back to its own .rewind() call, unchanged."""
+     jobs_by_device = {}
+     for l in layers:
+-        if isinstance(l, GDNLayerState):
++        if isinstance(l, GDNLayerState) and os.environ.get("EXL3_XPU") != "1":     # XPU: no batched rewind kernels
+             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
+             # torch.device, so normalize rather than assume a .index attribute
+             device_index = torch.device(l.device).index
+@@ -1023,6 +1026,35 @@ class GatedDeltaNet(Module):
+             save_state = False
+             save_history = False  # no SD without prior state, for simplicity
+ 
++        # glm-b70: prompt checkpoint inside the pass (Job.prefill, "recurrent_ckpt_offset"): the layer runs its first c
++        # tokens, stashes its state for the checkpoint at that position, then runs the rest. The same split as the
++        # separate last-page forward the job would otherwise make (c is page-aligned, so KDA chunk boundaries match),
++        # without running every other module, and fetching every routed expert, a second time
++        # Long prompts split the same way every _KDA_SUB tokens (a multiple of the 64-token KDA chunk, so the
++        # result is unchanged): the layer's prefill activations (~200 KB per token) bounded the prompt chunk size
++        c = params.get("recurrent_ckpt_offset")
++        if rsg and not rsg[0].exported and bsz == 1 and not save_history and \
++                ((c and 0 < c < seqlen) or 0 < _KDA_SUB < seqlen):
++            cuts = set(range(_KDA_SUB, seqlen, _KDA_SUB)) if _KDA_SUB > 0 else set()
++            if c and 0 < c < seqlen:
++                cuts.add(c)
++            bounds = [0] + sorted(cuts) + [seqlen]
++            p1 = {k: v for k, v in params.items() if k != "recurrent_ckpt_offset"}
++            out = None
++            for a, b in zip(bounds[:-1], bounds[1:]):
++                y = self.forward(x[:, a:b], p1, out_dtype)
++                if out is None:
++                    out = torch.empty((1, seqlen, y.shape[-1]), dtype = y.dtype, device = y.device)
++                out[:, a:b].copy_(y)
++                del y
++                if b == c:
++                    key = self.__dict__.get("_rs_key")
++                    if key is None:
++                        key = self._rs_key = next(k for k, l in rsg[0].cache.get_all_recurrent_layers().items()
++                                                  if l is rsl)
++                    params["recurrent_ckpt_side"][key] = rsl.stash(rsg[0].slot)
++            return out
++
+         # Deferred fill of the merged b/a projection (weights are materialized by now)
+         if self.bc_split and not self.ba_weight_filled and self.kda:
+             self.dt_bias_bc.copy_(self.dt_bias)
+@@ -1092,8 +1124,11 @@ class GatedDeltaNet(Module):
+                 self.beta_scale
+             )
+         elif self.kda:
++            # glm-b70: one transposing copy, and the projection (fp32) freed at once: prefill memory is per token
+             qkv = self.qkv_proj.forward(x, params)
+-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
++            mixed_qkv = torch.empty((bsz, qkv.shape[-1], seqlen), dtype = torch.bfloat16, device = qkv.device)
++            mixed_qkv.copy_(qkv.transpose(1, 2))
++            del qkv
+ 
+             # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
+             z = self.g_b_proj.forward(self.g_a_proj.forward(x, params).to(torch.half), params) \
+@@ -1104,14 +1139,17 @@ class GatedDeltaNet(Module):
+ 
+             # Per-k-channel log decay from the low-rank forget gate: "safe gate" form when a
+             # lower bound is configured, else softplus (per the Kimi/GLM5.3 reference)
++            # (glm-b70: computed in place, same values; the fp32 temporaries were held per token through the prefill)
+             f = self.f_b_proj.forward(self.f_a_proj.forward(x, params).to(torch.half), params)
+-            gf = (f.float() + self.dt_bias.float().view(1, 1, -1)) \
++            g = f.float() if f.dtype != torch.float else f
++            del f
++            g = g.add_(self.dt_bias.float().view(1, 1, -1)) \
+                 .view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
+             decay = torch.exp(self.a_log.float()).view(1, 1, self.num_v_heads, 1)
+             if self.gate_lower_bound is not None:
+-                g = self.gate_lower_bound * torch.sigmoid(decay * gf)
++                g = g.mul_(decay).sigmoid_().mul_(self.gate_lower_bound)
+             else:
+-                g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
++                g = torch.nn.functional.softplus(g, beta = 1.0, threshold = 20.0).mul_(-decay)
+         else:
+             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
+@@ -1164,6 +1202,7 @@ class GatedDeltaNet(Module):
+             params = params,
+             channelwise_g = self.kda,
+         )
++        del mixed_qkv, beta, g
+ 
+         # Norm
+         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
+diff --git a/exllamav3/modules/gated_delta_net_fn/conv1d.py b/exllamav3/modules/gated_delta_net_fn/conv1d.py
+index 21bad20..82f1916 100644
+--- a/exllamav3/modules/gated_delta_net_fn/conv1d.py
++++ b/exllamav3/modules/gated_delta_net_fn/conv1d.py
+@@ -242,7 +242,7 @@ def causal_conv1d_update_slotted_triton(
+     transpose_output: bool = False,
+     history: bool = False,
+ ) -> torch.Tensor:
+-    if not x.is_cuda:
++    if x.device.type not in ("cuda", "xpu"):
+         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
+     if not x.is_contiguous() or not conv_state.is_contiguous() or not weight.is_contiguous():
+         raise RuntimeError("causal_conv1d_update_slotted_triton requires contiguous x, conv_state, and weight")
+diff --git a/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py b/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
+index d907087..ea371cf 100644
+--- a/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
++++ b/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
+@@ -120,20 +120,30 @@ def gated_delta_rule_fn(
+             recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
+             if recurrent_slots_cpu is None:
+                 recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
++            from ...vendor.fla.l2norm import l2norm_fwd
++            def l2n(t):
++                # (glm-b70) the l2norm chunk_kda would apply, done here: q/k are strided views of mixed_qkv, and
++                # chunk_kda's input_guard would hold contiguous copies of them for the whole call next to the
++                # normalized ones. Same kernel, same values; the copy here is freed at once
++                t = t.contiguous()
++                return l2norm_fwd(t)[0]
+             core_attn_out = []
+             for i, s in enumerate(recurrent_slots_cpu.tolist()):
+                 state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+                 core_attn, new_state = chunk_kda(
+-                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
++                    l2n(q[i:i + 1]), l2n(k[i:i + 1]), v[i:i + 1],
+                     g = g[i:i + 1],
+                     beta = beta[i:i + 1],
+                     initial_state = state,
+                     output_final_state = save_state,
+-                    use_qk_l2norm_in_kernel = True,
++                    use_qk_l2norm_in_kernel = False,
++                    g_in_place = True,      # g is this call's own (GatedDeltaNet.forward drops it after)
+                 )
+                 if save_state and state is not None:
+                     state.copy_(new_state)
+                 core_attn_out.append(core_attn)
++            if len(core_attn_out) == 1:
++                return core_attn_out[0].to(torch.bfloat16)
+             return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
+ 
+         core_attn_out = torch.empty(
+diff --git a/exllamav3/modules/mla_attn.py b/exllamav3/modules/mla_attn.py
+index e2eb2c1..3ad9816 100644
+--- a/exllamav3/modules/mla_attn.py
++++ b/exllamav3/modules/mla_attn.py
+@@ -38,6 +38,9 @@ assert _score_tile % 256 == 0 and _score_tile > 0
+ 
+ 
+ 
++_MLA_SUB = int(os.environ.get("EXL3_MLA_SUBCHUNK", "1024"))   # glm-b70: prefill sub-chunk (MLAttention.forward)
++
++
+ def _host_seqlens(params: dict, cache_seqlens: torch.Tensor) -> list:
+     """Host copy of cache_seqlens, once per forward (shared across layers via the params
+     dict). The generator supplies cache_seqlens as a host (pinned staging) tensor, in which
+@@ -412,6 +415,32 @@ class MLAttention(Module):
+         params: dict,
+         out_dtype: torch.dtype | None = None
+     ) -> torch.Tensor:
++        # glm-b70: long prefill chunks run as sequential sub-chunks of this layer alone (it attends causally to the
++        # cache, so this is the generator's chunking applied to one layer: same result, while every other module
++        # and the routed experts still see the whole chunk once). The sparse path holds ~200 KB per token of
++        # per-row tensors (q, q_lat, o_lat, unfolded o, indices), which bounded the prompt chunk size
++        cs = params.get("cache_seqlens")
++        if (_MLA_SUB > 0 and x.dim() == 3 and x.shape[0] == 1 and x.shape[1] > _MLA_SUB and self.num_q_heads
++                and params.get("cache") is not None and isinstance(cs, torch.Tensor) and cs.device.type == "cpu"
++                and params.get("non_causal_spans") is None and params.get("inv_freq") is None
++                and params.get("position_ids") is None
++                and (params.get("positions") is None or params["positions"].numel() == 1)):
++            seqlen = x.shape[1]
++            out = None
++            for a in range(0, seqlen, _MLA_SUB):
++                b = min(seqlen, a + _MLA_SUB)
++                p1 = {k: v for k, v in params.items()
++                      if k not in ("dev_cache", "_mla_host_seqlens", "dsa_topk_indices", "_as_dsa_indices")}
++                p1["cache_seqlens"] = cs + a
++                if params.get("positions") is not None:
++                    p1["positions"] = params["positions"] + a       # start position of the chunk
++                y = self.forward(x[:, a:b], p1, out_dtype)
++                if out is None:
++                    out = torch.empty((1, seqlen, y.shape[-1]), dtype = y.dtype, device = y.device)
++                out[:, a:b].copy_(y)
++                del y, p1
++            return out
++
+         # TP rank without this layer: contribute nothing, stay in step with the collective
+         if self.num_q_heads == 0:
+             x = torch.zeros_like(x, dtype = self.out_dtype)
+@@ -606,7 +635,9 @@ class MLAttention(Module):
+             probs = torch.softmax(gates + ape.unsqueeze(0), dim = 1)
+             pool_keys = (probs * keys).sum(dim = 1).to(torch.half)
+             idx_layer.update_pool_direct(
+-                torch.tensor([first_pool], dtype = torch.int32, device = plane.device),
++                # a fill kernel, not torch.tensor(..., device=): a pageable host-to-device copy waits for the whole
++                # queue (on XPU a full sync per completed pool, every index_kpool decode tokens per indexer layer)
++                torch.full((1,), first_pool, dtype = torch.int32, device = plane.device),
+                 bt.unsqueeze(0) if bt.dim() == 1 else bt,
+                 pool_keys.unsqueeze(0),
+             )
+@@ -888,6 +919,13 @@ class MLAttention(Module):
+             # kernel's packed [nope | pe] per-head rows
+             q = q.view(R, H, self.qk_head_dim)
+             q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
++            if q.device.type == "xpu" and self.qk_rope_head_dim == 0 and qc is None:
++                # Intel XPU: oneDNN fused SDPA (glm-b70 xpu/glm_xpu/sparse_mla.py)
++                from glm_xpu.sparse_mla import mla_prefill_mha_sdpa
++                o = mla_prefill_mha_sdpa(q, self.w_uk_flat, self.w_uv_flat, ckv_cache, block_table, host_seqlens,
++                                         bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale)
++                o = o.reshape(bsz, seqlen, H * self.v_head_dim)
++                return self.o_proj.forward(o, params)
+             o = mla_attn_triton_prefill_mha(
+                 q,
+                 self.w_uk_flat, self.w_uv_flat,
+@@ -948,6 +986,14 @@ class MLAttention(Module):
+         # wise be the one sparse-path transient that grows with context (pages)
+         bt = block_table if bsz == 1 or seqlen == 1 \
+             else block_table.repeat_interleave(seqlen, dim = 0)
++        if q_lat.device.type == "xpu" and D_r == 0 and qc is None:
++            # Intel XPU: gathered oneDNN batched GEMMs (glm-b70 xpu/glm_xpu/sparse_mla.py); the Triton kernels run
++            # 5-22x slower on Xe2 and the one-shot variant can fail to launch
++            from glm_xpu.sparse_mla import sparse_mla_latent
++            o_lat = sparse_mla_latent(q_lat, ckv_cache, bt, indices, self.sm_scale)
++            o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
++            o = o.reshape(bsz, seqlen, H * self.v_head_dim)
++            return self.o_proj.forward(o, params)
+         o_lat = dsa_attn(
+             q_lat, ckv_cache, kpe_cache, bt,
+             indices = indices, k_len = indices.shape[1],
+diff --git a/exllamav3/modules/mlp.py b/exllamav3/modules/mlp.py
+index db26b31..9716263 100644
+--- a/exllamav3/modules/mlp.py
++++ b/exllamav3/modules/mlp.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ from typing_extensions import override
++import os
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -12,6 +13,7 @@ from ..model.model_tp_alloc import TPAllocation
+ from .multilinear import MultiLinear
+ from ..util.tensor import g_tensor_cache
+ 
++_ROW_CHUNK = int(os.environ.get("EXL3_MLP_ROW_CHUNK", "2048"))   # glm-b70: prefill row slice (GatedMLP.forward)
+ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+ 
+ class MLP(Module):
+@@ -727,6 +729,18 @@ class GatedMLP(Module):
+     ) -> torch.Tensor:
+         bsz, q_len, dim = x.shape
+ 
++        # glm-b70: long prefill chunks run in row slices (rows are independent): the gate/up/activation
++        # intermediates otherwise peak at ~150 KB per token, which bounded the prompt chunk size
++        if bsz == 1 and q_len > _ROW_CHUNK > 0 and self.num_slices and not self.tp_reduce:
++            out = None
++            for r0 in range(0, q_len, _ROW_CHUNK):
++                y = self.forward(x[:, r0 : r0 + _ROW_CHUNK], params, out_dtype)
++                if out is None:
++                    out = torch.empty((1, q_len, y.shape[-1]), dtype = y.dtype, device = y.device)
++                out[:, r0 : r0 + y.shape[1]].copy_(y)
++                del y
++            return out
++
+         if self.num_slices == 0:
+             d = torch.zeros_like(x, dtype = self.out_dtype)
+             if self.tp_reduce:
+@@ -748,7 +762,9 @@ class GatedMLP(Module):
+                     u = self.ups[s].forward(x, params)
+                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                     self.activation_fn_call(g, u, a, self.act_limit)
++                    del g, u                            # (glm-b70) not needed by the down projection
+                     d_ = self.downs[s].forward(a, params)
++                    del a
+ 
+                     if d is None: d = d_
+                     else: d += d_
+diff --git a/exllamav3/util/misc.py b/exllamav3/util/misc.py
+index 6292a4b..cbdf3d4 100644
+--- a/exllamav3/util/misc.py
++++ b/exllamav3/util/misc.py
+@@ -37,8 +37,9 @@ def cuda_sync_active():
+     Calling torch.cuda.synchronize() will create a CUDA context on CUDA:0 even if that device is not being used.
+     This function synchronizes only devices actively used by Torch in the current process.
+     """
++    dtype = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() and not torch.version.cuda else "cuda"
+     for device_id in range(torch.cuda.device_count()):
+-        device = torch.device(f'cuda:{device_id}')
++        device = torch.device(f'{dtype}:{device_id}')
+         if torch.cuda.memory_allocated(device) > 0:
+             torch.cuda.synchronize(device)
+ 
+diff --git a/exllamav3/vendor/fla/__init__.py b/exllamav3/vendor/fla/__init__.py
+index 8043032..3373be1 100644
+--- a/exllamav3/vendor/fla/__init__.py
++++ b/exllamav3/vendor/fla/__init__.py
+@@ -79,6 +79,7 @@ def chunk_kda(
+     output_final_state: bool = False,
+     use_qk_l2norm_in_kernel: bool = False,
+     chunk_size: int = 64,
++    g_in_place: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+     """
+     Chunked Kimi Delta Attention (per-channel decay) prefill.
+@@ -102,16 +103,19 @@ def chunk_kda(
+     if use_qk_l2norm_in_kernel:
+         q, _ = l2norm_fwd(q)
+         k, _ = l2norm_fwd(k)
+-    g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
++    # g_in_place: the caller's g (fp32) is overwritten by its chunk-local cumsum (the caller does not reuse it)
++    g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2, in_place = g_in_place)
+     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
+         q = q, k = k, v = v, gk = g, beta = beta, scale = scale, chunk_size = chunk_size,
+     )
++    del k                                   # (glm-b70) prefill memory is per token: drop what is done with early
+     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+         k = kg, w = w, u = u, gk = g,
+         initial_state = initial_state,
+         output_final_state = output_final_state,
+         chunk_size = chunk_size,
+     )
++    del w, u, kg
+     o = chunk_gla_fwd_o_gk(q = q, v = v_new, g = g, A = Aqk, h = h, scale = scale, chunk_size = chunk_size)
+     return o.to(q.dtype), final_state
+ 
+diff --git a/exllamav3/vendor/fla/cumsum.py b/exllamav3/vendor/fla/cumsum.py
+index 7a3b943..787c52f 100644
+--- a/exllamav3/vendor/fla/cumsum.py
++++ b/exllamav3/vendor/fla/cumsum.py
+@@ -179,6 +179,7 @@ def chunk_local_cumsum_vector(
+     head_first: bool = False,
+     output_dtype: torch.dtype | None = torch.float,
+     chunk_indices: torch.LongTensor | None = None,
++    in_place: bool = False,
+ ) -> torch.Tensor:
+     if head_first:
+         B, H, T, S = g.shape
+@@ -190,7 +191,10 @@ def chunk_local_cumsum_vector(
+     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
+ 
+-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
++    # in_place (glm-b70): each program loads its whole [BT, BS] block before storing it, so the output may alias the
++    # input; saves a (B, T, H, S) fp32 tensor per KDA prefill layer
++    same = in_place and g.dtype == (output_dtype or g.dtype)
++    g_org, g = g, (g if same else torch.empty_like(g, dtype=output_dtype or g.dtype))
+     def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
+     # keep cummulative normalizer in fp32
+     # this kernel is equivalent to
+@@ -247,6 +251,7 @@ def chunk_local_cumsum(
+             head_first=head_first,
+             output_dtype=output_dtype,
+             chunk_indices=chunk_indices,
++            in_place=kwargs.get("in_place", False),
+         )
+     else:
+         raise ValueError(

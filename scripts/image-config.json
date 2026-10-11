@@ -1,0 +1,470 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "User": "root",
+  "Env": [
+   "PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:/opt/intel/oneapi/mpi/2021.18/bin:/opt/intel/oneapi/mkl/2026.0/bin:/opt/intel/oneapi/dev-utilities/2026.0/bin:/opt/intel/oneapi/debugger/2026.0/opt/debugger/bin:/opt/intel/oneapi/compiler/2026.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "LANG=C.UTF-8",
+   "CCL_CONFIGURATION=cpu_gpu_dpcpp",
+   "CCL_CONFIGURATION_PATH=",
+   "CCL_ROOT=/opt/intel/oneapi/ccl/2022.0",
+   "CLASSPATH=/opt/intel/oneapi/mpi/2021.18/share/java/mpi.jar",
+   "CMAKE_PREFIX_PATH=/opt/intel/oneapi/tbb/2023.0/env/..:/opt/intel/oneapi/pti/0.17/lib/cmake/pti:/opt/intel/oneapi/mkl/2026.0/lib/cmake:/opt/intel/oneapi/dpl/2022.12/lib/cmake/oneDPL:/opt/intel/oneapi/compiler/2026.0:/opt/intel/oneapi/ccl/2022.0/lib/cmake/oneCCL",
+   "CMPLR_ROOT=/opt/intel/oneapi/compiler/2026.0",
+   "CPATH=/opt/intel/oneapi/umf/1.1/include:/opt/intel/oneapi/dev-utilities/2026.0/include:/opt/intel/oneapi/ccl/2022.0/include",
+   "CPLUS_INCLUDE_PATH=/opt/intel/oneapi/umf/1.1/include:/opt/intel/oneapi/tbb/2023.0/env/../include:/opt/intel/oneapi/pti/0.17/include:/opt/intel/oneapi/mpi/2021.18/include:/opt/intel/oneapi/mkl/2026.0/include:/opt/intel/oneapi/dpl/2022.12/include",
+   "C_INCLUDE_PATH=/opt/intel/oneapi/umf/1.1/include:/opt/intel/oneapi/tbb/2023.0/env/../include:/opt/intel/oneapi/pti/0.17/include:/opt/intel/oneapi/mpi/2021.18/include:/opt/intel/oneapi/mkl/2026.0/include",
+   "DIAGUTIL_PATH=/opt/intel/oneapi/compiler/2026.0/etc/compiler/sys_check/sys_check.sh",
+   "DPLROOT=/opt/intel/oneapi/dpl/2022.12",
+   "DPL_ROOT=/opt/intel/oneapi/dpl/2022.12",
+   "FI_PROVIDER_PATH=/opt/intel/oneapi/mpi/2021.18/opt/mpi/libfabric/lib/prov:/usr/lib/x86_64-linux-gnu/libfabric",
+   "GDB_INFO=/opt/intel/oneapi/debugger/2026.0/share/info/",
+   "INFOPATH=/opt/intel/oneapi/debugger/2026.0/share/info",
+   "INTEL_PYTHONHOME=/opt/intel/oneapi/debugger/2026.0/opt/debugger",
+   "I_MPI_ROOT=/opt/intel/oneapi/mpi/2021.18",
+   "LD_LIBRARY_PATH=/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tcm/1.5/env/../lib:/opt/intel/oneapi/tbb/2023.0/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/0.17/lib:/opt/intel/oneapi/mpi/2021.18/opt/mpi/libfabric/lib:/opt/intel/oneapi/mpi/2021.18/lib:/opt/intel/oneapi/mkl/2026.0/lib:/opt/intel/oneapi/debugger/2026.0/opt/debugger/lib:/opt/intel/oneapi/compiler/2026.0/opt/compiler/lib:/opt/intel/oneapi/compiler/2026.0/lib:/opt/intel/oneapi/ccl/2022.0/lib/",
+   "LIBRARY_PATH=/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tbb/2023.0/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/0.17/lib:/opt/intel/oneapi/mpi/2021.18/lib:/opt/intel/oneapi/mkl/2026.0/lib:/opt/intel/oneapi/compiler/2026.0/lib:/opt/intel/oneapi/ccl/2022.0/lib/",
+   "MANPATH=/opt/intel/oneapi/mpi/2021.18/share/man:/opt/intel/oneapi/debugger/2026.0/share/man:/opt/intel/oneapi/compiler/2026.0/share/man:",
+   "MKLROOT=/opt/intel/oneapi/mkl/2026.0",
+   "NLSPATH=/opt/intel/oneapi/compiler/2026.0/lib/compiler/locale/%l_%t/%N",
+   "OCL_ICD_FILENAMES=/opt/intel/oneapi/compiler/2026.0/lib/libintelocl.so",
+   "ONEAPI_ROOT=/opt/intel/oneapi",
+   "PKG_CONFIG_PATH=/opt/intel/oneapi/tbb/2023.0/env/../lib/pkgconfig:/opt/intel/oneapi/mpi/2021.18/lib/pkgconfig:/opt/intel/oneapi/mkl/2026.0/lib/pkgconfig:/opt/intel/oneapi/dpl/2022.12/lib/pkgconfig:/opt/intel/oneapi/compiler/2026.0/lib/pkgconfig:/opt/intel/oneapi/ccl/2022.0/lib/pkgconfig/",
+   "Pti_DIR=/opt/intel/oneapi/pti/0.17/lib/cmake/pti",
+   "SETVARS_COMPLETED=1",
+   "TBBROOT=/opt/intel/oneapi/tbb/2023.0/env/..",
+   "TCMROOT=/opt/intel/oneapi/tcm/1.5/env/..",
+   "TCM_ROOT=/opt/intel/oneapi/tcm/1.5",
+   "UMF_ROOT=/opt/intel/oneapi/umf/1.1",
+   "DEBIAN_FRONTEND=noninteractive",
+   "VIRTUAL_ENV=/opt/venv",
+   "UV_PYTHON_INSTALL_DIR=/opt/uv/python"
+  ],
+  "Cmd": [
+   "bash"
+  ],
+  "WorkingDir": "/sgl-workspace",
+  "Labels": {
+   "org.opencontainers.image.version": "24.04"
+  },
+  "ArgsEscaped": true
+ },
+ "created": "2026-09-18T08:20:00.104125331Z",
+ "history": [
+  {
+   "created": "2026-04-10T06:49:15.45210454Z",
+   "created_by": "/bin/sh -c #(nop)  ARG RELEASE",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-10T06:49:15.493474875Z",
+   "created_by": "/bin/sh -c #(nop)  ARG LAUNCHPAD_BUILD_ARCH",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-10T06:49:15.521658623Z",
+   "created_by": "/bin/sh -c #(nop)  LABEL org.opencontainers.image.version=24.04",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-10T06:49:17.706887224Z",
+   "created_by": "/bin/sh -c #(nop) ADD file:8ce1caf246e7c778bca84c516d02fd4e83766bb2c530a0fffa8a351b560a2728 in / "
+  },
+  {
+   "created": "2026-04-10T06:49:18.133477895Z",
+   "created_by": "/bin/sh -c #(nop)  CMD [\"/bin/bash\"]",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:49:02.309484874Z",
+   "created_by": "ARG DEEP_LEARNING_ESSENTIALS_VERSION=2026.0.0-614",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:49:02.309484874Z",
+   "created_by": "RUN |1 DEEP_LEARNING_ESSENTIALS_VERSION=2026.0.0-614 /bin/sh -c apt-get update && apt-get upgrade -y &&     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends         curl gpg-agent software-properties-common ca-certificates build-essential pkg-config gnupg libarchive13 openssh-server openssh-client wget net-tools git file cmake &&     rm -rf /var/lib/apt/lists/* # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-04-24T18:49:03.158393138Z",
+   "created_by": "RUN |1 DEEP_LEARNING_ESSENTIALS_VERSION=2026.0.0-614 /bin/sh -c curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/intel-oneapi-archive-keyring.gpg &&     echo \"deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main \" > /etc/apt/sources.list.d/oneAPI.list # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-04-24T18:49:03.158393138Z",
+   "created_by": "ARG REPOSITORY=ppa:kobuk-team/intel-graphics",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:49:13.512045365Z",
+   "created_by": "RUN |2 DEEP_LEARNING_ESSENTIALS_VERSION=2026.0.0-614 REPOSITORY=ppa:kobuk-team/intel-graphics /bin/sh -c add-apt-repository -y ${REPOSITORY} # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "RUN |2 DEEP_LEARNING_ESSENTIALS_VERSION=2026.0.0-614 REPOSITORY=ppa:kobuk-team/intel-graphics /bin/sh -c apt-get update && apt-get upgrade -y &&     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends         intel-deep-learning-essentials=${DEEP_LEARNING_ESSENTIALS_VERSION} intel-opencl-icd libze-intel-gpu1 libze1 libze-dev &&     rm -rf /var/lib/apt/lists/* # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV LANG=C.UTF-8",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CCL_CONFIGURATION=cpu_gpu_dpcpp",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CCL_CONFIGURATION_PATH=",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CCL_ROOT=/opt/intel/oneapi/ccl/2022.0",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CLASSPATH=/opt/intel/oneapi/mpi/2021.18/share/java/mpi.jar",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CMAKE_PREFIX_PATH=/opt/intel/oneapi/tbb/2023.0/env/..:/opt/intel/oneapi/pti/0.17/lib/cmake/pti:/opt/intel/oneapi/mkl/2026.0/lib/cmake:/opt/intel/oneapi/dpl/2022.12/lib/cmake/oneDPL:/opt/intel/oneapi/compiler/2026.0:/opt/intel/oneapi/ccl/2022.0/lib/cmake/oneCCL",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CMPLR_ROOT=/opt/intel/oneapi/compiler/2026.0",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CPATH=/opt/intel/oneapi/umf/1.1/include:/opt/intel/oneapi/dev-utilities/2026.0/include:/opt/intel/oneapi/ccl/2022.0/include",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV CPLUS_INCLUDE_PATH=/opt/intel/oneapi/umf/1.1/include:/opt/intel/oneapi/tbb/2023.0/env/../include:/opt/intel/oneapi/pti/0.17/include:/opt/intel/oneapi/mpi/2021.18/include:/opt/intel/oneapi/mkl/2026.0/include:/opt/intel/oneapi/dpl/2022.12/include",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV C_INCLUDE_PATH=/opt/intel/oneapi/umf/1.1/include:/opt/intel/oneapi/tbb/2023.0/env/../include:/opt/intel/oneapi/pti/0.17/include:/opt/intel/oneapi/mpi/2021.18/include:/opt/intel/oneapi/mkl/2026.0/include",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV DIAGUTIL_PATH=/opt/intel/oneapi/compiler/2026.0/etc/compiler/sys_check/sys_check.sh",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV DPLROOT=/opt/intel/oneapi/dpl/2022.12",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV DPL_ROOT=/opt/intel/oneapi/dpl/2022.12",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV FI_PROVIDER_PATH=/opt/intel/oneapi/mpi/2021.18/opt/mpi/libfabric/lib/prov:/usr/lib/x86_64-linux-gnu/libfabric",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV GDB_INFO=/opt/intel/oneapi/debugger/2026.0/share/info/",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV INFOPATH=/opt/intel/oneapi/debugger/2026.0/share/info",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV INTEL_PYTHONHOME=/opt/intel/oneapi/debugger/2026.0/opt/debugger",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV I_MPI_ROOT=/opt/intel/oneapi/mpi/2021.18",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV LD_LIBRARY_PATH=/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tcm/1.5/env/../lib:/opt/intel/oneapi/tbb/2023.0/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/0.17/lib:/opt/intel/oneapi/mpi/2021.18/opt/mpi/libfabric/lib:/opt/intel/oneapi/mpi/2021.18/lib:/opt/intel/oneapi/mkl/2026.0/lib:/opt/intel/oneapi/debugger/2026.0/opt/debugger/lib:/opt/intel/oneapi/compiler/2026.0/opt/compiler/lib:/opt/intel/oneapi/compiler/2026.0/lib:/opt/intel/oneapi/ccl/2022.0/lib/",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV LIBRARY_PATH=/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/tbb/2023.0/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/0.17/lib:/opt/intel/oneapi/mpi/2021.18/lib:/opt/intel/oneapi/mkl/2026.0/lib:/opt/intel/oneapi/compiler/2026.0/lib:/opt/intel/oneapi/ccl/2022.0/lib/",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV MANPATH=/opt/intel/oneapi/mpi/2021.18/share/man:/opt/intel/oneapi/debugger/2026.0/share/man:/opt/intel/oneapi/compiler/2026.0/share/man:",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV MKLROOT=/opt/intel/oneapi/mkl/2026.0",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV NLSPATH=/opt/intel/oneapi/compiler/2026.0/lib/compiler/locale/%l_%t/%N",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV OCL_ICD_FILENAMES=/opt/intel/oneapi/compiler/2026.0/lib/libintelocl.so",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV ONEAPI_ROOT=/opt/intel/oneapi",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV PATH=/opt/intel/oneapi/mpi/2021.18/bin:/opt/intel/oneapi/mkl/2026.0/bin:/opt/intel/oneapi/dev-utilities/2026.0/bin:/opt/intel/oneapi/debugger/2026.0/opt/debugger/bin:/opt/intel/oneapi/compiler/2026.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV PKG_CONFIG_PATH=/opt/intel/oneapi/tbb/2023.0/env/../lib/pkgconfig:/opt/intel/oneapi/mpi/2021.18/lib/pkgconfig:/opt/intel/oneapi/mkl/2026.0/lib/pkgconfig:/opt/intel/oneapi/dpl/2022.12/lib/pkgconfig:/opt/intel/oneapi/compiler/2026.0/lib/pkgconfig:/opt/intel/oneapi/ccl/2022.0/lib/pkgconfig/",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV Pti_DIR=/opt/intel/oneapi/pti/0.17/lib/cmake/pti",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV SETVARS_COMPLETED=1",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV TBBROOT=/opt/intel/oneapi/tbb/2023.0/env/..",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV TCMROOT=/opt/intel/oneapi/tcm/1.5/env/..",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV TCM_ROOT=/opt/intel/oneapi/tcm/1.5",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-04-24T18:52:33.494745175Z",
+   "created_by": "ENV UMF_ROOT=/opt/intel/oneapi/umf/1.1",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ENV DEBIAN_FRONTEND=noninteractive",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG PYTHON_VERSION=3.12",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG SG_LANG_BRANCH=v0.5.20",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG SG_LANG_KERNEL_BRANCH=main",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "USER root",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG IGC_VERSION=2.34.4+21428",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "ARG GMM_VERSION=22.10.0",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:10:55.243824842Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c apt-get update && apt-get install -y software-properties-common curl &&     add-apt-repository -y ppa:kobuk-team/intel-graphics &&     apt-get update &&     apt-get install -y         libze1 intel-metrics-discovery clinfo intel-gsc         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo         libze-dev &&     cd /tmp &&     igc_url=\"https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}\" &&     cr_url=\"https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}\" &&     curl -fsSL -O \"${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb\" &&     curl -fsSL -O \"${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb\" &&     curl -fsSL -O \"${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb\" &&     curl -fsSL -O \"${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb\" &&     curl -fsSL -O \"${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb\" &&     curl -fsSL -O \"${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb\" &&     apt-get install -y --allow-downgrades         ./intel-igc-core-2_${IGC_VERSION}_amd64.deb         ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb         ./libigdgmm12_${GMM_VERSION}_amd64.deb         ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb         ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb         ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb &&     rm -f /tmp/*.deb &&     apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12         intel-igc-core-2 intel-igc-opencl-2 &&     rm -rf /var/lib/apt/lists/* # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:11:04.432282588Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c apt-get update && apt-get install -y     python3-dev     build-essential     libssl-dev     protobuf-compiler     && rm -rf /var/lib/apt/lists/* # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:11:05.37560103Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c curl -LsSf https://astral.sh/uv/install.sh | sh # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:11:05.37560103Z",
+   "created_by": "ENV PATH=/root/.local/bin:/root/.cargo/bin:/opt/intel/oneapi/mpi/2021.18/bin:/opt/intel/oneapi/mkl/2026.0/bin:/opt/intel/oneapi/dev-utilities/2026.0/bin:/opt/intel/oneapi/debugger/2026.0/opt/debugger/bin:/opt/intel/oneapi/compiler/2026.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:11:13.248929393Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal && rustc --version && cargo --version # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:11:13.248929393Z",
+   "created_by": "ENV VIRTUAL_ENV=/opt/venv",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:11:13.248929393Z",
+   "created_by": "ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:11:13.609115525Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV} # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:11:13.609115525Z",
+   "created_by": "ENV PATH=/opt/venv/bin:/root/.local/bin:/root/.cargo/bin:/opt/intel/oneapi/mpi/2021.18/bin:/opt/intel/oneapi/mkl/2026.0/bin:/opt/intel/oneapi/dev-utilities/2026.0/bin:/opt/intel/oneapi/debugger/2026.0/opt/debugger/bin:/opt/intel/oneapi/compiler/2026.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:11:13.643313064Z",
+   "created_by": "WORKDIR /sgl-workspace",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:12:28.212572875Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu &&     pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:19:48.739208474Z",
+   "created_by": "RUN |8 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 /bin/sh -c echo \"Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}\" &&     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang &&     git -C sglang fetch --tags --force origin &&     cd sglang && cd python &&     cp pyproject_xpu.toml pyproject.toml &&     pip install --no-cache-dir \".[dev,diffusion]\" --extra-index-url https://download.pytorch.org/whl/xpu &&     pip install --no-cache-dir --no-deps xgrammar==0.1.33 # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:19:48.739208474Z",
+   "created_by": "ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  },
+  {
+   "created": "2026-09-18T08:20:00.104125331Z",
+   "created_by": "RUN |9 PYTHON_VERSION=3.12 SG_LANG_REPO=https://github.com/sgl-project/sglang.git SG_LANG_BRANCH=v0.5.20 SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git SG_LANG_KERNEL_BRANCH=main COMPUTE_RUNTIME_VERSION=26.18.38308.1 IGC_VERSION=2.34.4+21428 GMM_VERSION=22.10.0 TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417 /bin/sh -c TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF} # buildkit",
+   "comment": "buildkit.dockerfile.v0"
+  },
+  {
+   "created": "2026-09-18T08:20:00.104125331Z",
+   "created_by": "CMD [\"bash\"]",
+   "comment": "buildkit.dockerfile.v0",
+   "empty_layer": true
+  }
+ ],
+ "os": "linux",
+ "rootfs": {
+  "type": "layers",
+  "diff_ids": [
+   "sha256:538812a4b9bd45adaac2b5e5b967daa6999aa44eb110aa32ae7c69702b906475",
+   "sha256:abd24aa5d304339b7b9a5eb56785b036ce7481db578f2897f8250c6901f12dda",
+   "sha256:c03f3bae16f1883583cd1ec4c1b10a30bfb362f25609f4f67a9dc0426d0b49c4",
+   "sha256:eba961864a6c0a7a3a143ce3947a66f289ed9d4fd4fa31cb6d62a5f72b779ab5",
+   "sha256:e723cfb56cc2332387ee0a37293c8436e2346ce822083394befab6962b791677",
+   "sha256:603374514d9aca9e80ca502b060238a1271620d5f55f8cca3cc0752bacba5e73",
+   "sha256:6a554cacd9bbf09f1f850fdfe4579209dfd1aae065573b4e189756ef8ab784cb",
+   "sha256:c7c6810944e236603b5e804b5e8e2a531f5bfe18854bc37081ec1c1e9c511680",
+   "sha256:824cbeb8acbc0ea12ad71cfadbd969bb3adcaf029458d66e9fddd51abaae9d08",
+   "sha256:5e4b3f9522e6d354643a487908568ef145d9dcc592333a1c7719d48a0f9b6f26",
+   "sha256:600b26d173bac44eea3cafe17a53d5ce07351803b9e3b0e1ebdebae9e2e7ff5f",
+   "sha256:f3d407eacf837f78b8037e3b75fe27259c512540eff6a81b56a7eb69be1f1510",
+   "sha256:c51826fa0524a76fbf7e04be8e7f0262bb0de8fd9107d40aa91b34fdb7ba46bc",
+   "sha256:7e262a534a19055c332b3ea69855396163954f46510a1e424ed68019b049d32b"
+  ]
+ }
+}
