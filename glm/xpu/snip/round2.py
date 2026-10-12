@@ -1,0 +1,12 @@
+exec(open("/w/xpu/snip/speed.py").read().split("run(False, 8)")[0])
+run(True, 8)
+print("--- decode", flush=True)
+run(False, 64); run(True, 64); run(True, 64)
+print("--- phases (no-sync)", flush=True)
+exec(open("/w/xpu/snip/phases.py").read())
+print("--- 3.6K prompt (borrows staging slots), then decode (refill)", flush=True)
+N = 3600
+exec(open("/w/xpu/snip/prefill.py").read())
+exec(open("/w/xpu/snip/speed.py").read().split("run(False, 8)")[0])
+run(True, 64); run(True, 64)
+print(tier.summary(), flush=True)

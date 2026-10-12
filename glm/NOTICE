@@ -1,0 +1,10 @@
+b70-glm53-flash is MIT-licensed (see LICENSE). It includes or derives from:
+
+- ExLlamaV3 (MIT, Copyright (c) 2025 turboderp): the model code this runs (patched, see patches/ and the
+  horvay/exllamav3 b70-xpu branch), the EXL3 format and its decode rules.
+- trellis-serve (MIT, Copyright (c) 2026 0xSero): the starting point of the EXL3 ESIMD kernels in xpu/csrc and
+  xpu/exl3xpu (commit in xpu/TRELLIS_COMMIT). trellis-serve itself credits ExLlamaV3, the vLLM Marlin kernels
+  (Apache-2.0) and QTIP; see its NOTICE.
+- glm-flash-lite and moetier (MIT, Copyright (c) 2026 0xSero / sybil-solutions): the GLM-5.3-Flash expert tiering
+  design and the grouped MoE kernel this port started from.
+- flash-linear-attention (MIT, vendored in exllamav3): the chunked KDA prefill kernels.
