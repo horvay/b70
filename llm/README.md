@@ -26,7 +26,7 @@ image, the model, and NVMe space for the expert store (GLM ~95 GB, DSV4.1 ~105 G
 works (on btrfs, a `chattr +C` directory).
 
 ```sh
-git clone --recursive https://github.com/horvay/b70-inference && cd b70-inference
+git clone https://github.com/horvay/b70 && cd b70/llm   # setup fetches the two exllamav3 submodules it needs
 ./b70 setup                              # once, CPU only: the image, kernels and plugins for every model
 ./b70 prepare /path/to/glm-model         # once per GLM or DSV4.1 model: pack its NVMe expert store (Flash-Next fills its own)
 ./b70 serve /path/to/model --port 8000   # OpenAI-compatible server (its turn on the B70 via b70q); Ctrl-C or `./b70 stop` stops it
