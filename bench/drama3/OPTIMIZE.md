@@ -30,6 +30,7 @@ decode and writing wavs, but not the one-time model load (10-18 s).
 | **Final (`drama3_clone`), batch 16** | **bench 256 (1,711 s)** | **75.1 ms** | **0.159** (decode 0.026, 93% slot use) | **29.1 GiB** | **0.5% / 0.729 (20)**, no clip under 0.5 sim or over 20% WER (stock: 1.2% / 0.721, two weak clips) |
 | Final + fused projections (`D3_FUSE` unset, i.e. on; off by default) | eval 20 | 67.8 ms (-8%) | ~0.148 expected | ~29 GiB | 1.3% / 0.748 (20) |
 | Final, batch 32, activations padded to 128 columns (`D3_PAD_N=128 D3_PAD_TYPES=f16,q8_0`) | bench 96 | 131.6 ms | ~0.130 at full slot use | 31.7 GiB (too close to 32) | not scored |
+| **ggml SYCL backend instead of Vulkan (`D3_BACKEND=sycl`, horvay/audio.cpp 3bf3607: XMX matmuls for 2-32 rows, fused MUL_MAT_ID, oneMKL transposed conv), batch 16** | **bench 256** | **51.0 ms** | **0.132** | not measured | **0.7% / 0.752 (20)** |
 
 ## Where the time goes (stock port)
 
