@@ -46,3 +46,7 @@ engines/sd.cpp/xpu_sdpa/build_music3.sh      # xpu_music3 (after sd-cli)
 engines/audio.cpp/build_sycl.sh              # drama3_batch -> engines/audio.cpp/build/linux-sycl-release/bin/
 (cd queue && bun install)                    # then install queue/systemd/b70q.service and queue/bin/* (queue/README.md)
 ```
+
+## License
+
+MIT (`LICENSE`), except where a folder says otherwise: the engines keep their upstream licenses, and `tts/fish/` is under the Fish Audio Research License (`tts/LICENSE-FISH-AUDIO.md`).
