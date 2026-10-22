@@ -14,6 +14,8 @@ tools/              the commands below, plus mstore.ts (the model store)
 engines/sd.cpp      stable-diffusion.cpp fork (submodule, with the ggml fork): the one sd-cli for every image, video
                     and music job, and the native XPU libraries in xpu_sdpa/
 engines/audio.cpp   audio.cpp fork (submodule): Fish Audio Drama 3 (drama3_batch)
+engines/onednn      the local oneDNN v3.13.4 patch and build.sh for libdnnl_h3 (~/opt/onednn-sycl-graph), which every
+                    SYCL binary here links
 llm/                LLM servers: Gemma 4, Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash (the `b70` command)
 tts/                Fish S2 Pro and Qwen3-TTS on torch-XPU (older projects)
 ```

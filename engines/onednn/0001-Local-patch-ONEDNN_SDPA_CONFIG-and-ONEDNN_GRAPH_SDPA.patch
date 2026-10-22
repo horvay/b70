@@ -1,0 +1,73 @@
+From 2ba9535119be72f3ef36351aae61e4b00156fe67 Mon Sep 17 00:00:00 2001
+From: Greg Horvay <horvay@gmail.com>
+Date: Sat, 10 Oct 2026 17:17:18 -0400
+Subject: [PATCH] Local patch: ONEDNN_SDPA_CONFIG and
+ ONEDNN_GRAPH_SDPA_PRIMITIVE_ONLY env switches
+
+ONEDNN_SDPA_CONFIG overrides the micro_sdpa forward tile config in release
+builds; ONEDNN_GRAPH_SDPA_PRIMITIVE_ONLY=1 makes Graph SDPA compilation fail
+instead of falling back to kernels that materialize the score matrix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gpu/intel/sdpa/micro.cpp           |  7 +++++++
+ src/graph/backend/dnnl/kernels/sdp.hpp | 11 +++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/src/gpu/intel/sdpa/micro.cpp b/src/gpu/intel/sdpa/micro.cpp
+index 4c95ed3..b9117e1 100644
+--- a/src/gpu/intel/sdpa/micro.cpp
++++ b/src/gpu/intel/sdpa/micro.cpp
+@@ -15,6 +15,8 @@
+ *******************************************************************************/
+ 
+ #include "gpu/intel/sdpa/micro.hpp"
++
++#include <cstdlib>
+ #include "gpu/intel/sdpa/configs.hpp"
+ 
+ #include "common/c_types_map.hpp"
+@@ -113,6 +115,11 @@ status_t update_config_from_devenv_values(
+             = gpu_utils::dev_getenv("QUANTIZED_SDPA_CONFIG", std::string(""));
+     std::string config_str
+             = gpu_utils::dev_getenv("SDPA_CONFIG", std::string(""));
++    // Local patch: ONEDNN_SDPA_CONFIG overrides the forward (non-quantized)
++    // tile config in release builds too, for tuning without DNNL_DEV_MODE.
++    if (const char *env = std::getenv("ONEDNN_SDPA_CONFIG")) {
++        if (*env != '\0') config_str = env;
++    }
+     if ((!config_str.empty() && !quantized)
+             || (!q_config_str.empty() && quantized)) {
+         std::array<int, 8> config_values;
+diff --git a/src/graph/backend/dnnl/kernels/sdp.hpp b/src/graph/backend/dnnl/kernels/sdp.hpp
+index 119934b..8de5cc2 100644
+--- a/src/graph/backend/dnnl/kernels/sdp.hpp
++++ b/src/graph/backend/dnnl/kernels/sdp.hpp
+@@ -18,6 +18,7 @@
+ #define GRAPH_BACKEND_DNNL_KERNELS_SDP_HPP
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <memory>
+ #include <string>
+ #include <utility>
+@@ -62,6 +63,16 @@ public:
+             kernel = std::make_shared<sdp_primitive_kernel_t<quantized>>();
+             ret = kernel->compile_impl(part, g_engine, inputs, outputs);
+ 
++            // Local patch: ONEDNN_GRAPH_SDPA_PRIMITIVE_ONLY=1 fails the
++            // compilation instead of falling back to the decomposed kernels,
++            // which materialize the full score matrix.
++            const char *prim_only
++                    = std::getenv("ONEDNN_GRAPH_SDPA_PRIMITIVE_ONLY");
++            if (ret != status::success && prim_only != nullptr
++                    && prim_only[0] == '1') {
++                VDISPATCH_GRAPH_SDP("sdpa primitive kernel unavailable");
++                return ret;
++            }
+             if (ret != status::success) {
+                 kernel = std::make_shared<sdp_decomp_kernel_t<quantized, dt>>();
+                 ret = kernel->compile_impl(part, g_engine, inputs, outputs);
+-- 
+2.55.0
+
