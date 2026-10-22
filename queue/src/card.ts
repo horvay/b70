@@ -130,7 +130,7 @@ export class Card {
         if (!cid || seen.has(cid)) continue;
         seen.add(cid);
         const p = procs.get(pid)!;
-        const c = per.get(pid) ?? { pid, comm: p.comm, cmd: cmdline(pid) || p.comm, ticket: p.ticket, vram: 0, gtt: 0, sys: 0, busy: 0 };
+        const c = per.get(pid) ?? { pid, comm: p.comm, cmd: cachedCmdline(p), ticket: p.ticket, vram: 0, gtt: 0, sys: 0, busy: 0 };
         for (const [k, v] of Object.entries(info)) {
           if (!k.startsWith("drm-resident-")) continue;
           const region = k.slice(13);
@@ -175,11 +175,27 @@ export function cmdline(pid: number): string {
   return (read(`/proc/${pid}/cmdline`) ?? "").replace(/\0/g, " ").trim();
 }
 
+function cachedCmdline(p: Proc): string {
+  const e = execEntry(p.pid, `${p.start} ${p.comm}`);
+  e.cmd ??= cmdline(p.pid) || p.comm;
+  return e.cmd;
+}
+
 export function procStart(pid: number): number | undefined {
   const s = read(`/proc/${pid}/stat`);
   if (!s) return;
   return Number(s.slice(s.lastIndexOf(")") + 2).split(" ")[19]);
 }
+
+// Reading /proc/<pid>/environ or cmdline takes that process's mmap lock, which a job mapping a large model can hold
+// for seconds; reading them for every process on every sample stalled the daemon (a 3 s ping timed out). Both only
+// change at exec, so they are read once per exec: keyed by pid, start time and comm.
+const execCache = new Map<number, { key: string; ticket?: number; cmd?: string }>();
+const execEntry = (pid: number, key: string) => {
+  let e = execCache.get(pid);
+  if (e?.key !== key) execCache.set(pid, (e = { key }));
+  return e;
+};
 
 // One pass over /proc: our processes with their ticket tag, memory and CPU time.
 export function scanProcs(): Map<number, Proc> {
@@ -193,16 +209,21 @@ export function scanProcs(): Map<number, Proc> {
     const r = stat.lastIndexOf(")");
     const comm = stat.slice(stat.indexOf("(") + 1, r);
     const f = stat.slice(r + 2).split(" ");
-    let ticket: number | undefined;
-    try {
-      const env = fs.readFileSync(`/proc/${pid}/environ`, "latin1");
-      const i = env.indexOf("B70Q_TICKET=");
-      if (i >= 0 && (i === 0 || env[i - 1] === "\0")) ticket = Number(env.slice(i + 12, env.indexOf("\0", i)));
-    } catch {}
+    const e = execEntry(pid, `${f[19]} ${comm}`);
+    if (!("ticket" in e)) {
+      e.ticket = undefined;
+      try {
+        const env = fs.readFileSync(`/proc/${pid}/environ`, "latin1");
+        const i = env.indexOf("B70Q_TICKET=");
+        if (i >= 0 && (i === 0 || env[i - 1] === "\0")) e.ticket = Number(env.slice(i + 12, env.indexOf("\0", i)));
+      } catch {}
+    }
+    const ticket = e.ticket;
     out.set(pid, {
       pid, ppid: Number(f[1]), comm, start: Number(f[19]), ticket,
       rss: Number(f[21]) * page, cpu: (Number(f[11]) + Number(f[12])) / CLK_TCK,
     });
   }
+  for (const pid of execCache.keys()) if (!out.has(pid)) execCache.delete(pid);
   return out;
 }

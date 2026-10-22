@@ -14,8 +14,14 @@ export async function api<T = any>(method: string, path: string, body?: unknown,
   return res.json() as Promise<T>;
 }
 
+// Down only when the socket is missing or refuses the connection; a daemon that is slow to answer (heavy I/O on the
+// machine) gets three tries before callers fall back to the old lock.
 export async function up(): Promise<boolean> {
-  try { await api("GET", "/api/ping", undefined, 3000); return true; } catch { return false; }
+  for (let i = 0; i < 3; i++) {
+    try { await api("GET", "/api/ping", undefined, 4000); return true; }
+    catch (e: any) { if (e?.name !== "TimeoutError") return false; }
+  }
+  return false;
 }
 
 export const ts = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
