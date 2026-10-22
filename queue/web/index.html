@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>B70 queue</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%235fb3ff%22/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">B70 <span>queue</span></div>
+    <div id="pill" class="pill">…</div>
+    <div id="statusText" class="statusText"></div>
+    <div class="kpis" id="kpis"></div>
+    <div class="actions"><button id="pauseBtn"></button></div>
+  </header>
+  <main>
+    <section class="card now" id="now"><h2>Now</h2><div class="body"></div></section>
+    <section class="card queue" id="queue"><h2>Queue</h2><div class="body"></div></section>
+    <section class="card wide live">
+      <h2>Live <span class="seg" id="range"><button data-min="15" class="on">15 min</button><button data-min="60">1 h</button></span></h2>
+      <div class="charts">
+        <div><h3>VRAM <small>GiB · card / current job</small></h3><div id="chVram"></div></div>
+        <div><h3>Power <small>W</small></h3><div id="chPower"></div></div>
+        <div><h3>GPU busy <small>%</small></h3><div id="chUtil"></div></div>
+        <div><h3>Temperature <small>°C · GPU / VRAM</small></h3><div id="chTemp"></div></div>
+      </div>
+    </section>
+    <section class="card wide">
+      <h2>Timeline <span class="seg" id="tlRange"><button data-h="6">6 h</button><button data-h="24" class="on">24 h</button><button data-h="72">3 d</button></span></h2>
+      <div id="timeline"></div>
+    </section>
+    <section class="card alerts" id="alerts"><h2>Alerts</h2><div class="body"></div></section>
+    <section class="card others" id="others"><h2>Also on the card</h2><div class="body"></div></section>
+    <section class="card wide" id="history"><h2>History</h2><div class="body"></div></section>
+    <section class="card wide" id="stats"><h2>Job types <small>learned from past runs; queue estimates come from these</small></h2><div class="body"></div></section>
+  </main>
+  <div id="tip" class="tip"></div>
+  <script type="module" src="./app.ts"></script>
+</body>
+</html>

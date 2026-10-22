@@ -1,0 +1,16 @@
+{
+  "name": "b70q",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "daemon": "bun src/daemon.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "uplot": "^1.6.32"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
+  }
+}

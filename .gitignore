@@ -1,0 +1,3 @@
+# build outputs and local state live inside the submodules / subtrees; nothing here but code
+*.log
+__pycache__/

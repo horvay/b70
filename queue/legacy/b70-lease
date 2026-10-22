@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Exclusive lease on the Intel Arc Pro B70, shared by every agent and project on this PC. One holder at a time: a flock
+# on $LOCK, released automatically when the holder process exits.
+# After taking the lock it also waits for the card's VRAM to drop below MIN_GIB (`nvtop -s`, device-level only), for
+# B70 users that don't take the lease (Greg's own runs). It never inspects processes.
+#
+# usage:
+#   b70-lease run <owner> [--min-gib N] -- <cmd...>   wait, hold the lease while <cmd> runs, release on exit (jobs)
+#   b70-lease acquire <owner> [--ttl 4h] [--min-gib N] wait, then hold the lease in the background; prints the token
+#                                                     (servers, or work spread over several tool calls)
+#   b70-lease release <token>                         end an acquired lease
+#   b70-lease status                                  holder (owner, pid, since) and B70 VRAM in use
+#   b70-lease vram                                    B70 VRAM in use, GiB
+#   b70-lease waiters                                 number of jobs waiting for the lease
+#   b70-lease yield [max_s]                           for long jobs split into chunks, between two holds: if anyone is
+#                                                     waiting, wait until one of them has the lease (max_s, default 120)
+# Waiters check the lock every 2 s and print a line every POLL seconds (default 60); each leaves $D/wait.<pid> while
+# it waits, so chunked jobs can see them. Exit codes: 0 ok, 2 usage.
+set -u
+D=${XDG_STATE_HOME:-$HOME/.local/state}/b70; LOCK=$D/lock; HOLDER=$D/holder; mkdir -p "$D"; touch "$LOCK"
+POLL=${B70_LEASE_POLL:-60}
+
+vram() { timeout 20 nvtop -s 2>/dev/null | python3 -c "
+import json, sys
+try: print(next(round(int(d['mem_used']) / 2**30, 2) for d in json.load(sys.stdin) if 'B70' in d['device_name']))
+except Exception: print('')"; }
+holder() { [[ -s $HOLDER ]] && cat "$HOLDER" || echo "none"; }
+wait_vram() {  # $1 = max GiB
+  local u; while u=$(vram); [[ -z $u ]] || python3 -c "import sys; sys.exit(0 if $u >= $1 else 1)"; do
+    echo "$(date +%T) b70-lease: lease held, waiting for B70 VRAM (${u:-unknown} GiB in use)" >&2; sleep "$POLL"; done
+}
+take_lock() {  # waits on fd 9 until the lock is ours; registers as a waiter meanwhile
+  flock -n 9 && return
+  local w=$D/wait.$$ t=0; echo "${owner:-?}" > "$w"; trap 'rm -f "'"$w"'"' EXIT
+  until flock -n 9; do
+    (( t % POLL == 0 )) && echo "$(date +%T) b70-lease: B70 leased by $(holder), waiting" >&2
+    sleep 2; t=$((t + 2))
+  done
+  rm -f "$w"; trap - EXIT
+}
+waiters() {  # live waiters; files of dead ones are removed
+  local n=0 f; for f in "$D"/wait.*; do [[ -e $f ]] || continue
+    if kill -0 "${f##*.}" 2>/dev/null; then n=$((n + 1)); else rm -f "$f"; fi; done; echo $n; }
+
+cmd=${1:-}; shift || true
+case $cmd in
+  run)
+    owner=${1:?owner}; shift; min=1
+    [[ ${1:-} == --min-gib ]] && { min=$2; shift 2; }
+    [[ ${1:-} == -- ]] && shift
+    [[ $# -gt 0 ]] || { echo "b70-lease run <owner> -- <cmd...>" >&2; exit 2; }
+    exec 9>>"$LOCK"; take_lock
+    echo "$owner pid=$$ since=$(date '+%F %T') mode=run" > "$HOLDER"
+    wait_vram "$min"
+    echo "$(date +%T) b70-lease: B70 leased to $owner" >&2
+    "$@" 9>&-; rc=$?
+    : > "$HOLDER"; exit $rc ;;
+  acquire)
+    owner=${1:?owner}; shift; ttl=4h; min=1
+    while [[ $# -gt 0 ]]; do case $1 in --ttl) ttl=$2; shift 2;; --min-gib) min=$2; shift 2;; *) echo "unknown $1" >&2; exit 2;; esac; done
+    exec 9>>"$LOCK"; take_lock
+    # Hand the lock to a detached holder that lives until release or the TTL, then let go of our own copy.
+    setsid bash -c 'echo "'"$owner"' pid=$$ since=$(date "+%F %T") mode=acquire ttl='"$ttl"'" > "'"$HOLDER"'"; exec sleep '"$ttl" >/dev/null 2>&1 &
+    tok=$!
+    sleep 0.3; exec 9>&-
+    wait_vram "$min"
+    echo "$(date +%T) b70-lease: B70 leased to $owner (token $tok, ttl $ttl); end it with: b70-lease release $tok" >&2
+    echo "$tok" ;;
+  release)
+    tok=${1:?token}
+    grep -q "pid=$tok " "$HOLDER" 2>/dev/null || { echo "b70-lease: token $tok is not the current holder ($(holder))" >&2; exit 1; }
+    kill "$tok" 2>/dev/null; : > "$HOLDER"; echo "$(date +%T) b70-lease: released" >&2 ;;
+  status)
+    exec 9>>"$LOCK"
+    if flock -n 9; then echo "lease: free"; : > "$HOLDER"; else echo "lease: $(holder)"; fi
+    echo "vram_gib: $(vram)" ;;
+  vram) vram ;;
+  waiters) waiters ;;
+  yield)
+    max=${1:-120}; sleep 3; t=3
+    exec 9>>"$LOCK"
+    while (( t < max )) && [[ $(waiters) -gt 0 ]] && flock -n 9; do flock -u 9; sleep 2; t=$((t + 2)); done
+    (( t > 3 )) && echo "$(date +%T) b70-lease: yielded ${t}s, now $(holder)" >&2; exit 0 ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

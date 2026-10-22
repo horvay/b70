@@ -1,0 +1,97 @@
+#!/bin/bash
+# drama3_clone: batched Fish Audio Drama 3 voice cloning on the Intel Arc Pro B70 (ggml SYCL backend with XMX kernels,
+# ~/b70/engines/audio.cpp; 0.132 s/s on bench256 against 0.159 for the old Vulkan build).
+# A drop-in alternative to fish_clone.py (Fish S2 Pro): same TSV, same output layout.
+#
+# usage: drama3_clone <jobs.tsv> --out DIR [--voices-dir DIR] [--batch N] [any drama3_batch option]
+#
+#   jobs.tsv   out_name<TAB>voice<TAB>text[<TAB>ref_text]  (fish_clone.py format)
+#              voice = a wav path, or <voices-dir>/<voice>.wav with a <voice>.txt transcript next to it
+#   --out      output folder (required unless the local defaults set OUT); writes <out>/<out_name>.wav,
+#              44.1 kHz mono 16-bit, creating subfolders such as Voice/ from out_name
+#   --voices-dir  where named voices are (default .)
+#   Local defaults for --out and --voices-dir (OUT=, VOICES=) may be kept outside the repo in
+#   ~/.config/b70/drama3_clone.env (or DRAMA3_CLONE_CONF).
+#   --batch    rows decoded together (default 16)
+#   --chunk N  generate N lines per hold of the B70 (default 1600, about 30 min); 0 = the whole run in one hold.
+#              Between chunks the b70q queue (b70-lease) decides who goes next: other owners get the card when this
+#              run's 30-minute turn is over, so no break is needed (--break S still sleeps S seconds between chunks)
+#   --one-chunk  run one chunk, then exit 99 if lines are left, 0 when all are done (for b70q submit --chunked)
+#   --submit   hand the whole run to the B70 queue as a chunked job and return at once: prints the ticket id
+#              (b70q log <id> -f, b70q wait <id>); extra b70q options in B70Q_SUBMIT_OPTS, e.g. "--note 'act 2'"
+#   B70_OWNER  queue label (default drama3-clone)
+#
+# Existing outputs are skipped, so an interrupted run resumes. Lines are grouped by voice; each voice's reference
+# is encoded once (cached in <out>/.ref_codes) and its prompt prefix is computed once per run. Text may contain
+# Drama 3 inline tags such as [whispering], [sighs] or [laughing]; [crying] and [sobbing] are read as [tearful].
+# A line that runs past 100 + 4.5 frames per character (+65 per pause tag) is regenerated once with another seed;
+# both cases are listed in <out>/limited.tsv.
+# The job takes the shared B70 lease (b70-lease) per chunk and gives it up between chunks. Progress and s/s go to stderr.
+#
+# Examples:
+#   drama3_clone jobs.tsv --out wav --voices-dir voices
+#   drama3_clone eval/eval.tsv --out /tmp/test --batch 8 --limit 20 --chunk 0
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)   # ~/b70/tools
+BIN=${DRAMA3_BIN:-$(dirname "$HERE")/engines/audio.cpp/build/linux-sycl-release/bin/drama3_batch}
+MODEL=${DRAMA3_MODEL:-$HOME/models/voice/drama3/drama-3-backbone-8bit-experts-Q4_K.gguf}
+[[ $# -ge 1 ]] || { sed -n '2,30p' "$0"; exit 2; }
+JOBS=$1; shift
+OUT=
+VOICES=.
+CONF=${DRAMA3_CLONE_CONF:-$HOME/.config/b70/drama3_clone.env}
+[[ -f $CONF ]] && . "$CONF"
+BATCH=16
+CHUNK=1600
+BREAK=0
+ONE=0
+SUBMIT=0
+OWNER=${B70_OWNER:-drama3-clone}
+ORIG=("$@")
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --out) OUT=$2; shift 2;;
+    --voices-dir) VOICES=$2; shift 2;;
+    --batch) BATCH=$2; shift 2;;
+    --chunk) CHUNK=$2; shift 2;;
+    --break) BREAK=$2; shift 2;;
+    --one-chunk) ONE=1; shift;;
+    --submit) SUBMIT=1; shift;;
+    *) ARGS+=("$1"); shift;;
+  esac
+done
+[[ -n $OUT ]] || { echo "drama3_clone: --out DIR is required" >&2; exit 2; }
+# SYCL on the Arc only (Level Zero device 0; never the NVIDIA card).
+export D3_BACKEND=${D3_BACKEND:-sycl} ONEAPI_DEVICE_SELECTOR=${ONEAPI_DEVICE_SELECTOR:-level_zero:0} CUDA_VISIBLE_DEVICES=""
+mkdir -p "$OUT"
+if [[ $SUBMIT == 1 ]]; then   # the queue runs this script with --one-chunk until every line is done
+  pass=(); for a in "${ORIG[@]}"; do [[ $a == --submit ]] || pass+=("$a"); done
+  eval "extra=(${B70Q_SUBMIT_OPTS:-})"
+  exec b70q submit "$OWNER" --chunked --retries 3 --note "drama3 $(basename "$JOBS")" "${extra[@]}" -- \
+    "$(readlink -f "$0")" "$(readlink -f "$JOBS")" "${pass[@]}" --out "$(readlink -f "$OUT")" --one-chunk
+fi
+run() { b70-lease run "$OWNER" --note "drama3 $(basename "$JOBS")" -- "$BIN" "$JOBS" --model "$MODEL" --voices-dir "$VOICES" --out "$OUT" \
+  --batch "$BATCH" "$@" "${ARGS[@]}"; }
+[[ $CHUNK -gt 0 ]] || { run; exit $?; }
+# lines whose output wav doesn't exist yet
+left() { python3 -c 'import os,sys
+print(sum(1 for l in open(sys.argv[1]) if l.strip() and not os.path.exists(os.path.join(sys.argv[2], l.split("\t")[0] + ".wav"))))' "$JOBS" "$OUT"; }
+if [[ $ONE == 1 ]]; then
+  n=$(left); [[ $n -gt 0 ]] || { echo "$(date +%T) drama3_clone: all lines done" >&2; exit 0; }
+  echo "$(date +%T) drama3_clone: $n lines left, this chunk $CHUNK" >&2
+  run --limit "$CHUNK" || exit $?            # a crash: the queue retries (b70q submit --retries)
+  m=$(left); echo "$(date +%T) drama3_clone: chunk done, $m lines left" >&2
+  [[ $m -gt 0 ]] && exit 99; exit 0
+fi
+while n=$(left); [[ $n -gt 0 ]]; do
+  echo "$(date +%T) drama3_clone: $n lines left, next chunk $CHUNK" >&2
+  if ! run --limit "$CHUNK"; then   # a crash: finished clips are kept, so retry; give up after 3 in a row with no progress
+    m=$(left); if [[ $m -lt $n ]]; then fails=0; else fails=$((${fails:-0} + 1)); fi
+    echo "$(date +%T) drama3_clone: chunk failed ($m lines left, $fails failures without progress)" >&2
+    [[ $fails -lt 3 ]] || { echo "$(date +%T) drama3_clone: giving up" >&2; exit 1; }
+  fi
+  [[ $(left) -gt 0 ]] || break
+  [[ $BREAK -gt 0 ]] && { echo "$(date +%T) drama3_clone: B70 released for ${BREAK}s" >&2; sleep "$BREAK"; }
+done
+echo "$(date +%T) drama3_clone: all lines done" >&2

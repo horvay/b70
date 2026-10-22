@@ -1,0 +1,4 @@
+#!/bin/sh
+B=/usr/bin/bun
+[ -x "$B" ] || B=$(command -v bun)
+exec "$B" "$HOME/b70/queue/src/cli.ts" "$@"

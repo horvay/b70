@@ -1,0 +1,5 @@
+#!/bin/sh
+# Shared lease on the Intel Arc Pro B70, through the b70q queue daemon (~/b70/queue). Falls back to the old flock script.
+B=/usr/bin/bun
+[ -x "$B" ] || B=$(command -v bun) || exec "$HOME/b70/queue/legacy/b70-lease" "$@"
+exec "$B" "$HOME/b70/queue/src/lease.ts" "$@"

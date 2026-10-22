@@ -1,0 +1,13 @@
+[Unit]
+Description=b70q: the queue for the Intel Arc Pro B70 (dashboard http://127.0.0.1:7870/)
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/bun %h/b70/queue/src/daemon.ts
+WorkingDirectory=%h/b70/queue
+Restart=always
+RestartSec=2
+# Submitted jobs run in their own units (b70q-<id>.service), so restarting the daemon never touches them.
+
+[Install]
+WantedBy=default.target

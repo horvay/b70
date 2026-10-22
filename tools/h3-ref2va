@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# h3-ref2va: MiniMax H3 Ref2VA shots on the Arc Pro B70 with the one sd-cli (~/b70/engines/sd.cpp: ggml SYCL backend
+# + native XPU block libraries; no ComfyUI, no torch, no Vulkan). Replaces the per-project run-ref2va.sh and
+# run-ref2va-multi.sh copies.
+#
+# usage (in a folder with shots/ in it, or SHOTS=<that folder>):
+#   h3-ref2va SHOT FRAMES [ATTEMPT] [SEED]   one shot
+#   h3-ref2va --queue QUEUE_FILE             several shots in one sd-cli process; QUEUE_FILE lines: SHOT FRAMES ATTEMPT SEED
+#                                            ('#' and blank lines skipped). The text encoder runs once for all shots and is
+#                                            freed, then the shots are sampled and decoded with the diffusion weights kept
+#                                            loaded. Shots whose raw.mp4.avi exists, or that have an env.sh, are skipped.
+# A shot is shots/<SHOT>/prompt.txt plus shots/<SHOT>/inputs/: ref-*.png, motion-frames/, motion-audio.wav,
+# guides.txt (FILE@FRAME[@STRENGTH] per line, FILE relative to inputs/), guide-audio.wav. Optional shots/<SHOT>/env.sh
+# overrides settings for that shot (single-shot mode only). Output: shots/<SHOT>/<ATTEMPT>/raw.mp4.avi (with audio),
+# sheet.jpg, prompt.txt, guides.txt, settings.env, run.log.
+#
+# The sd-cli process takes the B70 through the b70q queue (b70-lease run $B70_OWNER, default <parent folder>-h3); inside a
+# queued job (tools/h3_submit.sh, b70q submit) it runs at once.
+#
+# Settings (environment): W H (1344x768) STEPS (4) SAMPLER (euler) EXTRA (more sd-cli flags; --queue mode also reads
+# extra-args.txt) FA_FLAG MAX_VRAM BACKEND; models DIFF LLM VAE AVAE (default ~/models/video/minimax-h3); SD (sd-cli).
+#   SD_XPU_H3_LIB      transformer blocks in libxpu_h3.so (default); empty = blocks in ggml
+#   SD_XPU_H3_INT8=1   int8 W8A8 blocks (faster, default off)
+#   SD_XPU_H3_LORA     block LoRAs "file@strength,..." (default Better Human Motion @0.5); empty = none
+#   SD_XPU_H3VAE_LIB   VAE decoder in libxpu_h3vae.so (default in --queue mode); empty = ggml decoder (single-shot default)
+#   SD_XPU_H3_CONTROL  Fun ControlNet-Union "file[@strength]" for --control-video inputs
+set -euo pipefail
+
+B70=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+XPU=$B70/engines/sd.cpp/xpu_sdpa
+M=${H3_MODELS:-$HOME/models/video/minimax-h3}
+HERE=$(cd "${SHOTS:-$PWD}" && pwd)
+[[ -d $HERE/shots ]] || { echo "h3-ref2va: no shots/ in $HERE (run it in a folder with shots/ in it)" >&2; exit 2; }
+OWNER=${B70_OWNER:-$(basename "$(dirname "$HERE")")-h3}
+
+MODE=single
+if [[ ${1:-} == --queue ]]; then
+  MODE=queue; QUEUE=${2:?usage: h3-ref2va --queue QUEUE_FILE}
+  [[ -f $QUEUE ]] || { echo "no queue file $QUEUE" >&2; exit 1; }
+else
+  [[ $# -ge 2 ]] || { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+  SCENE=$1 FRAMES=$2 ATTEMPT=${3:-attempt-01} SEED=${4:-2026100104}
+fi
+
+SD=${SD:-$B70/engines/sd.cpp/build-sycl/bin/sd-cli}
+DIFF=${DIFF:-$M/dasiwa-hybridv4turbo-q8_0.gguf}
+LLM=${LLM:-$M/text-encoder/qwen3vl_32b_minimax_h3-Q4_K_M.gguf}
+VAE=${VAE:-$M/vae/minimax_h3_video_vae_fp16.safetensors}
+AVAE=${AVAE:-$M/vae/minimax_h3_audio_vae_fp32.safetensors}
+W=${W:-1344}
+H=${H:-768}
+STEPS=${STEPS:-4}
+SAMPLER=${SAMPLER:-euler}
+BACKEND=${BACKEND:-diffusion=SYCL0,te=SYCL0,vae=SYCL0}
+if [[ $MODE == queue ]]; then EXTRA=${EXTRA:-$(cat "$HERE/extra-args.txt" 2>/dev/null || true)}; else EXTRA=${EXTRA:-}; fi
+export ONEAPI_DEVICE_SELECTOR=${ONEAPI_DEVICE_SELECTOR:-level_zero:0}  # SYCL sees only the B70
+
+xpu_env() {  # the native XPU libraries; an empty variable turns a library off
+  export SD_XPU_H3_LIB=${SD_XPU_H3_LIB-$XPU/libxpu_h3.so}
+  export SD_XPU_H3_WEIGHTS=${SD_XPU_H3_WEIGHTS:-$M/DasiwaMinimaxH3_dasiwaHybridV4Turbo_3281858.safetensors}
+  [[ -z $SD_XPU_H3_LIB ]] && unset SD_XPU_H3_LIB
+  export SD_XPU_H3_LORA=${SD_XPU_H3_LORA-$M/loras/better_motion_h3_lora_v1_500.safetensors@0.5}
+  [[ -z $SD_XPU_H3_LORA ]] && unset SD_XPU_H3_LORA
+  local vae_default=; [[ $MODE == queue ]] && vae_default=$XPU/libxpu_h3vae.so
+  export SD_XPU_H3VAE_LIB=${SD_XPU_H3VAE_LIB-$vae_default}
+  export SD_XPU_H3VAE_WEIGHTS=${SD_XPU_H3VAE_WEIGHTS:-$VAE}
+  [[ -z $SD_XPU_H3VAE_LIB ]] && unset SD_XPU_H3VAE_LIB SD_XPU_H3VAE_WEIGHTS
+  for v in SD_XPU_H3_INT8 SD_XPU_H3VAE_DTYPE SD_XPU_H3_CONTROL SD_MULTI_KEEP_XPU_BLOCKS; do [[ -n ${!v:-} ]] && export "$v"; done
+  # With the block library holding the block weights, ggml budgets against live free VRAM (0).
+  MAX_VRAM=${MAX_VRAM:-0}
+  return 0
+}
+
+shot_args() {  # SHOT OUT -> args: refs, motion, guides (copies guides.txt next to the output)
+  local IN=$HERE/shots/$1/inputs f spec
+  args=()
+  for f in "$IN"/ref-*.png; do [[ -e $f ]] && args+=(-r "$f"); done
+  [[ -d $IN/motion-frames ]] && args+=(--ref-video "$IN/motion-frames")
+  [[ -f $IN/motion-audio.wav ]] && args+=(--ref-video-audio "$IN/motion-audio.wav")
+  if [[ -f $IN/guides.txt ]]; then
+    while read -r spec; do [[ -z $spec || $spec == \#* ]] || args+=(--guide "$IN/$spec"); done < "$IN/guides.txt"
+    cp "$IN/guides.txt" "$2/guides.txt"
+  fi
+  [[ -f $IN/guide-audio.wav ]] && args+=(--guide-audio "$IN/guide-audio.wav@0")
+  return 0
+}
+
+settings() {  # SHOT FRAMES SEED OUT [extra line]
+  cp "$HERE/shots/$1/prompt.txt" "$4/prompt.txt"
+  cat > "$4/settings.env" <<EOF
+SCENE=$1 W=$W H=$H FRAMES=$2 STEPS=$STEPS SEED=$3 SAMPLER=$SAMPLER
+BACKEND=$BACKEND
+DIFF=$DIFF
+LLM=$LLM
+EXTRA=$EXTRA
+SD=$SD ${5:-}
+SD_XPU_H3_LORA=${SD_XPU_H3_LORA:-} SD_XPU_H3_LIB=${SD_XPU_H3_LIB:-} SD_XPU_H3_INT8=${SD_XPU_H3_INT8:-} SD_XPU_H3VAE_LIB=${SD_XPU_H3VAE_LIB:-} SD_XPU_H3_CONTROL=${SD_XPU_H3_CONTROL:-} MAX_VRAM=$MAX_VRAM ONEAPI_DEVICE_SELECTOR=$ONEAPI_DEVICE_SELECTOR
+started=$(date -Iseconds)
+EOF
+}
+
+sheet() { ffmpeg -v error -y -i "$1/raw.mp4.avi" -vf "select='not(mod(n\,16))',scale=448:-1,tile=4x3" -frames:v 1 "$1/sheet.jpg" || true; }
+
+build_common() {  # after env.sh, which may change any setting
+  # shellcheck disable=SC2206
+  common=(-M vid_gen --diffusion-model "$DIFF" --vae "$VAE" --audio-vae "$AVAE" --llm "$LLM" --backend "$BACKEND"
+    --offload-to-cpu ${FA_FLAG:---fa} --cfg-scale 1 --sampling-method "$SAMPLER" --scheduler simple --steps "$STEPS"
+    --flow-shift 12 -W "$W" -H "$H" --fps 24 --rng cpu)
+}
+
+if [[ $MODE == single ]]; then
+  DIR=$HERE/shots/$SCENE
+  [[ -f $DIR/prompt.txt ]] || { echo "no $DIR/prompt.txt" >&2; exit 1; }
+  # per-shot overrides (A/B tests): shots/<SCENE>/env.sh may re-export SD, SD_XPU_* ...
+  [[ -f $DIR/env.sh ]] && source "$DIR/env.sh"
+  xpu_env
+  build_common
+  OUT=$DIR/$ATTEMPT
+  mkdir -p "$OUT"
+  shot_args "$SCENE" "$OUT"
+  settings "$SCENE" "$FRAMES" "$SEED" "$OUT"
+  [[ -x $SD ]] || { echo "no sd-cli at $SD" >&2; exit 1; }
+  set +e
+  # shellcheck disable=SC2086
+  b70-lease run "$OWNER" --note "h3 $SCENE $ATTEMPT" -- "$SD" "${common[@]}" "${args[@]}" -p "$(cat "$DIR/prompt.txt")" \
+    --video-frames "$FRAMES" --seed "$SEED" -o "$OUT/raw.mp4" --max-vram "$MAX_VRAM" -v $EXTRA 2>&1 | tee "$OUT/run.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  echo "finished=$(date -Iseconds)" >> "$OUT/settings.env"
+  [[ -s $OUT/raw.mp4.avi ]] || { echo "FAILED $SCENE $ATTEMPT (exit $rc)"; exit $(( rc ? rc : 1 )); }
+  sheet "$OUT"
+  echo "ok $SCENE $ATTEMPT"
+  exit "$rc"
+fi
+
+xpu_env
+build_common
+[[ -x $SD ]] || { echo "no sd-cli at $SD" >&2; exit 1; }
+BATCH=$HERE/shots/multi-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$BATCH"
+JOBS=$BATCH/jobs.jsonl LOG=$BATCH/run.log
+: > "$JOBS"
+shots=()  # "SCENE ATTEMPT" per job, in job order
+while read -r shot frames attempt seed _; do
+  [[ -z ${shot:-} || $shot == \#* ]] && continue
+  [[ -n ${seed:-} ]] || { echo "bad queue line: $shot $frames $attempt" >&2; exit 1; }
+  DIR=$HERE/shots/$shot OUT=$HERE/shots/$shot/$attempt
+  if [[ -s $OUT/raw.mp4.avi ]]; then echo "skip $shot $attempt: raw.mp4.avi exists"; continue; fi
+  if [[ -f $DIR/env.sh ]]; then echo "skip $shot $attempt: has env.sh (render it alone: h3-ref2va $shot $frames $attempt $seed)"; continue; fi
+  [[ -d $DIR/inputs && -f $DIR/prompt.txt ]] || { echo "skip $shot: no inputs/ or prompt.txt"; continue; }
+  mkdir -p "$OUT"
+  shot_args "$shot" "$OUT"
+  args=(-p "$(cat "$DIR/prompt.txt")" "${args[@]}" --video-frames "$frames" --seed "$seed" -o "$OUT/raw.mp4")
+  python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${args[@]}" >> "$JOBS"
+  settings "$shot" "$frames" "$seed" "$OUT" "MULTI_BATCH=$BATCH"
+  shots+=("$shot $attempt")
+done < "$QUEUE"
+if [[ ${#shots[@]} -eq 0 ]]; then echo "nothing to render"; rm -f "$JOBS"; rmdir "$BATCH" 2>/dev/null || true; exit 0; fi
+echo "=== ${#shots[@]} shots -> $BATCH $(date -Iseconds)"
+
+set +e
+# shellcheck disable=SC2086
+b70-lease run "$OWNER" --note "h3 ${#shots[@]} shots" -- "$SD" "${common[@]}" --max-vram "$MAX_VRAM" --multi-jobs "$JOBS" \
+  -v $EXTRA 2>&1 | tee "$LOG"
+rc=${PIPESTATUS[0]}
+set -e
+
+# Split the shared log into each shot's run.log: lines before the first "[multi] job K" marker are common (model
+# loading); after that a line belongs to the job named by the latest marker.
+for i in $(seq 1 "${#shots[@]}"); do
+  read -r shot attempt <<<"${shots[$((i - 1))]}"
+  OUT=$HERE/shots/$shot/$attempt
+  awk -v k="$i" '
+    match($0, /\[multi\] job [0-9]+/) { split(substr($0, RSTART, RLENGTH), a, " "); cur = a[3] + 0 }
+    cur == 0 || cur == k' "$LOG" > "$OUT/run.log"
+  echo "finished=$(date -Iseconds)" >> "$OUT/settings.env"
+  if [[ -s $OUT/raw.mp4.avi ]]; then sheet "$OUT"; echo "ok $shot $attempt"; else echo "FAILED $shot $attempt"; fi
+done
+echo "=== done rc=$rc $(date -Iseconds)"
+exit "$rc"
