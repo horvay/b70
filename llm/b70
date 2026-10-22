@@ -1,0 +1,1163 @@
+#!/usr/bin/env python3
+"""b70: serve large MoE models on an Intel Arc Pro B70 (32 GB) with a RAM tier and an NVMe expert store.
+
+    b70 setup [glm|sglang|dsv41|all]       one-time, CPU only: unpack the SGLang XPU image, fetch and build the kernels
+    b70 info <model dir>                   JSON: which family the model is, whether setup and prepare are done
+    b70 prepare <model dir> [--store DIR]  one-time per model: pack the NVMe expert store (GLM, DSV4.1; Flash-Next
+                                           fills its own)
+    b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram] [--prepare]
+                                           OpenAI-compatible server in the foreground; SIGTERM stops it
+    b70 run glm|sglang|dsv41 <command...>  run a command in an install's sandbox, without the GPU
+    b70 stop                               stop a running `b70 serve`
+    b70 status                             JSON: the running server, if any
+
+Families (by config.json model_type), and the install that serves them:
+  gemma      Gemma 4 EXL3 (gemma4): sglang, drafting with Google's assistant model (--drafter)
+  flashnext  Qwen3.8-Flash-Next EXL3 (qwen4_exp): sglang, experts in VRAM, RAM and an NVMe store
+  glm        GLM-5.3-Flash EXL3 (glm5_next): glm/ (exllamav3 fork + B70 tier), one request at a time
+  dsv41      DeepSeek-V4.1-Flash EXL3 (deepseek_v41): dsv41/ (vcruz305's exllamav3 fork + dsv41/exllamav3.patch, the GLM
+             install's kernels, its own B70 tier), one request at a time, drafting with the model's own DSpark blocks
+The sglang install is SGLang 0.5.20-xpu with 0xSero's trellis-serve (EXL3 kernels for Intel) and trellis-serve.patch.
+
+Everything runs inside the unpacked lmsysorg/sglang XPU image through bubblewrap; no Docker, no root. `serve` and
+`run --gpu` take their turn on the B70 through the b70q queue (~/ai/b70q) when its daemon runs: they wait in line, then
+hold the card; a server (--queue OWNER, --idle DUR) is stopped by the queue after DUR idle on the GPU while another job
+waits. `serve` is also a guard: it stops the server at the first xe fault on the B70 or when RAM runs low, and does not
+start beside a Steam game that has the B70 open.
+
+State lives in B70_STATE (default <repo>/state): the image, per-family overlays, the trellis-serve checkout, caches,
+expert stores, logs. B70_ROOTFS points at an already unpacked image instead; B70_TRELLIS_SRC at a trellis-serve
+checkout to use as is (development).
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import http.client
+import urllib.request
+
+REPO = os.path.dirname(os.path.realpath(__file__))
+STATE = os.path.abspath(os.environ.get("B70_STATE") or os.path.join(REPO, "state"))
+ROOTFS = os.path.realpath(os.environ.get("B70_ROOTFS") or os.path.join(STATE, "image", "rootfs"))
+IMAGE_CONFIG = os.path.join(REPO, "common", "image-config.json")
+# lmsysorg/sglang:v0.5.20-xpu (torch 2.13 XPU, Triton XPU, oneAPI 2026.0 with icpx)
+IMAGE = ("registry-1.docker.io", "lmsysorg/sglang",
+         "sha256:e4e10d66de374e6e8cc88136e8dbfc3182787070df8a48e581fb007cc7a51c36")
+TRELLIS_REPO = "https://github.com/0xSero/trellis-serve.git"
+TRELLIS_COMMIT = "72fd2d4ca8e8de3fce03ab09e3ed1692957c2f8c"     # branch ft-xpu-vision; trellis-serve.patch applies here
+TRELLIS = os.path.abspath(os.environ.get("B70_TRELLIS_SRC") or os.path.join(STATE, "trellis-serve"))
+FAMILIES = {"glm5_next": "glm", "qwen4_exp": "flashnext", "gemma4": "gemma", "deepseek_v41": "dsv41"}
+INSTALL = {"glm": "glm", "flashnext": "sglang", "gemma": "sglang", "dsv41": "dsv41"}     # one SGLang + trellis-serve install
+SETUPS = ["glm", "sglang", "dsv41"]     # `setup all`, in order (dsv41 runs on the glm install's kernels)
+SERVE_INFO = os.path.join(STATE, "serve.json")     # the running `b70 serve` (for status / stop)
+
+
+def say(*a):
+    print("b70:", *a, flush=True)
+
+
+def fail(msg, code=1):
+    print(f"b70: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------- models and state
+
+def read_model(model_dir):
+    """(family, config) of an EXL3 model folder, family None when b70 does not serve it."""
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None, {}
+    q = cfg.get("quantization_config") or {}
+    if q.get("quant_method") != "exl3" and not os.path.exists(os.path.join(model_dir, "quantization_config.json")):
+        return None, cfg
+    return FAMILIES.get(cfg.get("model_type")), cfg
+
+
+def default_store(family):
+    return os.path.join(STATE, "stores", family)
+
+
+def glm_store_ready(store):
+    return os.path.exists(os.path.join(store, "glm53_flash_exl3_experts_blob.json"))
+
+
+def dsv41_store_ready(store):
+    """The packed experts with the DSpark drafter's appended (pack_store.main, then append_mtp)."""
+    try:
+        with open(os.path.join(store, "experts.json")) as f:
+            return "mtp_layers" in json.load(f)
+    except (OSError, ValueError):
+        return False
+
+
+def store_ready(family, store):
+    return {"glm": glm_store_ready, "dsv41": dsv41_store_ready}.get(family, lambda _: True)(store)
+
+
+def patch_sha():
+    with open(os.path.join(REPO, "trellis-serve.patch"), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
+def setup_marker(family):
+    return os.path.join(STATE, f"setup-{family}.json")
+
+
+def setup_wanted(family):
+    """What a finished setup of `family` must have been built from; a change means setup runs again."""
+    if family == "glm":
+        sub = subprocess.run(["git", "-C", os.path.join(REPO, "glm", "exllamav3"), "rev-parse", "HEAD"],
+                             capture_output=True, text=True)
+        return {"exllamav3": sub.stdout.strip(), "build": file_sha(os.path.join(REPO, "glm", "xpu", "build.sh"))}
+    if family == "dsv41":
+        # ./ : relative to this folder, which need not be the git repository's root
+        sub = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD:./dsv41/exllamav3"], capture_output=True,
+                             text=True)
+        csrc = os.path.join(REPO, "dsv41", "xpu", "csrc")
+        kernels = hashlib.sha256()
+        for name in sorted(os.listdir(csrc)) if os.path.isdir(csrc) else []:
+            kernels.update(name.encode() + (file_sha(os.path.join(csrc, name)) or "").encode())
+        return {"exllamav3": sub.stdout.strip(), "patch": file_sha(os.path.join(REPO, "dsv41", "exllamav3.patch")),
+                "build": file_sha(os.path.join(REPO, "dsv41", "xpu", "build.sh")), "kernels": kernels.hexdigest()[:16]}
+    src = "dev:" + TRELLIS if os.environ.get("B70_TRELLIS_SRC") else f"{TRELLIS_COMMIT}+{patch_sha()}"
+    return {"trellis": src, "into": "rootfs"}
+
+
+def file_sha(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def setup_done(family):
+    family = INSTALL.get(family, family)
+    try:
+        with open(setup_marker(family)) as f:
+            return json.load(f) == setup_wanted(family) and image_ready()
+    except (OSError, ValueError):
+        return False
+
+
+def image_ready():
+    return os.path.isfile(os.path.join(ROOTFS, "opt", "venv", "bin", "python3")) or \
+        os.path.isfile(os.path.join(ROOTFS, "usr", "bin", "python3"))
+
+
+# ------------------------------------------------------------------------------------------------------- sandbox
+
+def image_env():
+    with open(IMAGE_CONFIG) as f:
+        env = dict(e.split("=", 1) for e in json.load(f)["config"].get("Env", []))
+    return env
+
+
+def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None, template=None, drafter=None,
+            write_root=False):
+    """The bwrap command line that runs `cmd` in the image for `family`, the rootfs under a throw-away overlay (each
+    sandbox its own: a shared persistent overlay was busy for a moment after every sandbox exited).
+
+    glm: glm/ at /w (its build output, pylib, run/ and cache/ live there).
+    dsv41: the repo at /w (dsv41/ runs on glm/'s kernels and pylib), from /w/dsv41; the model's shards that are links
+    into other drives (the Engram tables) are bound at their own paths.
+    sglang: trellis-serve at /opt/trellis-serve, flashnext/ read-only at /opt/b70; setup (write_root) installs
+    oneDNN and the editable trellis-serve into the rootfs itself, which is b70's own copy of the image."""
+    family = INSTALL.get(family, family)
+    env = dict(env or {})
+    img = image_env()
+    args = ["bwrap"]
+    if family == "glm":
+        w = os.path.join(REPO, "glm")
+        for d in ("run", "cache"):
+            os.makedirs(os.path.join(w, d), exist_ok=True)
+        args += ["--overlay-src", ROOTFS, "--tmp-overlay", "/"]
+        binds = ["--bind", w, "/w", "--tmpfs", "/root", "--bind", os.path.join(w, "cache"), "/root/.cache"]
+        pp = img.get("PYTHONPATH", "")
+        env.setdefault("PYTHONPATH", "/w/xpu:/w/exllamav3:/w/pylib" + (":" + pp if pp else ""))
+        env.setdefault("TRITON_CACHE_DIR", "/root/.cache/triton")
+        chdir = chdir or "/w"
+    elif family == "dsv41":
+        w = os.path.join(REPO, "dsv41")
+        for d in ("run", "cache"):
+            os.makedirs(os.path.join(w, d), exist_ok=True)
+        args += ["--overlay-src", ROOTFS, "--tmp-overlay", "/"]
+        binds = ["--bind", REPO, "/w", "--tmpfs", "/root", "--bind", os.path.join(w, "cache"), "/root/.cache"]
+        for d in linked_dirs(model):
+            binds += ["--ro-bind", d, d]
+        pp = img.get("PYTHONPATH", "")
+        env.setdefault("PYTHONPATH", "/w/dsv41/xpu:/w/glm/xpu:/w/dsv41/exllamav3:/w/glm/pylib" + (":" + pp if pp else ""))
+        env.setdefault("TRITON_CACHE_DIR", "/root/.cache/triton")
+        env.setdefault("SYCL_CACHE_PERSISTENT", "1")
+        env.setdefault("SYCL_CACHE_DIR", "/root/.cache/sycl")
+        chdir = chdir or "/w/dsv41"
+    else:
+        cache, run = os.path.join(STATE, "cache", family), os.path.join(STATE, "run", family)
+        for d in (cache, run):
+            os.makedirs(d, exist_ok=True)
+        args += ["--bind", ROOTFS, "/"] if write_root else ["--overlay-src", ROOTFS, "--tmp-overlay", "/"]
+        binds = ["--bind", TRELLIS, "/opt/trellis-serve", "--ro-bind", os.path.join(REPO, "flashnext"), "/opt/b70",
+                 "--bind", run, "/run/b70", "--bind", cache, "/root/.cache"]
+        chdir = chdir or "/opt/trellis-serve/xpu"
+    args += ["--dev-bind", "/dev", "/dev"] if gpu else ["--dev", "/dev"]
+    args += ["--proc", "/proc", "--ro-bind", "/sys", "/sys", "--tmpfs", "/tmp",
+             "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+    args += binds
+    if model:
+        args += ["--ro-bind", model, "/models" if family in ("glm", "dsv41") else "/model"]
+    if store:
+        args += ["--bind", store, "/nvx"]
+    if template:
+        args += ["--ro-bind", template, "/opt/chat_template.jinja"]
+    if drafter:
+        args += ["--ro-bind", drafter, "/drafter"]
+    args += ["--setenv", "HOME", "/root"]
+    try:
+        tz = open("/etc/localtime", "rb").read().splitlines()[-1].decode()
+        args += ["--setenv", "TZ", tz]
+    except (OSError, IndexError, UnicodeDecodeError):
+        pass
+    for k, v in {**img, **env}.items():
+        args += ["--setenv", k, str(v)]
+    args += ["--unshare-pid", "--die-with-parent", "--chdir", chdir]
+    return args + list(cmd)
+
+
+def linked_dirs(model):
+    """Directories outside the model folder that its files link to (DSV4.1's Engram shards often live on other
+    drives), each bound read-only at its own path."""
+    dirs = []
+    if not model:
+        return dirs
+    for name in sorted(os.listdir(model)):
+        path = os.path.join(model, name)
+        if os.path.islink(path):
+            d = os.path.dirname(os.path.realpath(path))
+            if d not in dirs and os.path.isdir(d):
+                dirs.append(d)
+    return dirs
+
+
+def run_in(family, cmd, **kw):
+    r = subprocess.run(sandbox(family, cmd, **kw))
+    if r.returncode != 0:
+        fail(f"{family}: `{' '.join(cmd)[:120]}` failed (exit {r.returncode})")
+
+
+# --------------------------------------------------------------------------------------------------------- setup
+
+def setup_image():
+    if image_ready():
+        return
+    if not shutil.which("bwrap"):
+        fail("bubblewrap (bwrap) is not installed; install it with your package manager")
+    say(f"pulling {IMAGE[1]}@{IMAGE[2][:19]} into {ROOTFS} (~25 GB; resumes if interrupted)")
+    os.makedirs(os.path.dirname(ROOTFS), exist_ok=True)
+    r = subprocess.run([sys.executable, os.path.join(REPO, "common", "oci_pull.py"), *IMAGE, ROOTFS])
+    if r.returncode != 0 or not image_ready():
+        fail("pulling the image failed")
+
+
+def setup_glm():
+    if not os.path.isfile(os.path.join(REPO, "glm", "exllamav3", "exllamav3", "__init__.py")):
+        r = subprocess.run(["git", "-C", REPO, "submodule", "update", "--init", "glm/exllamav3"])
+        if r.returncode != 0:
+            fail("glm/exllamav3 is missing and `git submodule update --init` failed")
+    say("glm: installing llguidance and marisa-trie into glm/pylib")
+    run_in("glm", ["pip", "install", "-q", "--no-deps", "--target", "/w/pylib", "llguidance==1.9.1",
+                   "marisa-trie==1.4.1"])
+    say("glm: building the SYCL kernels (a few minutes)")
+    run_in("glm", ["bash", "/w/xpu/build.sh"])
+
+
+def setup_dsv41():
+    if not setup_done("glm"):
+        fail("dsv41 runs on the glm install's kernels and pylib; run `b70 setup glm` first")
+    sub = os.path.join(REPO, "dsv41", "exllamav3")
+    if not os.path.isfile(os.path.join(sub, "exllamav3", "__init__.py")):
+        r = subprocess.run(["git", "-C", REPO, "submodule", "update", "--init", "dsv41/exllamav3"])
+        if r.returncode != 0:
+            fail("dsv41/exllamav3 is missing and `git submodule update --init` failed")
+    # B70 changes to vcruz305's fork (lenient draft acceptance, XPU device checks, tile sizes, the row-blocked indexer)
+    patch = os.path.join(REPO, "dsv41", "exllamav3.patch")
+    applied = subprocess.run(["git", "-C", sub, "apply", "--reverse", "--check", patch], capture_output=True)
+    if applied.returncode != 0:
+        say("dsv41: applying dsv41/exllamav3.patch")
+        if subprocess.run(["git", "-C", sub, "apply", "--whitespace=nowarn", patch]).returncode != 0:
+            fail("dsv41/exllamav3.patch does not apply to dsv41/exllamav3 (local changes there?)")
+    say("dsv41: building the SYCL kernels (a few minutes)")
+    run_in("dsv41", ["bash", "/w/dsv41/xpu/build.sh"])
+
+
+def fetch_trellis():
+    if os.environ.get("B70_TRELLIS_SRC"):
+        if not os.path.isdir(os.path.join(TRELLIS, "xpu")):
+            fail(f"B70_TRELLIS_SRC={TRELLIS} is not a trellis-serve checkout")
+        return
+    patch = os.path.join(REPO, "trellis-serve.patch")
+    mark = os.path.join(TRELLIS, ".b70-patch")
+    want = f"{TRELLIS_COMMIT}+{patch_sha()}"
+    if open(mark).read().strip() == want if os.path.exists(mark) else False:
+        return
+    git = lambda *a: subprocess.run(["git", "-C", TRELLIS, *a], check=True)  # noqa: E731
+    if not os.path.isdir(os.path.join(TRELLIS, ".git")):
+        os.makedirs(TRELLIS, exist_ok=True)
+        git("init", "-q")
+        git("remote", "add", "origin", TRELLIS_REPO)
+    say(f"sglang: fetching trellis-serve {TRELLIS_COMMIT[:12]}")
+    git("fetch", "-q", "--depth", "1", "origin", TRELLIS_COMMIT)
+    git("checkout", "-q", "-f", TRELLIS_COMMIT)
+    git("clean", "-q", "-fdx")
+    git("apply", "--whitespace=nowarn", patch)
+    with open(mark, "w") as f:
+        f.write(want + "\n")
+
+
+SGLANG_BUILD = r"""
+X=/opt/trellis-serve/xpu/exl3xpu
+python3 -c "import sys, torch, sglang; print(sys.version.split()[0], 'torch', torch.__version__, 'sglang', sglang.__version__)"
+pip install -q --no-deps onednn==2026.0.0 onednn-devel==2026.0.0
+cd /opt/trellis-serve/xpu
+EXL3_DNNL_DIR="$(python3 -c 'import sys; print(sys.prefix)')" EXL3_OUT=$X/_C_sgl.so bash scripts/build_ext.sh
+EXL3_MOE_OUT=$X/_moe_sgl.so bash scripts/build_moe.sh
+bash scripts/build_ngram_nvme.sh
+gcc -O2 -shared -fPIC -pthread -o $X/_cold_read.so csrc/cold_read.c
+for f in _C_sgl.so _moe_sgl.so exl3xpu_ngram_nvme.so _cold_read.so; do test -s $X/$f; done
+readelf -d $X/_C_sgl.so | grep -q libdnnl.so || { echo "_C_sgl.so built without oneDNN"; exit 1; }
+pip install -q --no-deps --no-build-isolation -e /opt/trellis-serve/core -e /opt/trellis-serve/xpu
+python3 -c "from importlib.metadata import entry_points as e; \
+assert any(x.name == 'exl3xpu' for x in e(group='sglang.srt.plugins')); print('exl3xpu sglang plugin registered')"
+"""
+
+
+def remove_tree(path):
+    """rmtree that also clears overlayfs' mode-000 work directories."""
+    for root, dirs, _ in os.walk(path):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def setup_sglang():
+    fetch_trellis()
+    if running_server():
+        fail("a b70 server runs from the image setup would change; `b70 stop` first")
+    say("sglang: building trellis-serve's kernels and installing the plugin (a few minutes)")
+    run_in("sglang", ["bash", "-euo", "pipefail", "-c", SGLANG_BUILD], write_root=True)
+    remove_tree(os.path.join(STATE, "overlay"))            # the persistent overlay of earlier setups
+
+
+def cmd_setup(a):
+    fams = SETUPS if a.family == "all" else [a.family]
+    setup_image()
+    for fam in fams:
+        if setup_done(fam) and not a.force:
+            say(f"{fam}: already set up")
+            continue
+        {"glm": setup_glm, "sglang": setup_sglang, "dsv41": setup_dsv41}[fam]()
+        with open(setup_marker(fam), "w") as f:
+            json.dump(setup_wanted(fam), f)
+        say(f"{fam}: setup done")
+
+
+# ------------------------------------------------------------------------------------------------- info / prepare
+
+def model_info(model_dir, store=None):
+    fam, cfg = read_model(model_dir)
+    info = {"model": os.path.abspath(model_dir), "family": fam, "model_type": cfg.get("model_type")}
+    if fam:
+        store = store or default_store(fam)
+        info.update(setup=setup_done(fam), store=store, prepared=store_ready(fam, store),
+                    parallel_max=1 if fam in ("glm", "dsv41") else 8,
+                    context_max=65536 if fam in ("glm", "dsv41") else 217088)
+    return info
+
+
+def cmd_info(a):
+    print(json.dumps(model_info(a.model, a.store), indent=1))
+
+
+def make_store_dir(store):
+    if not os.path.isdir(store):
+        os.makedirs(store, exist_ok=True)
+        # btrfs: no copy-on-write or checksums, so O_DIRECT reads work
+        subprocess.run(["chattr", "+C", store], capture_output=True)
+
+
+def cmd_prepare(a):
+    prepare(a.model, a.store, a.force)
+
+
+def prepare(model, store, force=False):
+    a = argparse.Namespace(model=model, store=store, force=force)
+    fam, _ = read_model(a.model)
+    if not fam:
+        fail(f"{a.model} is not a model b70 serves")
+    if not setup_done(fam):
+        fail(f"{fam} is not set up; run `b70 setup {fam}` first")
+    store = os.path.abspath(a.store or default_store(fam))
+    if fam == "dsv41":
+        if dsv41_store_ready(store) and not a.force:
+            say(f"dsv41: expert store already packed in {store}")
+            return
+        make_store_dir(store)
+        say(f"dsv41: packing the routed experts into {store} (~105 GB, reads the whole model), then the drafter's")
+        run_in("dsv41", ["python3", "-u", "-m", "dsv_xpu.pack_store", "/models", "/nvx"], model=os.path.abspath(a.model),
+               store=store)
+        run_in("dsv41", ["python3", "-u", "-c", "from dsv_xpu.pack_store import append_mtp; append_mtp('/models', '/nvx')"],
+               model=os.path.abspath(a.model), store=store)
+        return
+    if fam != "glm":
+        say(f"{fam} needs no prepare step" + (": the first load writes its NVMe store" if fam == "flashnext" else ""))
+        return
+    if glm_store_ready(store) and not a.force:
+        say(f"glm: expert store already packed in {store}")
+        return
+    make_store_dir(store)
+    say(f"glm: packing the routed experts into {store} (~95 GB, reads the whole model)")
+    run_in("glm", ["python3", "-u", "/w/xpu/pack_store.py", "pack"], model=os.path.abspath(a.model), store=store)
+
+
+# ------------------------------------------------------------------------------------------------ the b70q queue
+
+class _UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__("b70q", timeout=timeout)
+        self.sock_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.sock_path)
+
+
+def b70q_socket():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "b70q.sock")
+
+
+def b70q(method, path, body=None, timeout=20):
+    """The b70q daemon's HTTP API over its unix socket; raises OSError when the daemon is not there."""
+    c = _UnixHTTP(b70q_socket(), timeout)
+    try:
+        c.request(method, path, body=None if body is None else json.dumps(body),
+                  headers={"content-type": "application/json"})
+        r = c.getresponse()
+        data = r.read()
+        if r.status >= 400:
+            raise OSError(f"b70q {method} {path}: HTTP {r.status} {data[:200]!r}")
+        return json.loads(data or b"{}")
+    except (http.client.HTTPException, ValueError) as e:
+        raise OSError(f"b70q {method} {path}: {e}") from e
+    finally:
+        c.close()
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text.strip())
+    if not m:
+        fail(f"bad duration {text} (use 90, 90s, 15m, 4h)")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def queue_turn(owner, note, opts):
+    """Waits in the b70q queue until this process holds the B70. Returns the ticket id, or None when the card is already
+    ours (inside a queue job: B70Q_TICKET) or no queue daemon runs. While waiting it prints its place in line every
+    minute (and when it changes). SIGTERM / SIGINT while waiting leaves the line and exits."""
+    if os.environ.get("B70Q_TICKET"):
+        return None
+    try:
+        t = b70q("POST", "/api/tickets", {"owner": owner, "kind": "run", "argv": sys.argv, "cwd": os.getcwd(),
+                                          "client_pid": os.getpid(), "note": note, "opts": opts})
+    except OSError:
+        say("no b70q queue daemon; using the B70 without it")
+        return None
+    tid = t["id"]
+    if t.get("nested"):
+        return None
+
+    def leave(signum, _frame):
+        try:
+            b70q("POST", f"/api/tickets/{tid}/cancel", timeout=5)
+        except OSError:
+            pass
+        say(f"left the B70 queue (#{tid})")
+        sys.exit(128 + signum)
+    old = {sg: signal.signal(sg, leave) for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    last, last_at, down_since = None, 0.0, None
+    try:
+        while True:
+            try:
+                w = b70q("GET", f"/api/tickets/{tid}/wait?until=granted&timeout=8", timeout=30)
+                down_since = None
+            except OSError as e:
+                down_since = down_since or time.time()
+                if time.time() - down_since > 300:
+                    say(f"lost the b70q daemon for 5 minutes ({e}); using the B70 without it")
+                    return None
+                time.sleep(2)
+                continue
+            tk = w["ticket"]
+            if tk["state"] == "granted":
+                say(f"the B70 is ours (b70q #{tid} {owner})")
+                os.environ["B70Q_TICKET"] = str(tid)
+                return tid
+            if tk["state"] != "waiting":
+                fail(f"b70q #{tid} {tk['state']} while waiting: {tk.get('end_reason')}", 75)
+            msg = queue_wait_text(tid, w)
+            if msg != last or time.time() - last_at >= 60:
+                say(msg)
+                last, last_at = msg, time.time()
+    finally:
+        for sg, h in old.items():
+            signal.signal(sg, h)
+
+
+def queue_wait_text(tid, w):
+    """"waiting for the B70: 2 in line, ~6 min (dsv41-sweep has it)", from the ticket's wait reply and /api/state."""
+    eta = None
+    try:
+        st = b70q("GET", "/api/state", timeout=5)
+        mine = next((q for q in st.get("queue", []) if q.get("id") == tid), None)
+        if mine and mine.get("eta_start"):
+            eta = max(0, (mine["eta_start"] - st["t"]) / 60000)
+    except OSError:
+        pass
+    status = (w.get("status") or {}).get("text") or "busy"
+    where = f"{w.get('position', '?')} in line"
+    return f"waiting for the B70: {where}{f', ~{eta:.0f} min' if eta is not None else ''} ({status})"
+
+
+def queue_done(tid, rc):
+    if tid is None:
+        return
+    for _ in range(10):
+        try:
+            b70q("POST", f"/api/tickets/{tid}/done", {"exit_code": rc}, timeout=5)
+            return
+        except OSError:
+            time.sleep(1)
+
+
+# ----------------------------------------------------------------------------------------------------- the guard
+
+def b70_pci():
+    """PCI address of the first GPU on the xe driver (the B70)."""
+    for r in sorted(os.listdir("/sys/class/drm")):
+        if not r.startswith("renderD"):
+            continue
+        dev = os.path.realpath(f"/sys/class/drm/{r}/device")
+        if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) == "xe":
+            return os.path.basename(dev), f"/dev/dri/{r}"
+    return None, None
+
+
+def avail_gb():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1048576
+    return 0.0
+
+
+def psi_full():
+    try:
+        with open("/proc/pressure/memory") as f:
+            for line in f:
+                if line.startswith("full"):
+                    return float(line.split()[1].split("=")[1])
+    except OSError:
+        pass
+    return 0.0
+
+
+SHELLS = {"bash", "sh", "zsh", "dash", "fish", "grep", "timeout", "tail"}
+
+
+def other_jobs(pattern, render, skip):
+    """Processes whose command line matches `pattern` that have the B70's render node open (a Steam game)."""
+    if not pattern or not render:
+        return []
+    rx = re.compile(pattern)
+    found = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) in skip:
+            continue
+        try:
+            args = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            comm = open(f"/proc/{pid}/comm").read().strip()
+            if comm in SHELLS or not rx.search(args):
+                continue
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.readlink(f"/proc/{pid}/fd/{fd}") == render:
+                    found.append(f"{pid} {args[:100]}")
+                    break
+        except OSError:
+            continue
+    return found
+
+
+FAULT = re.compile(r"Fault|CAT error|[Hh]ang|[Rr]eset|wedged|Timedout")
+
+
+class Guard:
+    """Runs the server in its own process group and stops the group on an xe fault, low RAM, memory pressure, or
+    SIGTERM/SIGINT to this process. Who else may use the B70 is the b70q queue's business, not the guard's."""
+
+    def __init__(self, ram_start_gb):
+        self.ram_floor = float(os.environ.get("B70_RAM_FLOOR_GB", "4"))
+        self.psi_max = float(os.environ.get("B70_PSI_MAX", "40"))
+        self.ram_start = float(os.environ.get("B70_RAM_START_GB", ram_start_gb))
+        self.games = os.environ.get("B70_GAMES", r"steamapps[/\\]common[/\\]")
+        self.pci, self.render = b70_pci()
+        self.proc = None
+        self.reason = None
+        self.lock = threading.Lock()
+
+    def check_start(self):
+        if not self.pci:
+            fail("no GPU on the xe driver found (the B70 needs the xe kernel driver)")
+        a = avail_gb()
+        if a < self.ram_start:
+            fail(f"GUARD: not starting, only {a:.0f} GB RAM available (need {self.ram_start:.0f})", 98)
+        # a Steam game under Proton opens every GPU, the B70 too, even when it renders on another card; model loads
+        # beside one failed binding B70 memory (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY / DEVICE_LOST, xe "VM worker
+        # error: -16"). Only checked at the start: a server already running is left alone.
+        o = other_jobs(self.games, self.render, {os.getpid()})
+        if o:
+            fail(f"GUARD: not starting, a game has the B70 open: {o[0]}", 98)
+
+    def stop(self, reason):
+        with self.lock:
+            if self.reason or not self.proc or self.proc.poll() is not None:
+                return
+            self.reason = reason
+        print(f"GUARD: {reason}, stopping the server", flush=True)
+        if reason != "asked to stop":       # who was using the memory, for the post-mortem
+            top = subprocess.run(["ps", "-eo", "pid,rss,args", "--sort=-rss"], capture_output=True, text=True).stdout
+            for line in top.splitlines()[1:9]:
+                pid, rss, cmd = (line.split(None, 2) + ["", ""])[:3]
+                print(f"GUARD   {pid:>8} {int(rss or 0) / 1048576:5.1f} GB  {cmd[:110]}", flush=True)
+        try:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        for _ in range(80):
+            if self.proc.poll() is not None:
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def watch_kernel(self, t0):
+        try:
+            j = subprocess.Popen(["journalctl", "-k", "-f", "-n", "0", "--since", f"@{int(t0)}", "-o", "short-unix",
+                                  "--no-pager"], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return
+        tag = f"xe {self.pci}"
+        for line in j.stdout:
+            try:
+                if float(line.split()[0]) < t0:
+                    continue
+            except (ValueError, IndexError):
+                pass
+            if tag in line and FAULT.search(line):
+                self.stop(f"B70 fault in the kernel log: {line.strip()[:200]}")
+            if self.proc.poll() is not None:
+                break
+        j.kill()
+
+    def watch_memory(self):
+        while self.proc.poll() is None and not self.reason:
+            a, p = avail_gb(), psi_full()
+            if a < self.ram_floor:
+                self.stop(f"RAM low ({a:.1f} GB available, floor {self.ram_floor:.0f})")
+            elif p > self.psi_max:
+                self.stop(f"memory pressure {p:.0f}% (full avg10, max {self.psi_max:.0f}), {a:.1f} GB RAM available")
+            time.sleep(1)
+
+    def run(self, args, ready=None):
+        t0 = time.time()
+
+        def child():
+            os.setsid()
+            try:
+                with open("/proc/self/oom_score_adj", "w") as f:
+                    f.write("1000")       # the kernel OOM killer takes the server before anything of the user's
+            except OSError:
+                pass
+
+        self.proc = subprocess.Popen(args, preexec_fn=child)
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s, lambda *_: threading.Thread(target=self.stop, args=("asked to stop",)).start())
+        threading.Thread(target=self.watch_kernel, args=(t0,), daemon=True).start()
+        threading.Thread(target=self.watch_memory, daemon=True).start()
+        if ready:
+            threading.Thread(target=ready, daemon=True).start()
+        while True:
+            try:
+                rc = self.proc.wait()
+                break
+            except InterruptedError:
+                continue
+        if self.reason and self.reason != "asked to stop":
+            print(f"GUARD tripped: {self.reason}", flush=True)
+            return 99
+        return 0 if self.reason == "asked to stop" else rc
+
+
+# ------------------------------------------------------------------------------------------- warm-up and port gate
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def relay(listen_port, target_port):
+    """Forward every TCP connection on 127.0.0.1:listen_port to target_port, byte for byte (streams, keep-alive and a
+    client hanging up, which cancels its request, all pass through)."""
+    import asyncio
+
+    async def pipe(reader, writer):
+        try:
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except (ConnectionError, OSError):
+                pass
+
+    async def handle(client_r, client_w):
+        try:
+            up_r, up_w = await asyncio.open_connection("127.0.0.1", target_port)
+        except OSError:
+            client_w.close()
+            return
+        await asyncio.gather(pipe(client_r, up_w), pipe(up_r, client_w))
+
+    async def main():
+        server = await asyncio.start_server(handle, "127.0.0.1", listen_port, reuse_address=True)
+        async with server:
+            await server.serve_forever()
+
+    asyncio.run(main())
+
+
+def open_when_warm(a, warm, alive):
+    """Wait for the server on its inner port, send it `warm` (one real request: kernels compile, graphs and caches
+    fill), then open the requested port. Until then the port is closed, so a client never meets a server that is up
+    but still warming (SGLang answered /v1/models seconds late right after its start, and client discovery with a
+    short timeout found no model)."""
+    url = f"http://127.0.0.1:{a.inner_port}"
+    while alive():
+        try:
+            urllib.request.urlopen(f"{url}/v1/models", timeout=5).read()
+            break
+        except OSError:
+            time.sleep(2)
+    else:
+        return
+    t0 = time.time()
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{url}/v1/chat/completions", json.dumps(warm).encode(),
+                                                      {"Content-Type": "application/json"}), timeout=900).read()
+        say(f"warm-up request done in {time.time() - t0:.0f} s")
+    except OSError as e:
+        say(f"warm-up request failed ({e}); opening the port anyway")
+    if alive():
+        threading.Thread(target=relay, args=(a.port, a.inner_port), daemon=True).start()
+        say(f"ready on http://127.0.0.1:{a.port}/v1")
+
+
+# --------------------------------------------------------------------------------------------------------- serve
+
+def serve_glm(a, model, store):
+    if not glm_store_ready(store):
+        fail(f"the GLM expert store is not packed in {store}; run `b70 prepare {model}` first")
+    ctx = min(a.ctx or 49152, 65536)
+    env = {"GLM_XPU_RAM_MARGIN": os.environ.get("GLM_XPU_RAM_MARGIN", "0.2")}
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("GLM_XPU_", "GLM_SERVE_"))})
+    cmd = ["python3", "/w/xpu/serve.py", "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx),
+           "--served-name", a.name or "glm-5.3-flash", "--store", "/nvx/glm53_flash_exl3_experts_blob.bin"]
+    if a.ram_gb:
+        cmd += ["--ram-gb", str(a.ram_gb)]
+    if a.chat_template:
+        cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    return sandbox("glm", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template), 40, \
+        {"model": a.name or "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
+def serve_dsv41(a, model, store):
+    """DeepSeek-V4.1-Flash: dsv41/xpu/serve.py (prompts through DeepSeek's reference encoder, so --chat-template is
+    not used), with the configuration measured in dsv41/README.md: DSpark (block boost 0.3, exact acceptance),
+    residency boost 0.3, a 24 GB RAM tier."""
+    if not dsv41_store_ready(store):
+        fail(f"the DSV4.1 expert store is not packed in {store}; run `b70 prepare {model}` first")
+    ctx = min(a.ctx or 32768, 65536)
+    env = {"DSV_BOOST": "0.3", "DSV_STAGE_GB": "0.5"}
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("DSV_", "EXL3_"))})
+    name = a.name or "deepseek-v4.1-flash"
+    cmd = ["python3", "-X", "faulthandler", "/w/dsv41/xpu/serve.py", "--host", "127.0.0.1", "--port", str(a.inner_port),
+           "--cache", str(ctx), "--served-name", name]
+    if a.ram_gb:
+        cmd += ["--ram-gb", str(a.ram_gb)]
+    warm = {"model": name, "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+    # 24 GB pinned RAM tier + the process
+    return sandbox("dsv41", cmd, gpu=True, model=model, store=store, env=env), 34, warm
+
+
+# Gemma 4 31B's KV budget on the B70 (memory fraction 0.85), in bf16 full-attention tokens (10 layers), and what a
+# sliding-window token costs in those units (50 layers; bf16 / fp8). Fitted to the pools measured next to the drafter:
+# 45.8K full + 4K SWA (bf16, one game), 60K + 4K (fp8 window), 44.9K + 8.2K (fp8, four games), 15.6K + 8.2K (bf16)
+GEMMA_KV_UNITS = {True: 74000, False: 104000}      # with / without the drafter
+GEMMA_SWA_UNITS = {False: 7.16, True: 3.58}        # bf16 / fp8 window
+
+
+def serve_gemma(a, model, store):
+    """Gemma 4 (dense, EXL3) on the same SGLang + trellis-serve install as Flash-Next."""
+    users = max(1, min(a.parallel or 1, 8))
+    ctx = a.ctx or 32768
+    env = {
+        "HF_HUB_OFFLINE": "1", "ZE_AFFINITY_MASK": "0",
+        "EXL3_MODEL_PATH": "/model",
+        "EXL3_LIB": "/opt/trellis-serve/xpu/exl3xpu/_C_sgl.so",
+        "EXL3_MOE_LIB": "/opt/trellis-serve/xpu/exl3xpu/_moe_sgl.so",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        # host copies through staging buffers: the copy engine reading a swapped page in place faulted the card
+        # while loading (after 0xSero's omarchy-local-ai 6.8.2/6.8.3)
+        "NEOReadDebugKeys": "1", "TreatNonUsmForTransfersAsSharedSystem": "0", "EnableSharedSystemUsmSupport": "0",
+        "PYTHONPATH": "/opt/b70/pyhooks", "TRIM_EVERY_S": "300",
+    }
+    # the sliding-window pool (50 layers x 16 KV heads x 512, ~820 KB per token in bf16) only needs a prefill chunk
+    # plus the 1024-token window per running request, and one window (plus a page) for each other game's cached
+    # prompt (kvpack.py keeps one window per cached game); it gets that, and the full-attention pool the rest of the
+    # budget (a full:SWA ratio spent most of the memory on the SWA pool)
+    chunk = int(os.environ.get("B70_CHUNK", "2048"))       # 2048 read prompts as fast as 8192 and halves the SWA pool
+    swa_tokens = int(os.environ.get("B70_SWA_TOKENS",
+                                    str(chunk + users * (1024 + 384) + (users - 1) * (1024 + 128) + 512)))
+    env["EXL3_SWA_TOKENS"] = str(swa_tokens)
+    # smaller KV (kvpack.py). The sliding-window layers in fp8 halve their pool and decode as fast as bf16 for one
+    # game, faster for several (1/2/4 games: 42/91/135 tok/s against 43.5/68.5/127); the full-attention layers packed
+    # (4-bit, rotated keys) hold 3.2x the tokens, but attention unpacks each game's whole context every step (four
+    # games at 20K: 19 tok/s each), so they are packed only when the unpacked pool cannot hold every game's context.
+    # One game keeps the exact bf16 window while its context fits.
+    memfrac = float(os.environ.get("B70_MEMFRAC", "0.85"))
+    units = float(os.environ.get("B70_KV_UNITS", GEMMA_KV_UNITS[bool(a.drafter)]))
+    room = {fp8: units - swa_tokens * GEMMA_SWA_UNITS[fp8] for fp8 in (False, True)}   # full-attention tokens
+    auto_fp8 = users > 1 or ctx > room[False]
+    fp8_window, pack_full = {"off": (False, False), "window": (True, False), "all": (True, True), "on": (True, True),
+                             "auto": (auto_fp8, ctx * users > room[auto_fp8])}[a.kv_pack]
+    if fp8_window:
+        env["EXL3_KV_FP8_SWA"] = "1"
+    if pack_full:
+        # one request's unpack scratch: K and V of the 4 KV heads x 512, bf16, per context token
+        scratch_gb = ctx * 4 * 512 * 2 * 2 / 2**30
+        memfrac -= scratch_gb / 31.9 + 0.01
+        env.update({"EXL3_KV_PACK": "1", "EXL3_KV_PACK_CTX": str(ctx)})
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "SGLANG_"))})
+    bs, graph_bs = 1, []
+    while bs < users:
+        graph_bs.append(bs)
+        bs *= 2
+    graph_bs.append(users)
+    cmd = ["python3", "-m", "sglang.launch_server", "--model-path", "/model", "--quantization", "exl3",
+           "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.inner_port),
+           "--served-model-name", a.name or "gemma-4",
+           "--kv-cache-dtype", os.environ.get("B70_KV_DTYPE", "auto"), "--context-length", str(ctx),
+           "--mem-fraction-static", f"{memfrac:.3f}",
+           "--chunked-prefill-size", str(chunk), "--max-running-requests", str(users),
+           "--dtype", "bfloat16", "--reasoning-parser", "gemma4", "--tool-call-parser", "gemma4",
+           # a request asking for more output than its prompt leaves room for is cut to fit, as llama-server does
+           "--allow-auto-truncate",
+           "--attention-backend", os.environ.get("B70_ATTENTION", "intel_xpu"),
+           # read each shard into RAM, one at a time, instead of mapping the files: the copy engine faulted the card
+           # reading a cold mapped page while loading (xe "Engine memory CAT error", class=bcs), with the model's files
+           # pushed out of the page cache; vLLM's --safetensors-load-strategy eager fixed the same fault
+           "--weight-loader-disable-mmap", "--model-loader-extra-config", '{"enable_multithread_load": false}',
+           # SGLang's own cache type stays bf16: Intel's attention kernel has no fp8 path for Gemma's 512-wide global
+           # heads; kvpack.py stores the windows in fp8 and the global layers packed (see --kv-pack)
+           ]
+    if os.environ.get("B70_GRAPHS", "1") == "1":
+        cmd += ["--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs)]
+    else:
+        cmd += ["--disable-cuda-graph"]
+    if a.chat_template:
+        cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    cmd += shlex.split(os.environ.get("B70_SGLANG_ARGS", ""))       # experiments: any other SGLang option
+    if a.drafter:
+        # Google's assistant model drafts (SGLang runs it as FROZEN_KV_MTP: it reads the target's KV cache and
+        # scores only the tokens of its top centroids)
+        steps = int(os.environ.get("B70_DRAFT_TOKENS", "2"))
+        cmd += ["--speculative-algorithm", "NEXTN", "--speculative-draft-model-path", "/drafter",
+                "--speculative-num-steps", str(steps), "--speculative-eagle-topk", "1",
+                "--speculative-num-draft-tokens", str(steps + 1)]
+    warm = {"model": a.name or "gemma-4", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+    return (sandbox("gemma", cmd, gpu=True, model=model, env=env, template=a.chat_template, drafter=a.drafter),
+            25, warm)
+
+
+def serve_flashnext(a, model, store):
+    users = max(1, min(a.parallel or 1, 8))
+    ctx = min(a.ctx or 204800, 217088)
+    hot = "/opt/b70/hot"
+    env = {
+        "HF_HUB_OFFLINE": "1", "ZE_AFFINITY_MASK": "0",
+        "EXL3_MODEL_PATH": "/model",
+        "EXL3_LIB": "/opt/trellis-serve/xpu/exl3xpu/_C_sgl.so",
+        "EXL3_MOE_LIB": "/opt/trellis-serve/xpu/exl3xpu/_moe_sgl.so",
+        # experts the game-master turns route to most stay pinned in VRAM slots (route_to_hot.py over GM turns:
+        # 94% of held-out decode routings against 39% for a generic profile)
+        "EXL3_MOE_SLOTS": "7600", "EXL3_MOE_CACHE": "1", "EXL3_MOE_STATIC": "1",
+        "EXL3_MOE_HOT": f"{hot}/{a.hot or 'gm-7500'}.json",
+        # n-gram embedding table on NVMe behind a small RAM cache; give up on a late row after 1.5 s (xe resets a
+        # compute job after 5 s)
+        "EXL3_NGRAM_TIER": "nvme", "SGLANG_EXL3_NGRAM_TIER": "nvme", "SGLANG_EXL3_NGRAM_RAM_GB": "0.5",
+        "SGLANG_EXL3_NGRAM_TIMEOUT_S": "1.5",
+        # cap torch's cache at 90% of the card (decode graphs allocate outside it), log VRAM use, give cached prefill
+        # blocks back before the reply
+        "EXL3_TORCH_MEM_FRACTION": "0.90", "EXL3_MEM_LOG": "30", "EXL3_RELEASE_AFTER_PREFILL": "1",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        # every server process hands freed heap back to the OS after the load (pyhooks/sitecustomize.py)
+        "PYTHONPATH": "/opt/b70/pyhooks", "TRIM_EVERY_S": "300",
+        # SGLang holds back waiting requests that share a prefix; here each prefill streams every non-resident
+        # expert, so concurrent turns must batch into one forward instead
+        "IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD": "1000000000",
+    }
+    if not a.all_ram:
+        # only the experts in the RAM list keep a host copy; the rest live in the NVMe cold store, written on the first
+        # load. Decode never routes to a cold expert, and pays a 0.5-logit margin against RAM ones (GLM's 0.2).
+        env.update({"EXL3_MOE_RAM": f"{hot}/{a.ram_list or 'gm-ram-4500'}.json",
+                    "EXL3_MOE_COLD_STORE": "/nvx/qwen38_cold_experts",
+                    "EXL3_MOE_RAM_MARGIN": str(a.margin if a.margin is not None else 0.5)})
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "SGLANG_"))})
+    bs, graph_bs = 1, []
+    while bs < users:
+        graph_bs.append(bs)
+        bs *= 2
+    graph_bs.append(users)
+    cmd = ["python3", "-m", "sglang.launch_server", "--model-path", "/model", "--quantization", "exl3",
+           "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.inner_port),
+           "--served-model-name", a.name or "flashnext-uncensored",
+           "--disable-shared-experts-fusion", "--kv-cache-dtype", "fp8_e4m3", "--context-length", str(ctx),
+           "--mem-fraction-static", "0.785", "--chunked-prefill-size", "8192", "--max-running-requests", str(users),
+           "--dtype", "bfloat16", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
+           "--allow-auto-truncate",
+           "--linear-attn-prefill-backend", "intel_xpu", "--linear-attn-decode-backend", "intel_xpu",
+           "--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs),
+           # linear-attention state slots, in bf16 (~57 MB each; fp32 doubled them and halved the full-attention pool
+           # at 4 games; greedy replies differ from fp32 no more than fp32 runs differ from each other): a running
+           # request takes 5, and each game's cached prompt keeps up to 2 (12 capped any --parallel at 2 running games)
+           "--max-mamba-cache-size", str(max(12, 8 * users)), "--mamba-max-states-per-path", "2",
+           "--mamba-ssm-dtype", "bfloat16", "--max-total-tokens", "217088"]
+    cmd += shlex.split(os.environ.get("B70_SGLANG_ARGS", ""))       # experiments: any other SGLang option
+    if a.chat_template:
+        cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    make_store_dir(store)
+
+    # a ~5K-token prompt: the first long prompt after a start pays ~2.5 s of one-time setup
+    with open(os.path.join(REPO, "flashnext", "hot", "warmup_prompt.json")) as f:
+        warm = json.load(f)
+    warm.update(max_tokens=1, model=a.name or "flashnext-uncensored")
+    return (sandbox("flashnext", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template),
+            45 if a.all_ram else 25, warm)
+
+
+def cmd_serve(a):
+    model = os.path.abspath(a.model)
+    fam, _ = read_model(model)
+    if not fam:
+        fail(f"{model} is not a model b70 serves (Gemma 4, GLM-5.3-Flash, Qwen3.8-Flash-Next or DeepSeek-V4.1-Flash EXL3)")
+    if not setup_done(fam):
+        fail(f"{fam} is not set up; run `b70 setup {fam}` first")
+    store = os.path.abspath(a.store or default_store(fam))
+    if a.chat_template:
+        a.chat_template = os.path.abspath(a.chat_template)
+    if a.drafter:
+        a.drafter = os.path.realpath(a.drafter)
+    os.makedirs(STATE, exist_ok=True)
+    if a.prepare:
+        prepare(model, store)        # CPU and disk only: before the queue
+    a.inner_port = free_port()
+    args, ram_start, warm = {"glm": serve_glm, "flashnext": serve_flashnext, "gemma": serve_gemma,
+                             "dsv41": serve_dsv41}[fam](a, model, store)
+    if a.dry_run:
+        print(shlex.join(args))
+        return
+    # one model on the B70 at a time: the queue hands the card over; idle on the GPU for --idle while another job
+    # waits, the queue stops this server (SIGTERM), and its caller starts it again when it is needed
+    tid = queue_turn(a.queue, f"b70 serve {a.name or os.path.basename(model)}",
+                     {"server": True, "idle_s": parse_duration(a.idle), "ram_gib": ram_start})
+    guard = Guard(ram_start)
+    guard.check_start()
+    with open(SERVE_INFO, "w") as f:
+        json.dump({"pid": os.getpid(), "port": a.port, "model": model, "family": fam, "b70q_ticket": tid}, f)
+    say(f"loading {os.path.basename(model)} ({fam}); http://127.0.0.1:{a.port}/v1 opens once it is warm")
+    rc = 1
+    try:
+        rc = guard.run(args, lambda: open_when_warm(a, warm, lambda: guard.proc.poll() is None and not guard.reason))
+    finally:
+        queue_done(tid, rc)
+        try:
+            with open(SERVE_INFO) as f:
+                if json.load(f).get("pid") == os.getpid():
+                    os.unlink(SERVE_INFO)
+        except (OSError, ValueError):
+            pass
+    sys.exit(rc)
+
+
+def running_server():
+    """The `b70 serve` recorded in state/serve.json, if that process still runs."""
+    try:
+        with open(SERVE_INFO) as f:
+            info = json.load(f)
+        with open(f"/proc/{int(info['pid'])}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return info if b"serve" in argv else None
+
+
+def cmd_run(a):
+    """A command inside an install's sandbox, without the GPU (tests, studies); state/run/<install> is /run/b70."""
+    env = {"PYTHONPATH": "/run/b70/py"} if a.install == "sglang" else {}
+    if a.gpu:
+        env["ZE_AFFINITY_MASK"] = "0"
+        tid = queue_turn(a.queue, f"b70 run {a.install} {shlex.join(a.command)[:60]}", {})
+        guard = Guard(10)
+        guard.check_start()
+        rc = 1
+        try:
+            rc = guard.run(sandbox(a.install, a.command, gpu=True, env=env))
+        finally:
+            queue_done(tid, rc)
+        sys.exit(rc)
+    r = subprocess.run(sandbox(a.install, a.command, env=env))
+    sys.exit(r.returncode)
+
+
+def cmd_status(_):
+    print(json.dumps({"running": running_server()}, indent=1))
+
+
+def sandboxes():
+    """PIDs of bwrap sandboxes over this state's image (a server's lasts a moment past `serve`)."""
+    pids = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"bwrap" and ROOTFS.encode() in argv:
+            pids.append(int(pid))
+    return pids
+
+
+def cmd_stop(_):
+    info = running_server()
+    if not info:
+        say("not running")
+        return
+    os.kill(info["pid"], signal.SIGTERM)
+    for _ in range(150):
+        if not running_server():
+            break
+        time.sleep(0.2)
+    else:
+        os.kill(info["pid"], signal.SIGKILL)
+    # the overlay stays mounted until the sandbox is gone; a new server could not mount it before
+    for _ in range(100):
+        if not sandboxes():
+            break
+        time.sleep(0.2)
+    say("stopped")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="b70", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("setup")
+    p.add_argument("family", nargs="?", default="all", choices=["all", *SETUPS])
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_setup)
+    p = sub.add_parser("info")
+    p.add_argument("model")
+    p.add_argument("--store")
+    p.set_defaults(fn=cmd_info)
+    p = sub.add_parser("prepare")
+    p.add_argument("model")
+    p.add_argument("--store")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_prepare)
+    p = sub.add_parser("serve")
+    p.add_argument("model")
+    p.add_argument("--port", type=int, required=True)
+    p.add_argument("--ctx", type=int, help="context length in tokens")
+    p.add_argument("--parallel", type=int, help="requests at once (Gemma and Flash-Next up to 8; GLM and DSV4.1 "
+                                                "serve one)")
+    p.add_argument("--name", help="model name the API answers to")
+    p.add_argument("--store", help="NVMe expert store directory")
+    p.add_argument("--all-ram", action="store_true", help="flashnext: every non-VRAM expert in RAM (~33 GB) instead "
+                                                          "of the RAM list + NVMe cold store (~15 GB)")
+    p.add_argument("--ram-list", help="flashnext: RAM list in flashnext/hot/ (default gm-ram-4500)")
+    p.add_argument("--hot", help="flashnext: VRAM list in flashnext/hot/ (default gm-7500)")
+    p.add_argument("--margin", type=float, help="flashnext: decode router margin against RAM experts (default 0.5)")
+    p.add_argument("--ram-gb", type=float, help="glm, dsv41: RAM tier size in GB (default 27 / 24)")
+    p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
+    p.add_argument("--drafter", help="gemma: an assistant model folder that drafts tokens (gemma-4-*-assistant)")
+    p.add_argument("--kv-pack", choices=["auto", "window", "all", "on", "off"], default="auto",
+                   help="gemma: smaller KV cache: `window` keeps the sliding-window layers in fp8, `all` (or `on`) "
+                        "also packs the full-attention layers to 4 bits (3.2x the tokens, decode slows with context); "
+                        "auto: fp8 windows for 2+ games or a context bf16 cannot hold, and all when the unpacked "
+                        "full-attention layers cannot hold --ctx x --parallel")
+    p.add_argument("--prepare", action="store_true", help="run `prepare` first when the model needs it (GLM and "
+                                                          "DSV4.1: packs the NVMe store, ~95 / ~105 GB, once)")
+    p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")
+    p.add_argument("--queue", default=os.environ.get("B70Q_OWNER") or "b70",
+                   help="owner name in the b70q queue (default $B70Q_OWNER or b70; nq-… goes next in line)")
+    p.add_argument("--idle", default="15m", help="the queue stops the server after this long idle on the GPU while "
+                                                 "another job waits (default 15m)")
+    p.set_defaults(fn=cmd_serve)
+    p = sub.add_parser("run", help="run a command in an install's sandbox, without the GPU")
+    p.add_argument("--gpu", action="store_true", help="with the B70 (its turn in the b70q queue), under the guard "
+                                                      "(kernel tests, benchmarks)")
+    p.add_argument("--queue", default=os.environ.get("B70Q_OWNER") or "b70-run", help="owner name in the b70q queue")
+    p.add_argument("install", choices=SETUPS)
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_run)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("stop").set_defaults(fn=cmd_stop)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
