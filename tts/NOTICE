@@ -1,0 +1,23 @@
+This repository contains a patch to Fish Audio's fish-speech software:
+
+  patches/fish-speech-xpu.patch
+    Target: https://github.com/fishaudio/fish-speech commit 214da3cd841bda85da2496b96cd3c4d7edb1337e
+    Files changed: fish_speech/models/text2semantic/llama.py, fish_speech/models/text2semantic/inference.py
+
+  This model is licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved.
+
+  The patch is a modification of the Fish Audio Materials, distributed under the Fish Audio Research License
+  (copy in patches/LICENSE-FISH-AUDIO.md). Changes, all for running on Intel XPU (Arc B70):
+  - inference.py: use torch.accelerator synchronize instead of CUDA-only calls; allow the inductor backend on XPU.
+  - llama.py: torch.where instead of a boolean-mask assignment (no host sync, graph-capturable); an opt-out of the
+    async input_pos check for graph-captured decoding; an optional per-row key mask for batched decoding with
+    left-padded prompts; an optional sub-vocabulary output head (semantic tokens + <|im_end|>); single-query GQA
+    attention without repeat_interleave.
+
+The scripts in fish/ follow fish-speech internals (prompt building, sampling, encode_audio) and are also
+distributed under the Fish Audio Research License.
+
+Built with Fish Audio.
+
+Qwen3-TTS (pip package qwen-tts 0.1.1 and the Qwen/Qwen3-TTS-12Hz-1.7B-* weights) is used unmodified, under the
+Apache License 2.0.
