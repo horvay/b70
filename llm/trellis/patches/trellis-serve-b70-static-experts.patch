@@ -1,0 +1,1540 @@
+diff --git i/xpu/csrc/exl3_moe.sycl w/xpu/csrc/exl3_moe.sycl
+index a48f1f1..9687066 100644
+--- i/xpu/csrc/exl3_moe.sycl
++++ w/xpu/csrc/exl3_moe.sycl
+@@ -418,6 +418,27 @@ ESIMD_INLINE void build4(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_
+     }
+ }
+ 
++// All NT tiles' VNNI B operands. Odd K (32 values per period): build4 over the PLANAR4 4-tile group. K=4 (8 values
++// per period, D = 1, no planarization): each tile is built on its own with the dense DPAS kernel's K=4 fast path,
++// which writes the same per-tile VNNI layout (16 x 16 tile -> 8 x 32 fp16) that the dpas calls below consume.
++template <int K, int NT>
++ESIMD_INLINE void build_tiles(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev,
++                              simd<fp16, 256 * NT>& B) {
++    if constexpr (K == 4) {
++        constexpr int W = Geo<K>::WORDS;
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            simd<uint32_t, W> dw = words.template select<W, 1>(j * W);
++            simd<uint32_t, W> pw = prev.template select<W, 1>(j * W);
++            simd<fp16, 256> Bj;
++            DpasKernel<4, 2, 8, 1>::build_k4(dw, pw, Bj);
++            B.template select<256, 1>(256 * j) = Bj;
++        }
++    } else {
++        build4<K, NT, 0>(words, prev, B);
++    }
++}
++
+ // gate|up: WG per row block b; T = 2 * (I/16) / NT threads (I=640: 20), thread = (proj, 4-tile group).
+ template <int K, int MB, typename TIn>
+ struct GateUpDpasKernel {
+@@ -491,7 +512,7 @@ struct GateUpDpasKernel {
+ #ifdef EXL3_MOE_PROBE_DPAS_NODECODE
+                 B.template select<NT * W * 2, 1>(0) = words.template bit_cast_view<fp16>();
+ #else
+-                build4<K, NT, 0>(words, prev, B);
++                build_tiles<K, NT>(words, prev, B);
+ #endif
+ #pragma unroll
+                 for (int rb = 0; rb < MB / 8; ++rb) {
+@@ -597,7 +618,7 @@ struct DownDpasKernel {
+             simd<fp16, MB * 16> Ab = block_load<fp16, MB * 16>(ablk + (((size_t)b * tk + r) * MB) * 16);
+ #endif
+             simd<fp16, 256 * NT> B;
+-            build4<K, NT, 0>(words, prev, B);
++            build_tiles<K, NT>(words, prev, B);
+ #pragma unroll
+             for (int rb = 0; rb < MB / 8; ++rb) {
+                 simd<fp16, 128> A = Ab.template select<128, 1>(rb * 128);
+@@ -767,7 +788,8 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
+     auto& q = queue_of(x);
+     int M = x.size(0), H = gm.H, I = gm.I, topk = topk_ids.size(1), npairs = M * topk;
+     constexpr int MB = kPrefillMB;
+-    TORCH_CHECK(gm.K == 3 && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
++    TORCH_CHECK((gm.K == 3 || gm.K == 4) && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0,
++                "moe prefill geometry");
+     auto rb = make_route(x, npairs, E, MB);
+     launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, MB, rb.act_expert,
+                  rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of, rb.blk_a, rb.n_blk);
+@@ -776,19 +798,30 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
+     const int64_t* pp = ptrs.data_ptr<int64_t>();
+     sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+     int T1 = 2 * (I / 16) / 4;
+-    auto run_gu = [&](auto tag) {
++    auto run_gu_k = [&](auto tag, auto kt) {
+         using TIn = decltype(tag);
+-        GateUpDpasKernel<3, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
++        constexpr int KK = decltype(kt)::value;
++        GateUpDpasKernel<KK, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
+                                        rb.n_blk, reinterpret_cast<fp16*>(ablk.data_ptr()), H, I, gm.off_suh_g(),
+                                        gm.off_svh_g(), gm.off_suh_d()};
+         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * T1, T1), props, k); });
+     };
++    auto run_gu = [&](auto tag) {
++        if (gm.K == 4) run_gu_k(tag, std::integral_constant<int, 4>{});
++        else run_gu_k(tag, std::integral_constant<int, 3>{});
++    };
+     if (!(g_debug_skip & 1)) { if (x.scalar_type() == at::kHalf) run_gu(fp16{}); else run_gu(bf16{}); }
+     int T2 = (H / 4 / 16) / 4;
+-    DownDpasKernel<3, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
+-                                   reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
+-    if (!(g_debug_skip & 2))
++    auto run_dn = [&](auto kt) {
++        constexpr int KK = decltype(kt)::value;
++        DownDpasKernel<KK, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
++                                        reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
+         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * 4 * T2, T2), props, kd); });
++    };
++    if (!(g_debug_skip & 2)) {
++        if (gm.K == 4) run_dn(std::integral_constant<int, 4>{});
++        else run_dn(std::integral_constant<int, 3>{});
++    }
+     int n = M * (H / 128), local = 8;
+     auto run_c = [&](auto tag) {
+         using TO = decltype(tag);
+@@ -959,7 +992,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
+                 int old = slot_key[s];
+                 if (old >= 0) {
+                     slot_of[old] = -1;
+-                    ptrs_all[old] = host_base[old / E] + (int64_t)(old % E) * blob;
++                    ptrs_all[old] = host_base[old];   // per-expert home (B70 static tier: compacted host rows)
+                 }
+                 int key = layer * E + e;
+                 slot_key[s] = key; slot_of[key] = s;
+@@ -1023,7 +1056,7 @@ struct PfWorker {
+                 for (int i = 0; i < n; ++i) {
+                     int e = pl[4 + i], s = pl[4 + E + i];
+                     q.memcpy(reinterpret_cast<void*>(slot_base + (int64_t)s * blob),
+-                             reinterpret_cast<const void*>(host_base[li] + (int64_t)e * blob), (size_t)blob);
++                             reinterpret_cast<const void*>(host_base[(size_t)li * E + e]), (size_t)blob);
+                 }
+                 (void)T; (void)c;
+                 lvv[0] = seq;                                   // stable host source for the done flag
+@@ -1050,7 +1083,9 @@ void moe_prefetch_worker_start(at::Tensor plans, at::Tensor host_base_cpu, int64
+     w->q = c10::xpu::getCurrentXPUStream().queue();
+     w->plans = reinterpret_cast<int*>(plans.data_ptr());
+     w->L = (int)n_layers; w->E = (int)n_experts;
+-    w->host_base.assign(host_base_cpu.data_ptr<int64_t>(), host_base_cpu.data_ptr<int64_t>() + n_layers);
++    TORCH_CHECK(host_base_cpu.numel() == n_layers * n_experts, "prefetch worker: host_base must be per expert");
++    w->host_base.assign(host_base_cpu.data_ptr<int64_t>(),
++                        host_base_cpu.data_ptr<int64_t>() + n_layers * n_experts);
+     w->slot_base = slot_base; w->blob = blob;
+     w->ptrs_all = ptrs_all.data_ptr<int64_t>(); w->slot_last = slot_last.data_ptr<int>();
+     w->done_seq = done_seq.data_ptr<int>();
+@@ -1101,7 +1136,7 @@ struct PrefetchCopyKernel {
+         int i = wg / chunks, c = wg % chunks;
+         if (i >= pf_list[0]) return;
+         int e = pf_list[1 + i], s = pf_slot[i];
+-        const uint32_t* src = reinterpret_cast<const uint32_t*>(host_base[layer] + (int64_t)e * blob);
++        const uint32_t* src = reinterpret_cast<const uint32_t*>(host_base[(int64_t)layer * E + e]);
+         uint32_t* dst = reinterpret_cast<uint32_t*>(slot_base + (int64_t)s * blob);
+         int64_t nd = blob / 4;
+         int64_t d0 = (int64_t)c * 16384 + (int64_t)t * 1024;    // dwords
+@@ -1207,16 +1242,23 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
+     int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
+     const int64_t* pp = ptrs.data_ptr<int64_t>();
+     fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
+-    TORCH_CHECK(K == 3, "moe: K=3 only in this build");
+-    if (g_debug_skip & 1) {}
+-    else if (x.scalar_type() == at::kHalf)
+-        gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+-    else if (x.scalar_type() == at::kBFloat16)
+-        gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+-    else TORCH_CHECK(false, "x dtype");
++    TORCH_CHECK(K == 3 || K == 4, "moe: K=3 or K=4 only in this build (K=", K, ")");
++    auto run_gu = [&](auto kt) {
++        constexpr int KK = decltype(kt)::value;
++        if (g_debug_skip & 1) {}
++        else if (x.scalar_type() == at::kHalf)
++            gateup_dispatch<KK, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
++        else if (x.scalar_type() == at::kBFloat16)
++            gateup_dispatch<KK, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
++        else TORCH_CHECK(false, "x dtype");
++    };
++    if (K == 4) run_gu(std::integral_constant<int, 4>{}); else run_gu(std::integral_constant<int, 3>{});
+     int dn_p_save = g_dn_p;
+     if (g_dn_p == 0) g_dn_p = M <= 1 ? 10 : 5;   // M=2: P=10 120.9 us vs P=5 112.8
+-    if (!(g_debug_skip & 2)) down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
++    if (!(g_debug_skip & 2)) {
++        if (K == 4) down_dispatch<4>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
++        else down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
++    }
+     g_dn_p = dn_p_save;
+     int n = M * (H / 128), local = 8;
+     auto run_c = [&](auto tag) {
+diff --git i/xpu/csrc/ngram_nvme_xpu.sycl w/xpu/csrc/ngram_nvme_xpu.sycl
+index 8b507ab..ced411e 100644
+--- i/xpu/csrc/ngram_nvme_xpu.sycl
++++ w/xpu/csrc/ngram_nvme_xpu.sycl
+@@ -671,47 +671,6 @@ void ngram_hash_tokens(torch::Tensor tokens, torch::Tensor mult, torch::Tensor s
+     }
+ }
+ 
+-// XPU entry points (raw pointers are USM host addresses; kernels on the current torch XPU stream).
+-// Every GPU access to the shared host words is a system-scope atomic RMW: plain / atomic loads and stores to host USM
+-// can sit in the GPU L3 between kernels of one in-order queue (no flush without a host-visible event), which hung the
+-// back-to-back publish -> wait pair (host never saw req_seq) and could serve stale resp lines on graph replay.
+-void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::Tensor& dseq)
+-{
+-    TORCH_CHECK(ids.is_xpu() && ids.is_contiguous(), "nvme_publish: ids");
+-    TORCH_CHECK(dseq.is_xpu() && dseq.scalar_type() == at::kInt, "nvme_publish: dseq");
+-    int n = (int) ids.numel();
+-    auto& q = c10::xpu::getCurrentXPUStream(ids.device().index()).queue();
+-    int64_t* req = (int64_t*) req_dev;
+-    if (n > 0)
+-    {
+-        size_t g = ((size_t) n + 255) / 256 * 256;
+-        if (ids.scalar_type() == at::kLong) {
+-            const int64_t* p = ids.data_ptr<int64_t>();
+-            q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+-                int i = it.get_global_id(0); if (i < n) sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                    sycl::access::address_space::global_space>(req[i]).exchange(p[i]);
+-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
+-        } else if (ids.scalar_type() == at::kInt) {
+-            const int32_t* p = ids.data_ptr<int32_t>();
+-            q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+-                int i = it.get_global_id(0); if (i < n) sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                    sycl::access::address_space::global_space>(req[i]).exchange((int64_t) p[i]);
+-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
+-        } else TORCH_CHECK(false, "nvme_publish: ids int32/int64");
+-    }
+-    uint32_t* ctrl = (uint32_t*) ctrl_dev;
+-    uint32_t* ds = (uint32_t*) dseq.data_ptr<int>();
+-    q.single_task([=]() {
+-        uint32_t s = ds[0] + 1;
+-        ds[0] = s;
+-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                         sycl::access::address_space::global_space>(ctrl[C_N]).exchange((uint32_t) n);
+-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                         sycl::access::address_space::global_space>(ctrl[C_REQ]).exchange(s, sycl::memory_order::acq_rel);
+-    });
+-}
+-
+ // Host -> GPU direction: a system-scope atomic (even an RMW) spinning inside one kernel never observed the host's
+ // done_seq store on B70 (served from the GPU cache; 400k iterations, 2.2 us each, past the host write).  The spin and
+ // the resp read therefore use ESIMD LSC loads with L1+L3 uncached hints, which go to host memory every time.
+@@ -753,6 +712,65 @@ struct NvmeRespK {
+     }
+ };
+ 
++// XPU entry points (raw pointers are USM host addresses; kernels on the current torch XPU stream).
++// GPU -> host words: plain stores can sit in the GPU L3 between kernels of one in-order queue (no flush without a
++// host-visible event), which hung the back-to-back publish -> wait pair (host never saw req_seq). Upstream used
++// system-scope atomic RMWs, but on B70 an atomic access that page-faults on host USM cannot be resolved (xe only
++// services atomic faults by migrating to VRAM: "Fault response: Unsuccessful -EINVAL", engine CAT error), and under
++// RAM pressure the xe shrinker unbinds host buffers, so the first publish after that killed the context. ESIMD LSC
++// stores with L1+L3 uncached hints write through to host memory as ordinary (fault-resolvable) writes.
++template <typename T>
++struct NvmePubK {
++    const T* ids; int64_t* req; int n;
++    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
++        int base = (int) item.get_global_id(0) * 16;
++        esn::simd_mask<16> m = esn::simd<int32_t, 16>(base, 1) < n;
++        esn::simd<uint32_t, 16> offi(0, sizeof(T));
++        esn::simd<T, 16> v = xe::lsc_gather<T, 1, xe::lsc_data_size::default_size, xe::cache_hint::none,
++                                            xe::cache_hint::none, 16>(ids + base, offi, m);
++        esn::simd<int64_t, 16> w = v;
++        esn::simd<uint32_t, 16> off(0, 8);
++        xe::lsc_scatter<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached,
++                        16>(req + base, off, w, m);
++        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
++    }
++};
++struct NvmeSeqK {
++    uint32_t* ctrl; uint32_t* ds; uint32_t n;
++    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
++        esn::simd<uint32_t, 1> z(0);
++        uint32_t s = xe::lsc_gather<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
++                                    xe::cache_hint::uncached>(ds, z)[0] + 1;
++        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
++            ds, z, esn::simd<uint32_t, 1>(s));
++        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
++            ctrl + C_N, z, esn::simd<uint32_t, 1>(n));
++        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
++        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
++            ctrl + C_REQ, z, esn::simd<uint32_t, 1>(s));
++        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
++    }
++};
++
++void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::Tensor& dseq)
++{
++    TORCH_CHECK(ids.is_xpu() && ids.is_contiguous(), "nvme_publish: ids");
++    TORCH_CHECK(dseq.is_xpu() && dseq.scalar_type() == at::kInt, "nvme_publish: dseq");
++    int n = (int) ids.numel();
++    auto& q = c10::xpu::getCurrentXPUStream(ids.device().index()).queue();
++    int64_t* req = (int64_t*) req_dev;
++    if (n > 0)
++    {
++        size_t g = (((size_t) n + 15) / 16 + 15) / 16 * 16;
++        if (ids.scalar_type() == at::kLong)
++            q.parallel_for(sycl::nd_range<1>(g, 16), NvmePubK<int64_t>{ids.data_ptr<int64_t>(), req, n});
++        else if (ids.scalar_type() == at::kInt)
++            q.parallel_for(sycl::nd_range<1>(g, 16), NvmePubK<int32_t>{ids.data_ptr<int32_t>(), req, n});
++        else TORCH_CHECK(false, "nvme_publish: ids int32/int64");
++    }
++    q.parallel_for(sycl::nd_range<1>(1, 1), NvmeSeqK{(uint32_t*) ctrl_dev, (uint32_t*) dseq.data_ptr<int>(), (uint32_t) n});
++}
++
+ void nvme_wait(int64_t ctrl_dev, const at::Tensor& dseq, at::Tensor& stall, int64_t resp_dev, at::Tensor& slots,
+                int64_t n, int64_t timeout_ns)
+ {
+diff --git i/xpu/exl3xpu/moe_offload.py w/xpu/exl3xpu/moe_offload.py
+index dbb2ab2..01b9f36 100644
+--- i/xpu/exl3xpu/moe_offload.py
++++ w/xpu/exl3xpu/moe_offload.py
+@@ -66,8 +66,13 @@ def s64(p: int) -> int:
+ 
+ 
+ def planar4(tr: torch.Tensor, K: int) -> torch.Tensor:
+-    """int16 trellis [rows, tiles, 16K] -> int32 words in PLANAR4 order (K with gcd(K, 32) = 1: 8 periods/tile)."""
+-    assert K in (3, 5, 7), "PLANAR4 packing implemented for odd K (D = K words per 32-value period)"
++    """int16 trellis [rows, tiles, 16K] -> int32 words in PLANAR4 order (K with gcd(K, 32) = 1: 8 periods/tile).
++    K=4 (gcd 4: D = 1 word per period, no planes): PLANAR4 order is the plain tile-major order, so the words are
++    returned as stored (the kernels' K=4 paths read them unplanarized)."""
++    if K == 4:
++        r, n, _ = tr.shape
++        return tr.contiguous().view(torch.int32).view(r, n, 8 * K).contiguous()
++    assert K in (3, 5, 7), "PLANAR4 packing implemented for odd K and K=4"
+     r, n, _ = tr.shape
+     w = tr.contiguous().view(torch.int32).view(r, n // 4, 4, 8, K)       # [row, group, tile, period g, plane i]
+     return w.permute(0, 1, 4, 2, 3).contiguous()                         # [row, group, plane i, tile, g]
+@@ -103,7 +108,11 @@ class ExpertStore:
+         self.host: dict = {}                                # key -> uint8 CPU tensor [E, BLOB] (USM host)
+         self.layer_index: dict = {}                         # key -> row in the device tables
+         self.slot_of: dict = {}                             # key -> cpu int32 [E] (mirror of static placement)
+-        self._host_ptr: dict = {}
++        self._host_ptr: dict = {}                           # key -> cpu int64 [E] home pointer of each expert
++        # B70 static tier (EXL3_MOE_STATIC): experts placed in a pinned device slot at load and never evicted, so they
++        # need no host copy. key -> sorted static expert ids; the host arena holds only the other experts, compacted.
++        self.static: dict = {}
++        self._pack_tmp = None                               # CPU staging for packing a static expert
+         self._stage = [None, None]
+         self._slot_ready_ev: dict = {}
+         # device-side cache state (authoritative for forward_cached)
+@@ -113,7 +122,9 @@ class ExpertStore:
+         self.slot_key = torch.full((n_slots,), -1, dtype=torch.int32, device=self.dev)
+         self.slot_last = torch.full((n_slots,), -1, dtype=torch.int32, device=self.dev)
+         self.tick = torch.zeros(1, dtype=torch.int32, device=self.dev)
+-        self.host_base = torch.zeros(max_layers, dtype=torch.int64, device=self.dev)
++        # per-expert home pointer (host row for host experts, the pinned slot for static ones); the kernels read
++        # host_base[layer * E + e] wherever they repoint an evicted expert or copy one from host memory
++        self.host_base = torch.zeros(LE, dtype=torch.int64, device=self.dev)
+         self.fill_all = torch.zeros(LE, dtype=torch.int64, device=self.dev)
+         self.fill_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+         self.pf_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+@@ -124,25 +135,106 @@ class ExpertStore:
+         self._cache_used = False            # set by forward_cached: static ops must resync from the device first
+ 
+     # ---- layers
+-    def add_layer(self, key, blobs: torch.Tensor | None = None) -> torch.Tensor:
++    def add_layer(self, key, blobs: torch.Tensor | None = None, static=()) -> torch.Tensor:
++        """Allocate layer `key`. Experts in `static` (as many as there are free slots) go into pinned device slots
++        and get no host row; the host arena holds the other experts in id order. Returns the host arena
++        [n_host, BLOB]; fill experts with pack_target()/pack_done()."""
+         li = len(self.layer_index)
+         if li >= self.max_layers:
+             raise RuntimeError(f"ExpertStore: more than max_layers={self.max_layers} MoE layers")
+         self.layer_index[key] = li
+-        h = self.X.host_alloc(self.E * self.blob).view(self.E, self.blob)
+-        if blobs is not None:
+-            h.copy_(blobs)
++        st = sorted({int(e) for e in static if 0 <= int(e) < self.E})[:len(self.free_slots)]
++        self.static[key] = st
++        is_static = torch.zeros(self.E, dtype=torch.bool)
++        if st:
++            is_static[torch.tensor(st)] = True
++        host_ids = (~is_static).nonzero().flatten()
++        n_host = int(host_ids.numel())
++        h = self.X.host_alloc(max(n_host, 1) * self.blob).view(max(n_host, 1), self.blob)[:n_host]
+         self.host[key] = h
+-        base = s64(h.data_ptr())
+-        self._host_ptr[key] = base + torch.arange(self.E, dtype=torch.int64) * self.blob
+-        self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])
+-        self.host_base[li] = base
+-        self.slot_of[key] = torch.full((self.E,), -1, dtype=torch.int32)
++        base = s64(h.data_ptr()) if n_host else 0
++        row_of = torch.full((self.E,), -1, dtype=torch.int64)
++        row_of[host_ids] = torch.arange(n_host, dtype=torch.int64)
++        self.row_of = getattr(self, "row_of", {})
++        self.row_of[key] = row_of
++        home = base + row_of.clamp_min(0) * self.blob
++        so = torch.full((self.E,), -1, dtype=torch.int32)
++        sls = []
++        for e in st:
++            sl = self.free_slots.pop()
++            so[e] = sl
++            self.slot_owner[sl] = (key, e)
++            sls.append(sl)
++            home[e] = self.slot_ptr(sl)
++        self._host_ptr[key] = home
++        self.slot_of[key] = so
++        if os.environ.get("EXL3_ADDR_LOG") == "1":
++            import sys as _sys
++            print(f"EXL3_ADDR store K={self.K} layer {key}: host rows [{base:#x}, {base + n_host * self.blob:#x}) "
++                  f"({n_host} experts), slots [{self.slot_base:#x}, {self.slot_base + self.n_slots * self.blob:#x}) "
++                  f"pid {os.getpid()}", file=_sys.stderr, flush=True)
++        d = self.dev
++        self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(home)
++        self.host_base[li * self.E:(li + 1) * self.E].copy_(home)
++        if st:
++            keys = torch.tensor([li * self.E + e for e in st], dtype=torch.int64)
++            slt = torch.tensor(sls, dtype=torch.int64)
++            self.slot_of_dev.index_copy_(0, keys.to(d), slt.to(torch.int32).to(d))
++            self.slot_key.index_copy_(0, slt.to(d), keys.to(torch.int32).to(d))
++            self.slot_last.index_fill_(0, slt.to(d), 0x7FFFFFFF)     # pinned: never an LRU victim
++        if blobs is not None:
++            for e in range(self.E):
++                self.pack_target(key, e).copy_(blobs[e])
++                self.pack_done(key, e)
+         return h
+ 
+     def host_view(self, key) -> torch.Tensor:
++        """The host arena [n_host, BLOB] in host-expert order (row_of[key][e]), NOT indexed by expert id."""
+         return self.host[key]
+ 
++    def check_ptrs(self, key, table: torch.Tensor | None = None, what: str = "") -> None:
++        """EXL3_PTR_CHECK=1 debug: every expert pointer of layer `key` (and every home pointer) must lie inside a real
++        allocation - a device slot, the layer's host rows or a staging buffer - and be blob-aligned there. Raises
++        before a kernel could fault on a bad address. Syncs; never inside graph capture."""
++        if os.environ.get("EXL3_PTR_CHECK") != "1" or torch.xpu.is_current_stream_capturing():
++            return
++        li = self.layer_index[key]
++        n_host = self.host[key].shape[0]
++        hb = s64(self.host[key].data_ptr()) if n_host else 0
++        ranges = [(self.slot_base, self.slot_base + self.n_slots * self.blob, "slots")]
++        if n_host:
++            ranges.append((hb, hb + n_host * self.blob, "host"))
++        for i, st in enumerate(self._stage):
++            if st is not None:
++                b = s64(st.data_ptr())
++                ranges.append((b, b + st.numel(), f"stage{i}"))
++        tabs = {"ptrs": (table if table is not None else self.ptrs(key)).cpu(),
++                "home": self.host_base[li * self.E:(li + 1) * self.E].cpu()}
++        for name, t in tabs.items():
++            for e in range(self.E):
++                p_ = int(t[e])
++                ok = any(lo <= p_ < hi and (p_ - lo) % self.blob == 0 for lo, hi, _ in ranges)
++                if not ok:
++                    raise RuntimeError(f"EXL3_PTR_CHECK {what} {key} {name}[{e}] = {p_:#x} is outside every allocation "
++                                       f"{[(hex(lo), hex(hi), n) for lo, hi, n in ranges]}")
++
++    def is_static(self, key, e: int) -> bool:
++        return int(self.row_of[key][e]) < 0
++
++    def pack_target(self, key, e: int) -> torch.Tensor:
++        """Where to pack expert e: its host row, or a CPU staging blob for a static expert (pack_done copies it to
++        the expert's pinned slot)."""
++        r = int(self.row_of[key][e])
++        if r >= 0:
++            return self.host[key][r]
++        if self._pack_tmp is None:
++            self._pack_tmp = torch.empty(self.blob, dtype=torch.uint8)
++        return self._pack_tmp
++
++    def pack_done(self, key, e: int) -> None:
++        if int(self.row_of[key][e]) < 0:
++            self.slots[int(self.slot_of[key][e])].copy_(self._pack_tmp)    # blocking: load time only
++
+     def ptrs(self, key) -> torch.Tensor:
+         li = self.layer_index[key]
+         return self.ptrs_all[li * self.E:(li + 1) * self.E]
+@@ -170,7 +262,7 @@ class ExpertStore:
+                 ev = self._slot_ready_ev.pop(sl, None)
+                 if ev is not None:
+                     s_.wait_event(ev)
+-                self.X.memcpy_async(self.slot_ptr(sl), s64(self.host[key][e].data_ptr()), self.blob)
++                self.X.memcpy_async(self.slot_ptr(sl), int(self._host_ptr[key][e]), self.blob)
+                 self.slot_owner[sl] = (key, e)
+                 so[e] = sl
+                 es.append(e)
+@@ -190,10 +282,11 @@ class ExpertStore:
+         so = self.slot_of[key]
+         li = self.layer_index[key]
+         es, sls = [], []
++        st = set(self.static.get(key, ()))
+         for e in experts:
+             e = int(e)
+             sl = int(so[e])
+-            if sl < 0:
++            if sl < 0 or e in st:
+                 continue
+             es.append(e)
+             sls.append(sl)
+@@ -242,6 +335,7 @@ class ExpertStore:
+         and are written through into the LRU slot (committed at the end of the call). No host sync, graph-safe.
+         Do not mix with make_resident/evict on the same slots while cached calls are queued."""
+         ids, w = self._rt(topk_ids, topk_w)
++        self.check_ptrs(key, what="forward_cached")
+         self._cache_used = True
+         return self.X.moe_forward_cached(x, ids, w, self.ptrs_all, self.layer_index[key], self.slot_of_dev,
+                                          self.slot_key, self.slot_last, self.tick, self.host_base, self.slot_base,
+@@ -270,9 +364,9 @@ class ExpertStore:
+         self.done_seq = torch.zeros(L, dtype=torch.int32, device=self.dev)
+         self.pend.zero_()
+         self._commit_host = self.X.host_alloc(L * 2 * E * 12)
+-        hb = torch.zeros(L, dtype=torch.int64)
++        hb = torch.zeros(L * E, dtype=torch.int64)          # per-expert home pointers (the static tier)
+         for key, li in self.layer_index.items():
+-            hb[li] = int(self._host_ptr[key][0])
++            hb[li * E:(li + 1) * E] = self._host_ptr[key]
+         torch.xpu.synchronize()
+         self._pf_stream = torch.xpu.Stream()
+         with torch.xpu.stream(self._pf_stream):     # the worker submits its copies to this stream's queue
+@@ -302,26 +396,54 @@ class ExpertStore:
+         return r
+ 
+     # ---- prefill staging (FreeToken-style layer streaming)
++    def reserve_staging(self) -> None:
++        """Allocate the prefill staging buffers now (load time), so SGLang's memory profiling counts them before it
++        sizes the KV pool; allocated lazily at the first long prompt they could OOM. Each holds only a layer's
++        non-resident experts, at most E minus its static tier (static experts are pinned): ~0.74 GB instead of
++        0.95 GB at K=3 / 7,500 hot, and nothing for an all-static store. Two buffers when several layers stream
++        (double buffer), one for a single layer. Call again after adding layers; it only grows."""
++        keys = [k for k in self.layer_index if not str(k).startswith("mtp.")]
++        rows = max((self.E - len(self.static.get(k, ())) for k in keys), default=0)
++        n_buf = 2 if len(keys) > 1 else 1
++        have = [0 if b is None else b.shape[0] for b in self._stage]
++        if all(have[b] >= rows for b in range(n_buf)):
++            return
++        self._stage = [None, None]
++        torch.xpu.empty_cache()                 # the smaller buffers this replaces (load time only)
++        for b in range(n_buf):
++            self._stage[b] = torch.empty((rows, self.blob), dtype=torch.uint8, device=self.dev)
++
+     def stage_layer(self, key, buf: int, stream) -> torch.Tensor:
+         """Copy every non-resident expert of `key` into staging buffer `buf` on `stream`; returns the pointer table
+         to pass to forward(ptrs=...) once `stream` has been waited on. Contiguous expert runs are copied together.
+         Uses the static-placement mirror (slot_of); after forward_cached calls, refresh it with sync_mirror()."""
+-        if self._stage[buf] is None:
+-            self._stage[buf] = torch.empty((self.E, self.blob), dtype=torch.uint8, device=self.dev)
+-        st = self._stage[buf]
+         self._resync()
+         so = self.slot_of[key]
+         miss = (so < 0).nonzero().flatten().tolist()
++        st = self._stage[buf]
++        if len(miss) > (0 if st is None else st.shape[0]):
++            # reserve_staging() sized the buffers at load; only a layer added later (or a debug path) gets here
++            import sys as _sys
++            print(f"exl3xpu: staging buffer {buf} grown to {len(miss)} experts at run time for {key} (OOM risk)",
++                  file=_sys.stderr, flush=True)
++            torch.xpu.current_stream().synchronize()
++            stream.synchronize()
++            self._stage[buf] = st = torch.empty((len(miss), self.blob), dtype=torch.uint8, device=self.dev)
++        home = self._host_ptr[key]
++        # missing expert miss[r] goes to staging row r (compact: the buffer holds only non-resident experts)
+         with torch.xpu.stream(stream):
+             i = 0
+             while i < len(miss):
+                 j = i
+-                while j + 1 < len(miss) and miss[j + 1] == miss[j] + 1:
++                while j + 1 < len(miss) and miss[j + 1] == miss[j] + 1 and \
++                        int(home[miss[j + 1]]) == int(home[miss[j]]) + self.blob:
+                     j += 1
+                 n = j - i + 1
+-                self.X.memcpy_async(s64(st[miss[i]].data_ptr()), s64(self.host[key][miss[i]].data_ptr()), n * self.blob)
++                self.X.memcpy_async(s64(st[i].data_ptr()), int(home[miss[i]]), n * self.blob)
+                 i = j + 1
+-        sp = s64(st.data_ptr()) + torch.arange(self.E, dtype=torch.int64) * self.blob
++        sp = torch.zeros(self.E, dtype=torch.int64)
++        if miss:
++            sp[torch.tensor(miss)] = s64(st.data_ptr()) + torch.arange(len(miss), dtype=torch.int64) * self.blob
+         if self.n_slots:
+             dp = self.slot_base + so.clamp_min(0).to(torch.int64) * self.blob
+             sp = torch.where(so >= 0, dp, sp)
+@@ -332,7 +454,7 @@ class ExpertStore:
+         """Empty every slot and repoint all tables to host memory (current stream; waits for queued work)."""
+         torch.xpu.current_stream().synchronize()
+         for key, li in self.layer_index.items():
+-            self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])
++            self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])   # static: their slot
+             self.slot_of[key].fill_(-1)
+         self.slot_of_dev.fill_(-1)
+         self.slot_key.fill_(-1)
+@@ -340,7 +462,23 @@ class ExpertStore:
+         self.fill_all.zero_()
+         self.pend.zero_()
+         self.slot_owner = [None] * self.n_slots
+-        self.free_slots = list(range(self.n_slots - 1, -1, -1))
++        static_slots = set()
++        d = self.dev
++        for key, li in self.layer_index.items():          # the static tier stays where it is, pinned
++            st = self.static.get(key, [])
++            if not st:
++                continue
++            sls = [int((int(self._host_ptr[key][e]) - self.slot_base) // self.blob) for e in st]
++            for e, sl in zip(st, sls):
++                self.slot_of[key][e] = sl
++                self.slot_owner[sl] = (key, e)
++                static_slots.add(sl)
++            keys = torch.tensor([li * self.E + e for e in st], dtype=torch.int64)
++            slt = torch.tensor(sls, dtype=torch.int64)
++            self.slot_of_dev.index_copy_(0, keys.to(d), slt.to(torch.int32).to(d))
++            self.slot_key.index_copy_(0, slt.to(d), keys.to(torch.int32).to(d))
++            self.slot_last.index_fill_(0, slt.to(d), 0x7FFFFFFF)
++        self.free_slots = [s for s in range(self.n_slots - 1, -1, -1) if s not in static_slots]
+         self._slot_ready_ev.clear()
+         self._cache_used = False
+ 
+@@ -393,7 +531,7 @@ class ExpertStore:
+             li_ = self.layer_index[key]
+             devt = self.ptrs_all[li_ * self.E:(li_ + 1) * self.E]
+             stg = s64(self._stage[buf].data_ptr())
+-            in_stage = (table >= stg) & (table < stg + self.E * self.blob)
++            in_stage = (table >= stg) & (table < stg + self._stage[buf].numel())
+             mism = (~in_stage) & (table != devt)
+             sod = self.slot_of_dev[li_ * self.E:(li_ + 1) * self.E]
+             print(f"EXL3_STAGE_CHECK {key}: staged-from-slot {int((~in_stage).sum())}, device-table-in-slot "
+@@ -401,6 +539,7 @@ class ExpertStore:
+                   f"slot_of_dev>=0 {int((sod >= 0).sum())}, mismatching slot pointers {int(mism.sum())}",
+                   file=_sys.stderr, flush=True)
+         ids, w = self._rt(topk_ids, topk_w)
++        self.check_ptrs(key, table=table, what="prefill_staged")
+         y = self.X.moe_forward(x, ids, w, table, self.I, self.K, self.E)
+         if os.environ.get("EXL3_STAGE_VERIFY", "0") == "1":
+             import sys as _sys
+@@ -412,13 +551,15 @@ class ExpertStore:
+             bad_e = []
+             for e in range(self.E):
+                 p_ = int(tab[e])
+-                if stg <= p_ < stg + self.E * self.blob:
+-                    if not torch.equal(self._stage[buf][e].cpu(), self.host[key][e]):
+-                        diff = (self._stage[buf][e].cpu() != self.host[key][e]).nonzero().flatten()
++                if stg <= p_ < stg + self._stage[buf].numel():
++                    got, ref = self._stage[buf][(p_ - stg) // self.blob].cpu(), self.host[key][int(self.row_of[key][e])]
++                    if not torch.equal(got, ref):
++                        diff = (got != ref).nonzero().flatten()
+                         bad_e.append((e, int(diff.numel()), int(diff[0]), int(diff[-1])))
+                 else:
+                     s_ = (p_ - self.slot_base) // self.blob
+-                    if not torch.equal(self.slots[s_].cpu(), self.host[key][e]):
++                    r_ = int(self.row_of[key][e])          # static experts have no host copy to compare
++                    if r_ >= 0 and not torch.equal(self.slots[s_].cpu(), self.host[key][r_]):
+                         bad_e.append(("slot", e, s_))
+             print(f"EXL3_STAGE_VERIFY {key} rows {x.shape[0]} equal {torch.equal(y, y2)} "
+                   f"maxdiff {(y.float() - y2.float()).abs().max().item():.3g} corrupt {len(bad_e)} {bad_e[:4]}",
+diff --git i/xpu/exl3xpu/ngram_nvme.py w/xpu/exl3xpu/ngram_nvme.py
+index e16a310..e79dfbf 100644
+--- i/xpu/exl3xpu/ngram_nvme.py
++++ w/xpu/exl3xpu/ngram_nvme.py
+@@ -150,6 +150,11 @@ class Exl3NgramNvmeTable(torch.nn.Module):
+         # USM host buffers: the pointers are device-usable as they are
+         self.slab_dev, self.req_dev, self.resp_dev, self.ctrl_dev = (s64(s.slab_ptr()), s64(s.req_ptr()),
+                                                                       s64(s.resp_ptr()), s64(s.ctrl_ptr()))
++        if os.environ.get("EXL3_ADDR_LOG") == "1":
++            import sys as _sys
++            print(f"EXL3_ADDR ngram nvme: slab [{self.slab_dev:#x}, {self.slab_dev + self.nslots * self.row_bytes:#x}) "
++                  f"req {self.req_dev:#x} resp {self.resp_dev:#x} ctrl {self.ctrl_dev:#x} cap {self.cap} pid {os.getpid()}",
++                  file=_sys.stderr, flush=True)
+         self.register_buffer("head_bias", head_bias.to(dev, torch.float16).contiguous(), persistent=False)
+         self.register_buffer("chunk_ptrs", torch.tensor([self.slab_dev], dtype=torch.int64, device=dev), persistent=False)
+         self.dseq = torch.zeros(4, dtype=torch.int32, device=dev)
+@@ -187,6 +192,13 @@ class Exl3NgramNvmeTable(torch.nn.Module):
+     def gather(self, ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         if ids.shape[-1] != self.num_heads:
+             raise ValueError(f"n-gram lookup expects [..., {self.num_heads}] ids, got {tuple(ids.shape)}")
++        if os.environ.get("EXL3_NGRAM_DEBUG") == "1" and not torch.xpu.is_current_stream_capturing():
++            import sys as _sys
++            torch.xpu.synchronize()
++            print(f"EXL3_NGRAM_DEBUG gather ids {tuple(ids.shape)} {ids.dtype} {ids.device} contiguous={ids.is_contiguous()} "
++                  f"min={int(ids.min())} max={int(ids.max())} rows={self.num_rows} cap={self.cap} "
++                  f"stream={torch.xpu.current_stream()} out={'given' if out is not None else 'new'}",
++                  file=_sys.stderr, flush=True)
+         flat = ids.reshape(-1)
+         if not flat.is_contiguous():
+             flat = flat.contiguous()
+diff --git i/xpu/exl3xpu/sglang_plugin.py w/xpu/exl3xpu/sglang_plugin.py
+index bcdd003..123213d 100644
+--- i/xpu/exl3xpu/sglang_plugin.py
++++ w/xpu/exl3xpu/sglang_plugin.py
+@@ -117,24 +117,68 @@ def _unpack_signs(packed: torch.Tensor) -> torch.Tensor:
+     return (1.0 - 2.0 * bits.flatten()).to(torch.float16)
+ 
+ 
+-_MOE_STORE = None
++_MOE_STORES: dict = {}     # K (trellis bits) -> ExpertStore; one slot arena per expert size
+ _MOE_HOT = None
+ _MOE_CACHE = os.environ.get("EXL3_MOE_CACHE", "0") == "1"
++_MOE_PROFILE = os.environ.get("EXL3_MOE_PROFILE", "")    # path: per-layer routing counts + prefill MoE time (JSON)
++_PROF: dict = {"layers": {}, "events": [], "rows": 0, "last": 0.0, "started": False}
++
++
++def _prof_count(key: str, ids: torch.Tensor) -> None:
++    """EXL3_MOE_PROFILE: count routed (token, expert) assignments of layer `key` on the device, decode (<= 4 rows) and
++    prefill apart. index_add_ is graph-safe, so decode graph replays count too; the counters were allocated at load
++    (allocating them during capture would re-zero them on every replay)."""
++    c = _PROF["layers"].get(key)
++    if c is None:
++        return
++    idx = ids.reshape(-1).long()
++    c["decode" if ids.shape[0] <= 4 else "prefill"].index_add_(0, idx, torch.ones_like(idx))
++
++
++def _prof_dump(force: bool = False) -> None:
++    """Write the counters (prefill, eager only: syncs). The first dump zeroes them instead, dropping the server's own
++    warm-up and graph-capture calls. Decode counts reach the file at the next prefill."""
++    import time as _t
++    now = _t.monotonic()
++    if not force and now - _PROF["last"] < 2.0:
++        return
++    _PROF["last"] = now
++    torch.xpu.synchronize()
++    if not _PROF["started"]:
++        _PROF["started"] = True
++        for c in _PROF["layers"].values():
++            c["decode"].zero_()
++            c["prefill"].zero_()
++        _PROF["events"].clear()
++        _PROF["rows"] = 0
++        return
++    ms = sum(a.elapsed_time(b) for a, b in _PROF["events"])
++    out = {"layers": {k: {"decode": c["decode"].tolist(), "prefill": c["prefill"].tolist()}
++                      for k, c in _PROF["layers"].items()},
++           "prefill_moe_ms": ms, "prefill_moe_calls": len(_PROF["events"]), "prefill_moe_rows": _PROF["rows"]}
++    with open(_MOE_PROFILE + ".tmp", "w") as f:
++        json.dump(out, f)
++    os.replace(_MOE_PROFILE + ".tmp", _MOE_PROFILE)
+ _STAGE_MIN_M = int(os.environ.get("EXL3_MOE_STAGE_MIN_M", "512"))   # >= rows: prefill layer streaming (0 = off)
+ if _STAGE_MIN_M <= 0:
+     _STAGE_MIN_M = 1 << 30
+ 
+ 
+ def _moe_store(H: int, I: int, K: int, n_experts: int):
+-    """Process-wide ExpertStore (one slot arena shared by all MoE layers incl. the MTP layer)."""
+-    global _MOE_STORE
+-    if _MOE_STORE is None:
++    """Process-wide ExpertStore per expert bit width K (one slot arena shared by all MoE layers of that K, incl. the
++    MTP layer). K=3 is the main store (EXL3_MOE_SLOTS slots, LRU cache + optional static tier). Any other K (e.g. the
++    4-bit layer 0 of some 3.05 bpw checkpoints) gets its own store of EXL3_MOE_SLOTS_K<K> slots (default 512, one
++    layer) whose layers are placed in pinned device slots entirely (all experts static, no host copy)."""
++    s = _MOE_STORES.get(K)
++    if s is None:
+         from .moe_offload import ExpertStore
+-        _MOE_STORE = ExpertStore(H, I, K, n_experts, int(os.environ.get("EXL3_MOE_SLOTS", "0")), _dev())
+-        logger.info("exl3xpu: expert store: %d device slots x %d B (%.2f GB)", _MOE_STORE.n_slots, _MOE_STORE.blob,
+-                    _MOE_STORE.n_slots * _MOE_STORE.blob / 1e9)
+-    s = _MOE_STORE
+-    if (s.H, s.I, s.K, s.E) != (H, I, K, n_experts):
++        env = "EXL3_MOE_SLOTS" if K == 3 else f"EXL3_MOE_SLOTS_K{K}"
++        slots = int(os.environ.get(env, "0" if K == 3 else str(n_experts)))
++        s = _MOE_STORES[K] = ExpertStore(H, I, K, n_experts, slots, _dev())
++        s.all_static = K != 3
++        logger.info("exl3xpu: expert store K=%d: %d device slots x %d B (%.2f GB)%s", K, s.n_slots, s.blob,
++                    s.n_slots * s.blob / 1e9, ", every expert static" if s.all_static else "")
++    if (s.H, s.I, s.E) != (H, I, n_experts):
+         raise NotImplementedError(f"exl3xpu: MoE layers with different geometry {(H, I, K, n_experts)} vs {(s.H, s.I, s.K, s.E)}")
+     return s
+ 
+@@ -147,6 +191,26 @@ def _moe_hot() -> dict:
+     return _MOE_HOT
+ 
+ 
++def _moe_static(key: str) -> list:
++    """EXL3_MOE_STATIC=1: layer `key`'s EXL3_MOE_HOT experts become the static tier (pinned device slots, no host
++    copy). Matched by the exact key, else by the layer number ('layers.N.'). The MTP layer has no profile;
++    EXL3_MOE_STATIC_MTP=1 pins all of its experts (it runs every draft step; EXL3_MOE_SLOTS must have room)."""
++    if os.environ.get("EXL3_MOE_STATIC", "0") != "1":
++        return []
++    if key.startswith("mtp."):
++        return list(range(512)) if os.environ.get("EXL3_MOE_STATIC_MTP", "0") == "1" else []
++    hot = _moe_hot()
++    if key in hot:
++        return list(hot[key])
++    m = re.search(r"layers\.(\d+)\.", key)
++    if m:
++        for k, v in hot.items():
++            m2 = re.search(r"layers\.(\d+)\.", k)
++            if m2 and m2.group(1) == m.group(1):
++                return list(v)
++    return []
++
++
+ def _build_classes():
+     from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
+     from sglang.srt.utils.common import set_weight_attrs
+@@ -375,7 +439,10 @@ def _build_classes():
+             self.method.process_weights_after_loading(self)
+ 
+         def forward(self, x):
+-            return self.method.apply(self, x)
++            if x.dim() == 2:
++                return self.method.apply(self, x)
++            y = self.method.apply(self, x.reshape(-1, self.in_features).contiguous())
++            return y.view(*x.shape[:-1], self.out_features)
+ 
+ 
+     from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+@@ -449,9 +516,11 @@ def _build_classes():
+                 raise NotImplementedError(f"exl3xpu: {self.prefix}: mixed K inside expert {e}")
+             store = _moe_store(layer.exl3_hidden, layer.exl3_inter, K, layer.exl3_num_experts)
+             if self.key not in store.host:
+-                store.add_layer(self.key)
++                static_ids = range(layer.exl3_num_experts) if getattr(store, "all_static", False) else _moe_static(self.key)
++                store.add_layer(self.key, static=static_ids)
+             from .moe_offload import pack_expert
+-            pack_expert(st["gate"], st["up"], st["down"], K, out=store.host_view(self.key)[e])
++            pack_expert(st["gate"], st["up"], st["down"], K, out=store.pack_target(self.key, e))
++            store.pack_done(self.key, e)
+             layer.exl3_K = K
+             layer.exl3_packed = getattr(layer, "exl3_packed", 0) + 1
+             del layer.exl3_store[e]
+@@ -483,10 +552,16 @@ def _build_classes():
+             want = want[:len(store.free_slots)]
+             if want:
+                 store.make_resident(self.key, want)
++            store.reserve_staging()
++            if _MOE_PROFILE and not self.key.startswith("mtp."):
++                _PROF["layers"][self.key] = {m: torch.zeros(n, dtype=torch.int64, device=store.dev)
++                                             for m in ("decode", "prefill")}
+             layer.exl3_moe_store = store
+-            logger.info("exl3xpu: %s: %d experts K=%d packed to host USM (%.3f GB), %d resident in device slots "
+-                        "(%d slots free)", self.prefix, n, layer.exl3_K, n * store.blob / 1e9,
+-                        store.resident_count(self.key), len(store.free_slots))
++            n_static = len(store.static.get(self.key, ()))
++            logger.info("exl3xpu: %s: %d experts K=%d, %d packed to host USM (%.3f GB), %d static, %d resident in "
++                        "device slots (%d slots free)", self.prefix, n, layer.exl3_K, n - n_static,
++                        (n - n_static) * store.blob / 1e9, n_static, store.resident_count(self.key),
++                        len(store.free_slots))
+ 
+         def apply(self, layer, dispatch_output):
+             from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+@@ -501,7 +576,21 @@ def _build_classes():
+             else:
+                 store.prefill_reset()
+                 fwd = store.forward_cached if _MOE_CACHE else store.forward
+-            y = fwd(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1), tk.topk_weights.reshape(flat.shape[0], -1))
++            ids = tk.topk_ids.reshape(flat.shape[0], -1)
++            if _MOE_PROFILE:
++                _prof_count(self.key, ids)
++                if fwd == store.forward_prefill_staged:
++                    _prof_dump()
++                    ev0, ev1 = torch.xpu.Event(enable_timing=True), torch.xpu.Event(enable_timing=True)
++                    ev0.record()
++                    y = fwd(self.key, flat, ids, tk.topk_weights.reshape(flat.shape[0], -1))
++                    ev1.record()
++                    _PROF["events"].append((ev0, ev1))
++                    _PROF["rows"] += flat.shape[0]
++                    return StandardCombineInput(hidden_states=y.view_as(x))
++                if flat.shape[0] > 4 and not torch.xpu.is_current_stream_capturing():
++                    _prof_dump()                 # a short prefill (cached path) flushes the decode counts too
++            y = fwd(self.key, flat, ids, tk.topk_weights.reshape(flat.shape[0], -1))
+             return StandardCombineInput(hidden_states=y.view_as(x))
+ 
+         def get_triton_quant_info(self, layer):
+@@ -599,6 +688,58 @@ def _patch_mtp() -> None:
+     cls.set_lm_head_from_target = set_lm_head_from_target
+ 
+ 
++def _patch_qwen4_mtp() -> None:
++    """Qwen4-exp (Flash-Next) MTP draft: its own __init__ (not Qwen3.5's, so _patch_mtp's never runs) builds the
++    hyper-connection input fusion `fc_embedding` / `fc_hidden` (hc_count > 1) or `fc` as plain nn.Linear, but EXL3
++    checkpoints quantize them. Serve them as EXL3 linears and share the target embedding from construction. Weight
++    loading is Qwen3.5's (already patched by _patch_mtp: skips embed_tokens, finishes `fc`); the extra projections are
++    finished here."""
++    try:
++        from sglang.srt.models import qwen4_exp_mtp as m
++    except Exception as e:  # pragma: no cover
++        logger.warning("exl3xpu: Qwen4-exp MTP shim not installed (%s)", e)
++        return
++    cls = m.Qwen4ExpForCausalLMMTP
++    if cls.__dict__.get("_exl3_patched", False):      # own flag: the Qwen3.5 base class carries _patch_mtp's
++        return
++    orig_init, orig_load = cls.__init__, cls.load_weights
++
++    def __init__(self, config, quant_config=None, prefix="", *a, **k):
++        orig_init(self, config, quant_config, prefix, *a, **k)
++        Cfg, _, Dense = classes()
++        qc = getattr(self, "quant_config", quant_config)
++        if not isinstance(qc, Cfg):
++            return
++        emb = self.model.embed_tokens
++        w = emb.weight
++        emb.weight = torch.nn.Parameter(torch.empty((0, w.shape[1]), dtype=w.dtype, device=w.device), requires_grad=False)
++        for name, val in vars(w).items():
++            if name != "data" and not hasattr(emb.weight, name):
++                setattr(emb.weight, name, val)
++        self._exl3_skip_embed = True
++        del w
++        _empty_cache()
++        self._exl3_dense = []
++        for attr in ("fc_embedding", "fc_hidden", "fc"):
++            lin = getattr(self, attr, None)
++            info = qc.modules.get(f"mtp.{attr}")
++            if info is not None and isinstance(lin, torch.nn.Linear):
++                setattr(self, attr, Dense(lin.in_features, lin.out_features, info, f"mtp.{attr}",
++                                          params_dtype=lin.weight.dtype))
++                self._exl3_dense.append(attr)
++        logger.info("exl3xpu: Qwen4-exp MTP input fusion served as EXL3 linears: %s", ", ".join(self._exl3_dense) or "none")
++
++    def load_weights(self, weights, *a, **k):
++        out = orig_load(self, weights, *a, **k)
++        for attr in getattr(self, "_exl3_dense", ()):
++            lin = getattr(self, attr)
++            if attr != "fc" and hasattr(lin, "exl3_shards"):     # Qwen3.5's patched loader already finished `fc`
++                lin.process_weights_after_loading()
++        return out
++
++    cls.__init__, cls.load_weights, cls._exl3_patched = __init__, load_weights, True
++
++
+ class _DraftHeadMethod:
+     """quant_method of the pruned draft head: EXL3 GEMM over the kept 128-token blocks only, scattered into a
+     full-vocab -inf row (the draft's top-1 can only be a kept token; the target verifies with the full head)."""
+@@ -1229,6 +1370,7 @@ def activate() -> None:
+     except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
+         logger.info("exl3xpu: vision shim not installed (%s)", e)
+     _patch_mtp()
++    _patch_qwen4_mtp()
+     _patch_xpu_spec_sampling()
+     _patch_xpu_gdn_verify()
+     _patch_xpu_mamba_scatter()
+diff --git i/xpu/scripts/build_ngram_nvme.sh w/xpu/scripts/build_ngram_nvme.sh
+index d54288f..4128790 100755
+--- i/xpu/scripts/build_ngram_nvme.sh
++++ w/xpu/scripts/build_ngram_nvme.sh
+@@ -5,7 +5,7 @@ set -euo pipefail
+ cd "$(dirname "$0")/.."
+ T=$(python3 -c "import torch,os;print(os.path.dirname(torch.__file__))")
+ PY=$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])")
+-icpx -fsycl -fsycl-targets=spir64 -O3 -fPIC -std=c++17 -shared -march=native -D_GLIBCXX_USE_CXX11_ABI=1 \
++icpx -fsycl -fsycl-targets=spir64 -O3 -fPIC -std=c++17 -shared -march=x86-64-v3 -mclflushopt -D_GLIBCXX_USE_CXX11_ABI=1 \
+   -DTORCH_EXTENSION_NAME=exl3xpu_ngram_nvme -DTORCH_API_INCLUDE_EXTENSION_H \
+   -I$T/include -I$T/include/torch/csrc/api/include -I$PY \
+   -x c++ csrc/ngram_nvme_xpu.sycl -x none -o ${EXL3_NVME_OUT:-exl3xpu/exl3xpu_ngram_nvme.so} \
+diff --git i/xpu/tests/bench_staging.py w/xpu/tests/bench_staging.py
+index 83086d5..b7f2c6c 100644
+--- i/xpu/tests/bench_staging.py
++++ w/xpu/tests/bench_staging.py
+@@ -19,10 +19,11 @@ sys.argv = _argv
+ ap2 = argparse.ArgumentParser()
+ ap2.add_argument("--m", default="2048,8192")
+ ap2.add_argument("--layers", type=int, default=6)
++ap2.add_argument("--layer", type=int, default=1, help="checkpoint layer to load (K=3; layer 0 is 4-bit here)")
+ ap2.add_argument("--out", default="")
+ a2 = ap2.parse_args()
+ 
+-host, devarena = load_layer(0)
++host, devarena = load_layer(a2.layer)
+ LB = E * BLOB
+ stage = [torch.empty(LB, dtype=torch.uint8, device=dev) for _ in range(2)]
+ hp = s64(host.data_ptr())
+diff --git i/xpu/tests/probe_kernel_load.py w/xpu/tests/probe_kernel_load.py
+new file mode 100644
+index 0000000..46dc159
+--- /dev/null
++++ w/xpu/tests/probe_kernel_load.py
+@@ -0,0 +1,63 @@
++"""B70 spike: does loading many JIT kernel variants in one process make a later kernel launch fail with
++UR_RESULT_ERROR_OUT_OF_RESOURCES? Runs dense EXL3 linears (K=3/4/5) and grouped MoE (K=3/4) over many row counts on
++random data (values irrelevant), then the n-gram NVMe lookup that failed in serving."""
++import os, sys, time
++import torch
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++t0 = time.time()
++def say(m): print(f"[{time.time() - t0:6.1f}s] {m}", flush=True)
++dev = torch.device("xpu", 0)
++torch.ops.load_library(os.environ["EXL3_LIB"])
++C = torch.ops.exl3xpu_C
++from exl3xpu.moe_offload import ops
++X = ops()
++n_launch = 0
++
++
++def dense(K, k, n, M):
++    global n_launch
++    tr = torch.randint(-32768, 32767, (k // 16, n // 16, 16 * K), dtype=torch.int16, device=dev)
++    suh = (torch.rand((1, k), device=dev) + 0.5).half()
++    svh = (torch.rand(n, device=dev) * 0.01).half()
++    sonb = torch.zeros(n // 128, dtype=torch.int32, device=dev)
++    x = torch.randn((M, k), device=dev).to(torch.bfloat16)
++    C.linear(x, tr, suh, svh, sonb, [0, n], K, 2, 128, 16384)
++    torch.xpu.synchronize()
++    n_launch += 1
++
++
++def moe(K, M):
++    global n_launch
++    H, I, E = 2560, 640, 512
++    blob = int(X.blob_bytes(H, I, K))
++    arena = torch.randint(0, 255, (E, blob), dtype=torch.uint8, device=dev)
++    ptrs = (arena.data_ptr() + torch.arange(E, dtype=torch.int64) * blob).to(dev)
++    x = torch.randn((M, H), device=dev).to(torch.bfloat16)
++    w, ids = torch.topk(torch.softmax(torch.randn((M, E), device=dev), -1), 10, dim=-1)
++    X.moe_forward(x, ids.to(torch.int32).contiguous(), (w / w.sum(-1, keepdim=True)).float().contiguous(), ptrs, I, K, E)
++    torch.xpu.synchronize()
++    n_launch += 1
++
++
++stage = "start"
++try:
++    for K in (3, 4, 5):
++        for (k, n) in ((2560, 1280), (640, 2560)):
++            for M in (1, 4, 23, 129):
++                stage = f"dense K={K} {k}x{n} M={M}"
++                dense(K, k, n, M)
++        say(f"dense K={K} done ({n_launch} calls)")
++    for K in (3, 4):
++        for M in (1, 4, 23, 600):
++            stage = f"moe K={K} M={M}"
++            moe(K, M)
++        say(f"moe K={K} done ({n_launch} calls)")
++    stage = "ngram"
++    from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
++    nv = Exl3NgramNvmeTable(os.environ["MODEL"], ram_gb=4.0, device=dev)
++    ids = torch.randint(0, nv.num_rows, (23, 16), dtype=torch.int64).to(dev)
++    out = nv.gather(ids); torch.xpu.synchronize()
++    say(f"n-gram gather after {n_launch} kernel-variant calls: ok, finite={bool(torch.isfinite(out.float()).all())}")
++except Exception as e:
++    say(f"FAILED at {stage} after {n_launch} calls: {str(e).splitlines()[0]}")
++    sys.exit(1)
+diff --git i/xpu/tests/probe_ngram_nvme.py w/xpu/tests/probe_ngram_nvme.py
+new file mode 100644
+index 0000000..8919304
+--- /dev/null
++++ w/xpu/tests/probe_ngram_nvme.py
+@@ -0,0 +1,34 @@
++"""B70 spike: step-by-step probe of the NVMe n-gram tier (no host table), to find where a lookup stalls."""
++import os, sys, time
++import torch
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
++t0 = time.time()
++def say(m): print(f"[{time.time() - t0:6.1f}s] {m}", flush=True)
++dev = torch.device("xpu", 0)
++held = []
++if os.environ.get("HOLD_GB"):            # pinned host USM like the expert store, allocated first
++    from exl3xpu.moe_offload import ops
++    X = ops()
++    for i in range(int(os.environ["HOLD_GB"])):
++        h = X.host_alloc(1 << 30); h.fill_(1); held.append(h)
++    say(f"holding {len(held)} GiB of host USM")
++if os.environ.get("HOLD_DEV_GB"):        # device memory in use like the serving process (slots, weights, KV)
++    for i in range(int(os.environ["HOLD_DEV_GB"])):
++        held.append(torch.ones(1 << 28, dtype=torch.float32, device=dev))
++    torch.xpu.synchronize(); say(f"holding {os.environ['HOLD_DEV_GB']} GiB of device memory")
++say("constructing the NVMe table")
++nv = Exl3NgramNvmeTable(os.environ["MODEL"], ram_gb=float(os.environ.get("RAM_GB", "1")), device=dev)
++say(f"table ready: {nv.num_rows} rows, K={nv.K}, words={nv.words}")
++ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int64, device=dev)
++torch.xpu.synchronize(); say("ids on device; calling gather (1 x 16)")
++out = nv.gather(ids)
++say("gather enqueued; synchronizing")
++torch.xpu.synchronize()
++say(f"gather done: {tuple(out.shape)} {out.dtype}, finite={bool(torch.isfinite(out.float()).all())}, absmean={out.float().abs().mean().item():.4f}")
++for T in (25, 4096):
++    g = torch.Generator().manual_seed(T)
++    ids = torch.randint(0, nv.num_rows, (T, 16), generator=g, dtype=torch.int64).to(dev)
++    torch.xpu.synchronize(); say(f"gather {T} x 16 random ids")
++    out = nv.gather(ids); torch.xpu.synchronize()
++    say(f"  done: finite={bool(torch.isfinite(out.float()).all())}, absmean={out.float().abs().mean().item():.4f}")
+diff --git i/xpu/tests/test_dense_bits.py w/xpu/tests/test_dense_bits.py
+new file mode 100644
+index 0000000..6b18d52
+--- /dev/null
++++ w/xpu/tests/test_dense_bits.py
+@@ -0,0 +1,93 @@
++"""
++B70 spike: every (bit width, shape) of the checkpoint's dense EXL3 linears through torch.ops.exl3xpu_C.linear at several
++row counts, against the fp32 reference (trellis_core.reference.weight_orig). Lists launch failures (e.g.
++UR_RESULT_ERROR_OUT_OF_RESOURCES) and accuracy per case. One real tensor per (K, k, n); shared-expert gate+up also fused.
++
++  python3 tests/test_dense_bits.py --model /models/<ckpt> [--m 1,4,8,16,24,64,129,512]
++"""
++import argparse, json, os, re, sys
++import torch
++from safetensors import safe_open
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, "..", "..", "core", "src"))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from trellis_core import reference as ref
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", required=True)
++ap.add_argument("--m", default="1,4,8,16,24,64,129,512")
++ap.add_argument("--only-k", default="")
++args = ap.parse_args()
++torch.ops.load_library(os.environ["EXL3_LIB"])
++C = torch.ops.exl3xpu_C
++dev = torch.device("xpu:0")
++idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
++handles = {}
++
++
++def get(name):
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    return handles[fn].get_tensor(name)
++
++
++# one representative per (K, k, n), skipping routed experts, vision and the MTP head
++seen, cases = set(), []
++for name in sorted(idx):
++    if not name.endswith(".trellis") or ".experts." in name or "visual" in name or "mtp" in name:
++        continue
++    base = name[:-len(".trellis")]
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    sh = handles[fn].get_slice(name).get_shape()
++    K = sh[2] // 16
++    key = (K, sh[0] * 16, sh[1] * 16)
++    if args.only_k and str(K) not in args.only_k.split(","):
++        continue
++    if key not in seen:
++        seen.add(key)
++        cases.append(([base], key))
++# fused shared-expert gate+up per K (the call that failed in serving)
++for K_want in (3, 4, 5):
++    for name in sorted(idx):
++        m = re.match(r"(.*\.mlp\.shared_expert)\.gate_proj\.trellis$", name)
++        if m and handles.setdefault(idx[name], safe_open(f"{args.model}/{idx[name]}", "pt", device="cpu")).get_slice(name).get_shape()[2] // 16 == K_want:
++            cases.append(([m.group(1) + ".gate_proj", m.group(1) + ".up_proj"], ("fused", K_want)))
++            break
++
++print(f"{len(cases)} cases", flush=True)
++Ms = [int(v) for v in args.m.split(",")]
++fails = 0
++for bases, key in cases:
++    t = [{s: get(b + "." + s) for s in ("trellis", "suh", "svh")} for b in bases]
++    K = t[0]["trellis"].shape[2] // 16
++    tr = torch.cat([x["trellis"] for x in t], 1).contiguous().to(dev) if len(t) > 1 else t[0]["trellis"].contiguous().to(dev)
++    suh = torch.stack([x["suh"].half() for x in t]).contiguous().to(dev)
++    svh = torch.cat([x["svh"].half() for x in t]).contiguous().to(dev)
++    bounds = [0]
++    for x in t:
++        bounds.append(bounds[-1] + x["trellis"].shape[1] * 16)
++    sonb = torch.empty(bounds[-1] // 128, dtype=torch.int32)
++    for g in range(len(bounds) - 1):
++        sonb[bounds[g] // 128: bounds[g + 1] // 128] = g
++    sonb = sonb.to(dev)
++    W = torch.cat([ref.weight_orig(x["trellis"].to(dev), x["suh"].to(dev), x["svh"].to(dev), K, 2) for x in t], 1)
++    kdim = W.shape[0]
++    for M in Ms:
++        x = (torch.randn((M, kdim), generator=torch.Generator().manual_seed(M)) * 0.5).to(torch.bfloat16).to(dev)
++        try:
++            y = C.linear(x, tr, suh, svh, sonb, bounds, K, 2, 128, 16384)
++            torch.xpu.synchronize()
++            r = x.float() @ W
++            rms = ((y.float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
++            status = "ok" if rms < 0.02 else "WRONG"
++            fails += status != "ok"
++            print(f"{str(key):22s} {'+'.join(b.split('.')[-1] for b in bases):18s} M={M:4d} {status} rms_rel={rms:.4f}", flush=True)
++        except Exception as e:
++            fails += 1
++            print(f"{str(key):22s} {'+'.join(b.split('.')[-1] for b in bases):18s} M={M:4d} FAIL {str(e).splitlines()[0][:110]}", flush=True)
++            torch.xpu.synchronize()
++print(f"{len(cases)} shapes x {len(Ms)} row counts, {fails} failures", flush=True)
+diff --git i/xpu/tests/test_moe_k4.py w/xpu/tests/test_moe_k4.py
+new file mode 100644
+index 0000000..91c1a2e
+--- /dev/null
++++ w/xpu/tests/test_moe_k4.py
+@@ -0,0 +1,210 @@
++"""
++K=4 variant of test_moe.py (B70 spike): the expert bit width is read from the checkpoint (layer 0 of
++Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-3bpw is K=4) and blobs are packed by exl3xpu.moe_offload.
++X002: grouped EXL3 MoE (pointer-table experts) on XPU vs the trellis_core fp32 reference, on REAL Qwen3.8-Flash-Next
++routed experts; plus decode/prefill microbenchmarks with experts in device slots / host USM (zero-copy) / mixed.
++
++  python3 tests/test_moe.py --check            # correctness, layers 0 and 47, M = 1..16 (+ prefill sizes if built)
++  python3 tests/test_moe.py --bench-decode     # per-layer latency, device vs host-USM vs mixed
++"""
++import os, sys, json, time, argparse, random
++import torch
++import torch.nn.functional as F
++from safetensors import safe_open
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, "..", "..", "core", "src"))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from trellis_core import reference as ref
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", default=os.environ.get("MODEL", "/model"))
++ap.add_argument("--layer", type=int, default=0)
++ap.add_argument("--check", action="store_true")
++ap.add_argument("--check-m", default="1,2,3,4,8,16")
++ap.add_argument("--bench-decode", action="store_true")
++ap.add_argument("--bench-m", default="1,2,4,8,16")
++ap.add_argument("--bench-prefill", action="store_true")
++ap.add_argument("--prefill-m", default="2048,8192")
++ap.add_argument("--iters", type=int, default=100)
++ap.add_argument("--dtype", default="bf16")
++ap.add_argument("--out", default="")
++ap.add_argument("--splits", default="", help="gu_p,dn_p")
++ap.add_argument("--mr", type=int, default=0)
++ap.add_argument("--placements", default="device,host,mixed50,mixed20")
++args = ap.parse_args()
++
++torch.ops.load_library(os.environ.get("EXL3_MOE_LIB") or os.path.join(HERE, "..", "exl3xpu", "_moe.so"))
++X = torch.ops.exl3xpu_moe
++dev = torch.device("xpu:0")
++H, I, E, TOPK = 2560, 640, 512, 10
++from exl3xpu.moe_offload import pack_expert as _pack_expert
++if args.splits:
++    X.moe_set_splits(*[int(v) for v in args.splits.split(",")])
++if args.mr:
++    X.moe_set_mr(args.mr)
++if os.environ.get("MOE_PREFILL_MIN_M"):
++    X.moe_set_prefill_min_m(int(os.environ["MOE_PREFILL_MIN_M"]))
++if os.environ.get("MOE_PAIR_MAX_M"):
++    X.moe_set_pair_max_m(int(os.environ["MOE_PAIR_MAX_M"]))
++if os.environ.get("MOE_DEBUG_SKIP"):
++    X.moe_set_debug(int(os.environ["MOE_DEBUG_SKIP"]))
++dt = torch.bfloat16 if args.dtype == "bf16" else torch.float16
++idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
++handles = {}
++
++
++def get(name):
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    return handles[fn].get_tensor(name)
++
++
++def expert_tensors(L, e):
++    p = f"model.language_model.layers.{L}.mlp.experts.{e}."
++    return {pr: {s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")}
++
++
++def pack(t):
++    blob = _pack_expert({k: t["gate_proj"][k] for k in ("trellis", "suh", "svh")},
++                        {k: t["up_proj"][k] for k in ("trellis", "suh", "svh")},
++                        {k: t["down_proj"][k] for k in ("trellis", "suh", "svh")}, K)
++    assert blob.numel() == BLOB, (blob.numel(), BLOB)
++    return blob
++
++
++def s64(p):
++    return p - (1 << 64) if p >= (1 << 63) else p
++
++
++K = expert_tensors(args.layer, 0)["gate_proj"]["trellis"].shape[2] // 16
++BLOB = X.blob_bytes(H, I, K)
++print(f"layer {args.layer}: experts K={K}, blob {BLOB} B", flush=True)
++
++
++def load_layer(L):
++    t0 = time.time()
++    host = X.host_alloc(E * BLOB).view(E, BLOB)          # USM host (zero-copy readable by the device)
++    for e in range(E):
++        host[e].copy_(pack(expert_tensors(L, e)))
++    devarena = host.to(dev)                               # device slots [E, BLOB]
++    print(f"layer {L}: packed {E} experts ({E * BLOB / 1e9:.3f} GB) in {time.time() - t0:.1f}s; "
++          f"usm_kind host={X.usm_kind(s64(host.data_ptr()))} dev={X.usm_kind(s64(devarena.data_ptr()))}", flush=True)
++    return host, devarena
++
++
++def ptr_table(host, devarena, on_host_mask):
++    hp = s64(host.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB
++    dp = s64(devarena.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB
++    return torch.where(on_host_mask, hp, dp).to(dev)
++
++
++def ref_moe(x, ids, w, L, cache):
++    """fp32 reference: dense original-basis weights (trellis_core.reference.weight_orig), grouped by expert."""
++    out = torch.zeros((x.shape[0], H), dtype=torch.float32, device=dev)
++    xf = x.float()
++    flat = ids.flatten().long()
++    for e in torch.unique(flat).tolist():
++        if e not in cache:
++            t = {pr: {s_: v.to(dev) for s_, v in d.items()} for pr, d in expert_tensors(L, e).items()}
++            cache[e] = {pr: ref.weight_orig(t[pr]["trellis"], t[pr]["suh"], t[pr]["svh"], K, 2) for pr in t}
++        W = cache[e]
++        pos = (flat == e).nonzero().flatten()
++        rows, ks = pos // ids.shape[1], pos % ids.shape[1]
++        xs = xf[rows.to(dev)]
++        a = F.silu(xs @ W["gate_proj"]) * (xs @ W["up_proj"])
++        d = a @ W["down_proj"]
++        out.index_add_(0, rows.to(dev), d * w[rows, ks].to(dev).unsqueeze(1))
++    return out
++
++
++def routing(M, g=None, skew=None):
++    g = g or torch.Generator().manual_seed(0)
++    logits = torch.randn((M, E), generator=g)
++    if skew is not None:
++        logits = logits + skew
++    w, ids = torch.topk(torch.softmax(logits, -1), TOPK, dim=-1)
++    w = w / w.sum(-1, keepdim=True)
++    return ids.to(torch.int32).to(dev), w.float().to(dev)
++
++
++res = {"check": [], "decode": [], "prefill": []}
++host, devarena = load_layer(args.layer)
++
++if args.check:
++    cache = {}
++    torch.manual_seed(0)
++    for M in [int(v) for v in args.check_m.split(",")]:
++        for placement in ("device", "host", "mixed"):
++            mask = {"device": torch.zeros(E, dtype=torch.bool), "host": torch.ones(E, dtype=torch.bool),
++                    "mixed": torch.arange(E) % 2 == 1}[placement]
++            ptrs = ptr_table(host, devarena, mask)
++            x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
++            ids, w = routing(M, torch.Generator().manual_seed(M))
++            y = X.moe_forward(x, ids, w, ptrs, I, K, E)
++            y2 = X.moe_forward(x, ids, w, ptrs, I, K, E)
++            torch.xpu.synchronize()
++            r = ref_moe(x, ids.cpu(), w.cpu(), args.layer, cache)
++            err = ((y.float() - r).abs().max() / r.abs().max()).item()
++            rms = ((y.float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
++            det = torch.equal(y, y2)
++            floor = ((r.to(dt).float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
++            rec = {"M": M, "placement": placement, "max_rel": round(err, 5), "rms_rel": round(rms, 5),
++                   "rms_rel_floor_out_dtype": round(floor, 5), "deterministic": det}
++            res["check"].append(rec)
++            print(rec, flush=True)
++
++if args.bench_decode:
++    def bench(fn_list, iters):
++        for f in fn_list[:5]:
++            f()
++        torch.xpu.synchronize()
++        t = time.perf_counter()
++        for i in range(iters):
++            fn_list[i % len(fn_list)]()
++        torch.xpu.synchronize()
++        return (time.perf_counter() - t) / iters * 1e6
++
++    for M in [int(v) for v in args.bench_m.split(",")]:
++        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
++        routs = [routing(M, torch.Generator().manual_seed(1000 + i)) for i in range(64)]
++        for placement, frac in [(p, {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[p])
++                                for p in args.placements.split(",")]:
++            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
++            ptrs = ptr_table(host, devarena, mask)
++            fns = [lambda ids=ids, w=w: X.moe_forward(x, ids, w, ptrs, I, K, E) for ids, w in routs]
++            us = bench(fns, args.iters)
++            n_unique = sum(len(torch.unique(ids)) for ids, _ in routs) / len(routs)
++            gb = n_unique * BLOB / 1e9
++            rec = {"M": M, "placement": placement, "us_per_layer": round(us, 1), "unique_experts": n_unique,
++                   "weight_GBps": round(gb / (us * 1e-6), 1), "ms_48_layers": round(us * 48 / 1e3, 2)}
++            res["decode"].append(rec)
++            print(rec, flush=True)
++
++if args.bench_prefill:
++    for M in [int(v) for v in args.prefill_m.split(",")]:
++        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
++        routs = [routing(M, torch.Generator().manual_seed(2000 + i)) for i in range(4)]
++        for placement in args.placements.split(","):
++            frac = {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[placement]
++            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
++            ptrs = ptr_table(host, devarena, mask)
++            for ids, w in routs[:2]:
++                X.moe_forward(x, ids, w, ptrs, I, K, E)
++            torch.xpu.synchronize()
++            it = max(3, min(20, int(2e5 / M))) if placement == "device" else 3
++            t = time.perf_counter()
++            for i in range(it):
++                ids, w = routs[i % len(routs)]
++                X.moe_forward(x, ids, w, ptrs, I, K, E)
++            torch.xpu.synchronize()
++            ms = (time.perf_counter() - t) / it * 1e3
++            flops = M * TOPK * 3 * 2 * H * I
++            rec = {"M": M, "placement": placement, "ms_per_layer": round(ms, 3), "TFLOPS": round(flops / ms / 1e9, 1),
++                   "tok_per_s_48_layers_moe_only": round(M / (ms * 48 / 1e3), 0)}
++            res["prefill"].append(rec)
++            print(rec, flush=True)
++
++if args.out:
++    json.dump(res, open(args.out, "w"), indent=1)
+diff --git i/xpu/tests/test_ngram_nvme_k3.py w/xpu/tests/test_ngram_nvme_k3.py
+new file mode 100644
+index 0000000..5587a32
+--- /dev/null
++++ w/xpu/tests/test_ngram_nvme_k3.py
+@@ -0,0 +1,43 @@
++"""X008: NVMe n-gram tier (XPU publish/wait + RowStore) must return bit-identical rows to the USM-host table, incl. an
++XPU-graph-captured lookup; timings for a decode token and a 4k/16k-token lookup (cold and warm cache)."""
++import os, sys, time, torch
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++from exl3xpu.ngram_host import Exl3NgramHostTable
++from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
++dev = torch.device("xpu", 0)
++M = os.environ.get("MODEL", "/model")
++nv = Exl3NgramNvmeTable(M, ram_gb=float(os.environ.get("RAM_GB", "8")), device=dev)
++ho = Exl3NgramHostTable(M)
++bad = 0
++g = torch.Generator().manual_seed(0)
++for T in (1, 7, 4096):
++    ids = torch.randint(0, nv.num_rows, (T, 16), generator=g, dtype=torch.int64).to(dev)
++    if T == 7:
++        ids[0, 0] = 0; ids[0, 1] = nv.num_rows - 1
++    torch.xpu.synchronize(); t = time.perf_counter()
++    a = nv.gather(ids); torch.xpu.synchronize(); dt = (time.perf_counter() - t) * 1e3
++    b = ho.gather(ids)
++    eq = torch.equal(a.view(torch.int16), b.view(torch.int16)); bad += not eq
++    print(f"T={T}: bit-identical {eq}  nvme gather {dt:.2f} ms (cold rows)", flush=True)
++    torch.xpu.synchronize(); t = time.perf_counter()
++    a2 = nv.gather(ids); torch.xpu.synchronize(); dt2 = (time.perf_counter() - t) * 1e3
++    bad += not torch.equal(a2.view(torch.int16), b.view(torch.int16))
++    print(f"      warm {dt2:.2f} ms", flush=True)
++# graph capture of a decode lookup
++ids_s = torch.randint(0, nv.num_rows, (1, 16), generator=g, dtype=torch.int64).to(dev)
++out_s = torch.empty((1, 16, 160), dtype=torch.bfloat16, device=dev)
++s = torch.xpu.Stream(); s.wait_stream(torch.xpu.current_stream())
++with torch.xpu.stream(s):
++    nv.gather(ids_s, out=out_s)
++torch.xpu.current_stream().wait_stream(s); torch.xpu.synchronize()
++gr = torch.xpu.XPUGraph()
++with torch.xpu.graph(gr):
++    nv.gather(ids_s, out=out_s)
++for k in range(5):
++    ids_s.copy_(torch.randint(0, nv.num_rows, (1, 16), generator=g, dtype=torch.int64).to(dev))
++    gr.replay(); torch.xpu.synchronize()
++    eq = torch.equal(out_s.view(torch.int16), ho.gather(ids_s).view(torch.int16)); bad += not eq
++    print("graph replay", k, "bit-identical", eq, flush=True)
++print("stats", {k: v for k, v in nv.stats().items() if k in ("lookups", "misses", "lookup_hit_rate", "bytes", "error", "gpu_waits")})
++nv.release()
++sys.exit(bad)
+diff --git i/xpu/tests/test_static_tier.py w/xpu/tests/test_static_tier.py
+new file mode 100644
+index 0000000..958720b
+--- /dev/null
++++ w/xpu/tests/test_static_tier.py
+@@ -0,0 +1,138 @@
++"""
++B70 spike: the ExpertStore static tier (EXL3_MOE_STATIC) and per-K stores, on real experts of one layer.
++
++A store whose `static` experts sit in pinned device slots (no host copy) must give exactly the output of the plain
++pointer-table MoE over all-host experts, through every path the plugin uses: decode with the LRU cache
++(forward_cached), prefill staging (forward_prefill_staged) and plain forward. Static slots must never be evicted,
++and the host arena must hold only the non-static experts.
++
++  python3 tests/test_static_tier.py --model /models/<ckpt> --layer 1 --static 150 --slots 200
++  python3 tests/test_static_tier.py --model /models/<ckpt> --layer 0 --all-static        # a K=4 layer
++"""
++import argparse, json, os, sys
++import torch
++from safetensors import safe_open
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from exl3xpu.moe_offload import ExpertStore, ops, pack_expert, s64
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", required=True)
++ap.add_argument("--layer", type=int, default=1)
++ap.add_argument("--static", type=int, default=150)
++ap.add_argument("--slots", type=int, default=200)
++ap.add_argument("--all-static", action="store_true")
++ap.add_argument("--steps", type=int, default=24)
++args = ap.parse_args()
++
++dev = torch.device("xpu:0")
++H, I, E, TOPK = 2560, 640, 512, 10
++idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
++handles = {}
++
++
++def get(name):
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    return handles[fn].get_tensor(name)
++
++
++def expert(e):
++    p = f"model.language_model.layers.{args.layer}.mlp.experts.{e}."
++    return [{s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")]
++
++
++K = expert(0)[0]["trellis"].shape[2] // 16
++X = ops()
++BLOB = int(X.blob_bytes(H, I, K))
++n_static = E if args.all_static else args.static
++n_slots = E if args.all_static else args.slots
++print(f"layer {args.layer}: K={K}, blob {BLOB} B, {n_static} static, {n_slots} slots", flush=True)
++
++# reference: every expert in host USM, plain pointer table
++ref_host = X.host_alloc(E * BLOB).view(E, BLOB)
++for e in range(E):
++    pack_expert(*expert(e), K, out=ref_host[e])
++ref_ptrs = (s64(ref_host.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB).to(dev)
++
++# store under test: a pseudo-random static set (not a contiguous range), packed through pack_target/pack_done
++g = torch.Generator().manual_seed(1)
++static = sorted(torch.randperm(E, generator=g)[:n_static].tolist())
++store = ExpertStore(H, I, K, E, n_slots, dev)
++key = f"layers.{args.layer}.mlp.experts"
++store.add_layer(key, static=static)
++for e in range(E):
++    pack_expert(*expert(e), K, out=store.pack_target(key, e))
++    store.pack_done(key, e)
++torch.xpu.synchronize()
++
++ok = True
++
++
++def check(name, cond):
++    global ok
++    ok &= bool(cond)
++    print(("PASS " if cond else "FAIL ") + name, flush=True)
++
++
++check(f"host arena holds only the {E - n_static} non-static experts",
++      store.host[key].shape[0] == E - n_static)
++pinned = store.slot_last.cpu()
++st_slots = [int(store.slot_of[key][e]) for e in static]
++check("every static expert has a pinned slot", all(s >= 0 and int(pinned[s]) == 0x7FFFFFFF for s in st_slots))
++for e in static[:8]:
++    s_ = int(store.slot_of[key][e])
++    if not torch.equal(store.slots[s_].cpu(), ref_host[e]):
++        check(f"static expert {e}: slot bytes equal the packed blob", False)
++        break
++else:
++    check("static experts' slot bytes equal their packed blobs (first 8)", True)
++
++
++def routing(M, seed):
++    gg = torch.Generator().manual_seed(seed)
++    w, ids = torch.topk(torch.softmax(torch.randn((M, E), generator=gg), -1), TOPK, dim=-1)
++    return ids.to(torch.int32).to(dev), (w / w.sum(-1, keepdim=True)).float().to(dev)
++
++
++dt = torch.bfloat16
++same = True
++for step in range(args.steps):                      # decode through the device LRU cache (misses write through)
++    M = 1 + step % 4
++    x = (torch.randn((M, H), generator=torch.Generator().manual_seed(100 + step)) * 0.5).to(dt).to(dev)
++    ids, w = routing(M, 200 + step)
++    y = store.forward_cached(key, x, ids, w)
++    r = X.moe_forward(x, ids, w, ref_ptrs, I, K, E)
++    same &= torch.equal(y, r)
++torch.xpu.synchronize()
++check(f"forward_cached == all-host moe_forward over {args.steps} decode steps (bit-exact)", same)
++pinned = store.slot_last.cpu()
++check("static slots still pinned after the LRU ran", all(int(pinned[s]) == 0x7FFFFFFF for s in st_slots))
++ptrs_now = store.ptrs(key).cpu()
++check("static experts still point at their slots",
++      all(int(ptrs_now[e]) == store.slot_ptr(int(store.slot_of[key][e])) for e in static))
++
++store.reserve_staging()                             # load time: staging sized to the non-static experts only
++st0 = store._stage[0]
++check(f"staging buffer holds E - static = {E - n_static} experts",
++      (st0 is None and n_static == E) or (st0 is not None and st0.shape[0] == E - n_static))
++M = 600                                             # prefill: staging path (copy engine + DPAS)
++x = (torch.randn((M, H), generator=torch.Generator().manual_seed(7)) * 0.5).to(dt).to(dev)
++ids, w = routing(M, 9)
++y = store.forward_prefill_staged(key, x, ids, w)
++r = X.moe_forward(x, ids, w, ref_ptrs, I, K, E)
++torch.xpu.synchronize()
++check(f"forward_prefill_staged == all-host moe_forward at M={M} (bit-exact)", torch.equal(y, r))
++check("prefill staging did not grow the buffer at run time", store._stage[0] is st0)
++
++store.reset_cache()                                 # reset keeps the static tier
++pinned = store.slot_last.cpu()
++check("reset_cache keeps static slots pinned", all(int(pinned[s]) == 0x7FFFFFFF for s in st_slots))
++x = (torch.randn((3, H), generator=torch.Generator().manual_seed(11)) * 0.5).to(dt).to(dev)
++ids, w = routing(3, 12)
++check("forward after reset_cache == reference",
++      torch.equal(store.forward_cached(key, x, ids, w), X.moe_forward(x, ids, w, ref_ptrs, I, K, E)))
++print("ALL PASS" if ok else "SOME FAILED", flush=True)
++sys.exit(0 if ok else 1)

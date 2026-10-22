@@ -1,0 +1,11 @@
+# the unpacked SGLang image (24 GB), upstream checkouts, caches and run logs stay local
+image/
+cache/
+run/
+models/
+trellis-serve/
+local-ai-images/
+local-ai-recipe-kit/
+local-ai-registry/
+*.log
+__pycache__/
