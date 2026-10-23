@@ -14,8 +14,12 @@ Endpoints
                               (default 1: earlier turns' reasoning is not resent). A reply that opens a think block
                               although thinking was off still goes to reasoning_content, never to content.
                               Sampling: temperature, top_p, top_k, min_p, max_tokens / max_completion_tokens, stop, seed.
+                              return_progress (llama.cpp's): while the prompt is read, streamed chunks carry
+                              prompt_progress {total, cache, processed, time_ms}, one per prefill chunk.
   POST /v1/completions        raw prompt text, stream or not
   POST /quit                  stop the server (127.0.0.1 only)
+
+A prompt that takes more than one prefill chunk logs a line per chunk: tokens read, the rate, and the time left.
 
 The model is loaded exactly as xpu/devserver.py loads it (same warm order, tier, block graphs, live speed log in
 run/live.log). The generator's page table is kept between requests, so a chat follow-up that repeats the previous
@@ -239,8 +243,42 @@ class Splitter:
 class Request:
     def __init__(self, ids, sampling, stops, max_new):
         self.ids, self.sampling, self.stops, self.max_new = ids, sampling, stops, max_new
-        self.out = queue.Queue()     # ("text", str) ... then ("done", info) or ("error", msg)
+        # ("progress", dict) while the prompt is read, ("text", str) ..., then ("done", info) or ("error", msg)
+        self.out = queue.Queue()
         self.cancelled = threading.Event()
+
+
+def duration(s):
+    s = max(0, round(s))
+    return f"{s // 60} min {s % 60:02d} s" if s >= 60 else f"{s} s"
+
+
+class PrefillProgress:
+    """How far a request has read its prompt, after each prefill chunk: to the client as llama.cpp's prompt_progress,
+    and to the log as tokens read, the last chunk's rate and the time left at this request's rate so far (the final
+    chunk is left to the first-token line)."""
+
+    def __init__(self, req, t0):
+        self.req, self.t0, self.cache = req, t0, None
+        self.last_done, self.last_t = 0, t0
+
+    def chunk(self, r):
+        from exllamav3.constants import PAGE_SIZE
+        now, done, end = time.perf_counter(), int(r["curr_progress"]), int(r["max_progress"])
+        total = self.req.ids.shape[-1]
+        if self.cache is None:
+            job = r["job"]
+            self.cache = min(done, int(job.cached_pages) * PAGE_SIZE + int(job.cached_tokens))
+            self.last_done = self.cache
+        self.req.out.put(("progress", {"total": total, "cache": self.cache, "processed": done,
+                                       "time_ms": round((now - self.t0) * 1000)}))
+        if done < end:
+            rate_now = (done - self.last_done) / max(now - self.last_t, 1e-6)
+            rate = (done - self.cache) / max(now - self.t0, 1e-6)
+            cached = f", {self.cache:,} cached" if self.cache else ""
+            log(f"prompt {done:,} of {total:,} tokens read ({100 * done // total}%{cached}), {rate_now:.0f} tok/s "
+                f"now, {100 - 100 * done // total}% left: about {duration((end - done) / max(rate, 1e-6))}")
+        self.last_done, self.last_t = done, now
 
 
 class Engine:
@@ -345,6 +383,7 @@ class Engine:
                   seed=req.sampling.get("seed"))
         t0 = time.perf_counter()
         gen.enqueue(job)
+        progress = PrefillProgress(req, t0)
         t_first, n, info = None, 0, None
         while gen.num_remaining_jobs():
             if req.cancelled.is_set():
@@ -356,6 +395,8 @@ class Engine:
                 if stage == "error":
                     self.broken = f"{r.get('error')!r}"[:300]
                     raise RuntimeError(f"generator error: {self.broken}")
+                if stage == "prefill":
+                    progress.chunk(r)
                 if stage != "streaming":
                     continue
                 if t_first is None:
@@ -417,8 +458,9 @@ def make_handler(engine, a):
             except OSError:
                 return True
 
-        def events(self, req):
-            """Yields ("text", str) and finally ("done", info); raises on error. Cancels on client disconnect."""
+        def events(self, req, progress=False):
+            """Yields ("text", str) and finally ("done", info), with ("progress", dict) before them if asked; raises
+            on error. Cancels on client disconnect."""
             while True:
                 try:
                     ev = req.out.get(timeout=0.5)
@@ -429,6 +471,8 @@ def make_handler(engine, a):
                     continue
                 if ev[0] == "error":
                     raise RuntimeError(ev[1])
+                if ev[0] == "progress" and not progress:
+                    continue
                 yield ev
                 if ev[0] == "done":
                     return
@@ -525,17 +569,21 @@ def make_handler(engine, a):
                 self.wfile.write(chunk({"role": "assistant", "content": ""}))
                 self.wfile.flush()
                 info = None
-                for ev in self.events(req):
-                    if ev[0] == "done":
-                        info = ev[1]
-                        parts = sp.feed("", final=True)
+                for ev in self.events(req, progress=body.get("return_progress") is True):
+                    if ev[0] == "progress":
+                        # llama.cpp's shape: an empty assistant delta carrying the progress
+                        out = [chunk({"role": "assistant", "content": None}, prompt_progress=ev[1])]
                     else:
-                        parts = sp.feed(ev[1])
-                    for kind, t in parts:
-                        self.wfile.write(chunk({"reasoning_content" if kind == "reasoning" else "content": t}))
+                        if ev[0] == "done":
+                            info = ev[1]
+                        parts = sp.feed("", final=True) if ev[0] == "done" else sp.feed(ev[1])
+                        out = [chunk({"reasoning_content" if kind == "reasoning" else "content": t})
+                               for kind, t in parts]
                     try:
+                        for b in out:
+                            self.wfile.write(b)
                         self.wfile.flush()
-                    except OSError:
+                    except OSError:         # the client hung up (during the prompt too): stop its job
                         req.cancelled.set()
                         raise
                 reason = info["finish_reason"]
