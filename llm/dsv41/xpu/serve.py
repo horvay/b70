@@ -27,6 +27,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -110,14 +111,73 @@ def parse_tool_calls(held, tools):
     try:
         _, _, calls = E.parse_tool_calls(len(TOOL_OPEN), held)
     except (ValueError, AssertionError) as e:
-        log(f"tool call not parsed ({e}); returned as text")
-        return held, []
+        calls = salvage_tool_calls(held, tools)
+        if not calls:
+            log(f"tool call not parsed ({e}); returned as text")
+            return held, []
+        log(f"tool call salvaged from a malformed block ({e})")
     out = []
     for c in calls:
         name = c["name"] if c.get("namespace") is None else f"{c['namespace']}::{c['name']}"
         out.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                     "function": {"name": name, "arguments": c["arguments"]}})
     return "", out
+
+
+_INVOKE = re.compile(r'<(?:｜DSML｜\s*)?invoke\s+name="([^"]+)"\s*>(.*?)(?=<(?:｜DSML｜\s*)?invoke\s|\Z)', re.DOTALL)
+_PARAM = re.compile(r'<(?:｜DSML｜\s*)?parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)'
+                    r'</(?:｜DSML｜\s*)?parameter\s*>', re.DOTALL)
+
+
+def salvage_tool_calls(held, tools):
+    """Calls from a block the reference parser rejects. The 1.62 bpw model sometimes drifts from DSML mid-call: its
+    parameter tags lose the ｜DSML｜ marker or string="..." flag, the invoke closes as </name>, or it retries as JSON
+    ({"name": ..., "parameters"|"arguments": {...}}). Only tools the request offered count; the first form that yields
+    calls wins (a JSON retry after DSML calls is the same call again)."""
+    schemas = {}
+    for t in tools or []:
+        f = t.get("function", t) if isinstance(t, dict) else {}
+        if f.get("name"):
+            schemas[f["name"]] = (f.get("parameters") or {}).get("properties") or {}
+
+    def value(tool, key, text, string):
+        if string is None:      # no flag: the schema decides; JSON text for non-strings, else the raw text
+            string = "true" if schemas.get(tool, {}).get(key, {}).get("type", "string") == "string" else "false"
+        if string == "false":
+            try:
+                return json.loads(text)
+            except ValueError:
+                pass
+        return text
+
+    calls = []
+    for name, body in _INVOKE.findall(held):
+        if name not in schemas:
+            continue
+        args = {}
+        for key, string, text in _PARAM.findall(body):
+            args.setdefault(key, value(name, key, text, string or None))
+        calls.append({"name": name, "arguments": json.dumps(args, ensure_ascii=False)})
+    if calls:
+        return calls
+    dec, i = json.JSONDecoder(), held.find("{")
+    while i >= 0:
+        try:
+            obj, end = dec.raw_decode(held, i)
+        except ValueError:
+            i = held.find("{", i + 1)
+            continue
+        if isinstance(obj, dict) and obj.get("name") in schemas:
+            args = obj.get("parameters", obj.get("arguments", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = None
+            if isinstance(args, dict):
+                calls.append({"name": obj["name"], "arguments": json.dumps(args, ensure_ascii=False)})
+        i = held.find("{", end)
+    return calls
 
 
 class Engine:

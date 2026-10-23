@@ -866,6 +866,7 @@ ROUTE_CHECK = [int(os.environ.get("DSV_ROUTE_CHECK", "0"))]
 
 
 PREFILL_BOOST = [float(os.environ.get("DSV_PREFILL_BOOST", "0.3"))]   # prompt rows: residency boost (512-token prompt 47 -> 20 s, NLL +-0.01)
+PREFILL_SET_MIN = int(os.environ.get("DSV_PREFILL_SET_MIN", "0"))   # prompt rows: also boost experts the chunk wants this often (0 off)
 IN_PREFILL = [False]          # set by the runner while model.prefill runs (prompt tokens use exact routing)
 
 
@@ -930,8 +931,17 @@ def route(mod, y, nosync=None):
         mul = torch.from_numpy(np.where(resident, 1.0 + PREFILL_BOOST[0], 1.0).astype(np.float32)).to(y.device)
         # the pick on the CPU: torch.topk on the XPU segfaulted here (host side) on the first prompt chunk of two runs;
         # prompts run synchronously anyway, and this is one 0.8 MB copy per layer
-        key = (s * mul + mod._bias).cpu()
-        idx = torch.topk(key, k, dim=-1, sorted=False).indices.to(y.device)
+        s_c, mul_c = s.cpu(), mul.cpu()
+        key = s_c * mul_c + mod._bias.cpu()
+        idx = torch.topk(key, k, dim=-1, sorted=False).indices
+        if PREFILL_SET_MIN > 0 and R > PREFILL_SET_MIN:
+            # set-aware: an expert this chunk's rows want at least PREFILL_SET_MIN times is read anyway, so it competes
+            # boosted like a resident one; experts only a row or two wanted then lose their near-ties to it (fewer
+            # pieces read for one token)
+            wanted = torch.bincount(idx.reshape(-1), minlength=s.shape[-1]) >= PREFILL_SET_MIN
+            mul_c = torch.where(wanted, torch.tensor(1.0 + PREFILL_BOOST[0]), mul_c)
+            idx = torch.topk(s_c * mul_c + mod._bias.cpu(), k, dim=-1, sorted=False).indices
+        idx = idx.to(y.device)
         w = s.gather(-1, idx)
         w = w * (mod.routed_scaling_factor / (w.sum(-1, keepdim=True) + 1e-20))
         return idx, w, None

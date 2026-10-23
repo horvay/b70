@@ -74,5 +74,22 @@ for step in (1, 3, 7, len(out)):
 rest, calls = serve.parse_tool_calls('<｜DSML｜ calls>\n<｜DSML｜ invoke nam', tools)
 check("a broken tool call stays visible", rest.startswith("<｜DSML｜ calls>") and not calls)
 
+
+# 4. malformed blocks the 1.62 bpw model writes: salvaged when they name an offered tool
+read = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {
+    "path": {"type": "string"}, "i": {"type": "string"}, "limit": {"type": "integer"}}}}}]
+drift = ('<｜DSML｜ calls>\n<｜DSML｜ invoke name="read">\n<parameter name="i">Inspect the dossier</parameter>\n'
+         '<parameter name="path">dossiers/a.md</parameter>\n<parameter name="limit">40</parameter>\n</read>\n'
+         '<｜DSML｜ calls>\n<tool calls>{"name":"read","parameters":{"path":"dossiers/a.md","i":"again"}}')
+rest, calls = serve.parse_tool_calls(drift, read)
+check("DSML without markers, retried as JSON: one call", not rest and len(calls) == 1
+      and calls[0]["function"]["name"] == "read"
+      and json.loads(calls[0]["function"]["arguments"]) == {"i": "Inspect the dossier", "path": "dossiers/a.md",
+                                                            "limit": 40}, repr((rest, calls)))
+rest, calls = serve.parse_tool_calls('<｜DSML｜ calls>\n<tool calls>{"name":"read","arguments":{"path":"b.md"}}', read)
+check("JSON-only call", not rest and len(calls) == 1 and json.loads(calls[0]["function"]["arguments"]) == {"path": "b.md"})
+rest, calls = serve.parse_tool_calls('<｜DSML｜ calls>\n<｜DSML｜ invoke name="write">\n<parameter name="x">1</parameter>', read)
+check("a tool the request did not offer stays visible", rest.startswith("<｜DSML｜ calls>") and not calls)
+
 print("ALL OK" if not fails else f"{fails} FAILED", flush=True)
 sys.exit(1 if fails else 0)

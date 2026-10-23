@@ -208,7 +208,29 @@ def load(model_dir="/models", store_dir="/nvx", cache_tokens=65536, max_batch_si
     import triton
     PREFILL_NATIVE = os.environ.get("DSV_PREFILL_NATIVE", "1") == "1" and hasattr(triton.knobs, "intel")
 
+    FIRST_CHUNK = int(os.environ.get("DSV_FIRST_CHUNK", "0"))
+    chunks_run = [0]
+    if FIRST_CHUNK > 0:
+        # a request's first computed prompt chunk is at most FIRST_CHUNK tokens (a multiple of the 256-token page):
+        # its experts land in the RAM tier, and the boost steers the next, full-size chunk toward them
+        from exllamav3.generator.job import Job as _Job
+        job_prefill = _Job.prefill
+
+        def first_small(self, results):
+            if getattr(self, "_dsv_computed", False):
+                return job_prefill(self, results)
+            g, keep, n0 = self.generator, self.generator.max_chunk_size, chunks_run[0]
+            g.max_chunk_size = min(keep, FIRST_CHUNK)
+            try:
+                return job_prefill(self, results)
+            finally:
+                g.max_chunk_size = keep
+                self._dsv_computed = chunks_run[0] > n0
+
+        _Job.prefill = first_small
+
     def prefill(input_ids, params=None):
+        chunks_run[0] += 1
         if moe.PAGER is not None:
             moe.PAGER.wait_idle()
         if tier.nosync:
