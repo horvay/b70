@@ -26,6 +26,8 @@ tts/                Fish S2 Pro and Qwen3-TTS on torch-XPU (older projects)
 |---|---|---|
 | MiniMax H3 video (Ref2VA, guides, ControlNet, multi-shot batches) | `tools/h3-ref2va` | `engines/sd.cpp/build-sycl/bin/sd-cli` + `xpu_sdpa/libxpu_h3.so`, `libxpu_h3vae.so` |
 | Qwen Image 2.1 stills (Noct Q Anime) | `tools/b70-image.sh -m qwen --xpu`, `--batch` | sd-cli + `xpu_sdpa/libxpu_qwen21.so` |
+| MOSS-Image stills (Base, Dirty-Moss; Turbo LoRA, 1.5x hires; `(word:1.3)` prompt weights) | `tools/b70-image.sh -m moss\|dirty-moss [--turbo] [--hires] [--xpu]`, `--batch` | `engines/sd.cpp-moss` sd-cli (upstream MOSS support, branch `moss-merge`); `--xpu`: + `xpu_sdpa/libxpu_moss.so` |
+| MiniMax-H3-Image stills and edits (33B, 6 steps, 4-16 MP, up to 16 `<Picture N>` references) | `tools/b70-image.sh -m h3`, `--batch` (one process per still) | `engines/sd.cpp-h3img` sd-cli (upstream master with H3-Image, branch `h3-image`; its ggml on branch `b70-sycl` carries the B70 SYCL patches that still apply, the pool-cache release and the oneDNN f16 matmul) + `xpu_sdpa/libxpu_h3.so` int8 blocks. 4 MP ~1.2 s/step, 16 MP ~7.8 s/step; ~1.5 / 2.3 min per image with loading, text encoder and VAE |
 | MiniMax Music 3 songs | `engines/sd.cpp/xpu_sdpa/xpu_music3` | standalone SYCL + oneDNN |
 | Fish Audio Drama 3 voice | `tools/drama3_clone <jobs.tsv> --out DIR [--submit]` | `engines/audio.cpp/.../drama3_batch` |
 | LLM servers | `llm/b70 serve <model>` | SGLang / exllamav3 ports in a bubblewrap image |

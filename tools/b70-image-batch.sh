@@ -14,10 +14,12 @@
 #
 # Writes every job's OUT and OUT-minus-extension.log (its part of the run log; the first job's log also holds the
 # shared model load), plus BATCH_LOG (default: JOBS-minus-extension.batch.log) and the sd-cli jobs file
-# (BATCH_LOG with .jobs.jsonl). SD_FAST_BIN picks the sd-cli build (needs img_gen --multi-jobs).
+# (BATCH_LOG with .jobs.jsonl). The sd-cli build is the one b70-image.sh picks for the model (MOSS: sd.cpp-moss);
+# SD_FAST_BIN overrides it (needs img_gen --multi-jobs).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"   # ~/b70/tools
+SD_FAST_BIN_SET="${SD_FAST_BIN:-}"
 SD_FAST_BIN="${SD_FAST_BIN:-$(dirname "$ROOT")/engines/sd.cpp/build-sycl/bin/sd-cli}"
 
 [[ $# -ge 1 && "$1" != -h && "$1" != --help ]] || { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
@@ -52,8 +54,8 @@ if n == 0:
 EOF
 
 # Context (model) options of the sd-cli command line; everything else is per job.
-ctx_with_value=" --diffusion-model --llm --vae --lora-model-dir --llm_vision "
-ctx_flags=" --diffusion-fa -v "
+ctx_with_value=" --diffusion-model --llm --vae --lora-model-dir --llm_vision --tokenizer "
+ctx_flags=" --diffusion-fa --vae-conv-direct -v "
 
 base=() base_key="" base_env=() vision="" outs=() logs=()
 n=$(find "$tmp" -name 'job-*.args' | wc -l)
@@ -94,6 +96,11 @@ for ((j = 1; j <= n; j++)); do
   printf '%s\0' "${job[@]}" > "$tmp/job-$j.job"
 done
 [[ -n "$vision" ]] && base+=(--llm_vision "$vision")
+# the sd-cli build b70-image.sh resolved for these jobs (same for all of them: it is part of the env key)
+for v in ${base_env[@]+"${base_env[@]}"}; do
+  [[ "$v" == B70_SD_CLI=* && -z "$SD_FAST_BIN_SET" ]] && SD_FAST_BIN="${v#B70_SD_CLI=}"
+done
+[[ -x "$SD_FAST_BIN" ]] || { echo "not found: $SD_FAST_BIN" >&2; exit 1; }
 
 python3 - "$tmp" "$n" > "$JOBS_JSONL" <<'EOF'
 import json, sys
@@ -105,7 +112,22 @@ EOF
 echo "b70 batch: $n stills in one process ($(basename "$SD_FAST_BIN")), log $BATCH_LOG"
 for ((j = 0; j < n; j++)); do echo "  $((j + 1)): ${outs[j]}"; done
 
-env ${base_env[@]+"${base_env[@]}"} "$SD_FAST_BIN" "${base[@]}" --multi-jobs "$JOBS_JSONL" > "$BATCH_LOG" 2>&1 &
+if [[ $("$SD_FAST_BIN" --help 2>/dev/null | grep -c -- --multi-jobs) -gt 0 ]]; then
+  env ${base_env[@]+"${base_env[@]}"} "$SD_FAST_BIN" "${base[@]}" --multi-jobs "$JOBS_JSONL" > "$BATCH_LOG" 2>&1 &
+else
+  # Builds without --multi-jobs (MiniMax-H3-Image's upstream sd.cpp-h3img): one process per still, in order, with the
+  # same "[multi] job N/M start:/saved" markers in BATCH_LOG, so callers follow and split it the same way.
+  (
+    for ((j = 1; j <= n; j++)); do
+      mapfile -d '' jargs < "$tmp/job-$j.job"
+      echo "[INFO ] b70-image-batch - [multi] job $j/$n start: ${outs[j - 1]}"
+      env ${base_env[@]+"${base_env[@]}"} "$SD_FAST_BIN" "${base[@]}" "${jargs[@]}" 2>&1 || exit $?
+      [[ -s "${outs[j - 1]}" ]] || { echo "[ERROR] b70-image-batch - job $j/$n wrote no ${outs[j - 1]}"; exit 1; }
+      echo "[INFO ] b70-image-batch - [multi] job $j/$n saved: ${outs[j - 1]}"
+    done
+    echo "[INFO ] b70-image-batch - [multi] $n/$n jobs saved"
+  ) > "$BATCH_LOG" 2>&1 &
+fi
 PID=$!
 trap 'kill $PID 2>/dev/null' INT TERM
 
@@ -126,7 +148,7 @@ awk -v files="$(printf '%s\n' "${logs[@]}")" '
 for ((j = 0; j < n; j++)); do
   echo "-- $((j + 1)): ${outs[j]}"
   [[ -f "${logs[j]}" ]] || { echo "   not started"; continue; }
-  grep -aE 'completed, taking|generate_image completed|ERROR|xpu_qwen21\] (loaded|LoRA|error)|\[multi\] job [0-9]+/[0-9]+ (saved|\()' "${logs[j]}" |
+  grep -aE 'completed, taking|generate_image completed|ERROR|xpu_(qwen21|moss)\] (loaded|LoRA|error)|\[multi\] job [0-9]+/[0-9]+ (saved|\()' "${logs[j]}" |
     grep -v 'loading tensors' | sed 's/^\[[A-Z]* *\] [^-]*- //'
 done
 grep -aE '\[multi\] (context ready|[0-9]+/[0-9]+ jobs saved)' "$BATCH_LOG" | sed 's/^\[[A-Z]* *\] [^-]*- //'
