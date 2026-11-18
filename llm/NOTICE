@@ -1,5 +1,12 @@
 b70-inference is MIT-licensed (see LICENSE). It includes or derives from:
 
+- exl3conv/: a C++/SYCL reimplementation of the EXL3 converter of ExLlamaV3 (MIT, Copyright (c) 2025 turboderp,
+  github.com/turboderp-org/exllamav3), which builds on QTIP (Cornell RelaxML); it reads ExLlamaV3's calibration texts
+  from the llm/dsv41/exllamav3 submodule and redistributes none of them. Its evaluation set,
+  exl3conv/data/oasst2-eval.jsonl, is 200 conversations from OpenAssistant oasst2 (Apache-2.0,
+  huggingface.co/datasets/OpenAssistant/oasst2). exl3conv/data/trace-conversations.json is exllamav3's
+  sc_trace.py seed conversation list (MIT, Copyright (c) 2025 turboderp), and exl3measure / exl3opt port its
+  sc_measure.py and sc_optimize.py.
 - glm/: see glm/NOTICE (ExLlamaV3, trellis-serve, glm-flash-lite, moetier, flash-linear-attention).
 - trellis-serve.patch: changes to trellis-serve (MIT, Copyright (c) 2026 0xSero), which `b70 setup` fetches
   from github.com/0xSero/trellis-serve and patches; trellis-serve credits ExLlamaV3, the vLLM Marlin kernels

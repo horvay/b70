@@ -6,6 +6,7 @@
     b70 prepare <model dir> [--store DIR]  one-time per model: pack the NVMe expert store (GLM, DSV4.1; Flash-Next
                                            fills its own)
     b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram] [--prepare]
+              [--queue OWNER] [--idle DUR | --standby]
                                            OpenAI-compatible server in the foreground; SIGTERM stops it
     b70 run glm|sglang|dsv41 <command...>  run a command in an install's sandbox, without the GPU
     b70 stop                               stop a running `b70 serve`
@@ -13,7 +14,13 @@
 
 Families (by config.json model_type), and the install that serves them:
   gemma      Gemma 4 EXL3 (gemma4): sglang, drafting with Google's assistant model (--drafter)
+  ripple     Ripple-65B EXL3 (ricursive): engines/glm.cpp, no setup
   flashnext  Qwen3.8-Flash-Next EXL3 (qwen4_exp): sglang, experts in VRAM, RAM and an NVMe store
+  qwen35     Qwen3.8-27B EXL3 (qwen3_5), text and images: engines/glm.cpp, one request at a time
+  edge0      Edge0-145B release folder (model.json family Edge0; NVFP4 latent experts): engines/glm.cpp, no setup,
+             one request at a time
+  gguf       a GGUF folder (model.json {"family": "gguf", "gguf": "<file>"}): engines/llama.cpp's SYCL llama-server
+             (the Atomic fork the client runs on CUDA, so it speaks the client's dialect), drafting with the GGUF's own MTP layer
   glm        GLM-5.3-Flash EXL3 (glm5_next): glm/ (exllamav3 fork + B70 tier), one request at a time
   dsv41      DeepSeek-V4.1-Flash EXL3 (deepseek_v41): dsv41/ (vcruz305's exllamav3 fork + dsv41/exllamav3.patch, the GLM
              install's kernels, its own B70 tier), one request at a time, drafting with the model's own DSpark blocks
@@ -22,7 +29,12 @@ The sglang install is SGLang 0.5.20-xpu with 0xSero's trellis-serve (EXL3 kernel
 Everything runs inside the unpacked lmsysorg/sglang XPU image through bubblewrap; no Docker, no root. `serve` and
 `run --gpu` take their turn on the B70 through the b70q queue (~/ai/b70q) when its daemon runs: they wait in line, then
 hold the card; a server (--queue OWNER, --idle DUR) is stopped by the queue after DUR idle on the GPU while another job
-waits. `serve` is also a guard: it stops the server at the first xe fault on the B70 or when RAM runs low, and does not
+waits. With --standby (or its owner in STANDBY_OWNERS of ~/.config/b70/serve.env) the server is the card's idle model
+instead: it unloads when another job waits and it has had no request for a minute, and loads again when the card is
+free or a request comes; its port stays open meanwhile. Several standby servers can wait (one per owner; a newer one
+replaces its owner's old one): the one loaded last loads again when the card is free, another one only for a request
+(in line like any job). `serve` is also a guard: it stops the server at the first xe fault on the B70, when RAM runs low or memory pressure
+stays above 40% (full avg10) for 20 s (B70_PSI_MAX, B70_PSI_SECS), and does not
 start beside a Steam game that has the B70 open.
 
 State lives in B70_STATE (default <repo>/state): the image, per-family overlays, the trellis-serve checkout, caches,
@@ -30,6 +42,7 @@ expert stores, logs. B70_ROOTFS points at an already unpacked image instead; B70
 checkout to use as is (development).
 """
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -55,8 +68,9 @@ IMAGE = ("registry-1.docker.io", "lmsysorg/sglang",
 TRELLIS_REPO = "https://github.com/0xSero/trellis-serve.git"
 TRELLIS_COMMIT = "72fd2d4ca8e8de3fce03ab09e3ed1692957c2f8c"     # branch ft-xpu-vision; trellis-serve.patch applies here
 TRELLIS = os.path.abspath(os.environ.get("B70_TRELLIS_SRC") or os.path.join(STATE, "trellis-serve"))
-FAMILIES = {"glm5_next": "glm", "qwen4_exp": "flashnext", "gemma4": "gemma", "deepseek_v41": "dsv41"}
-INSTALL = {"glm": "glm", "flashnext": "sglang", "gemma": "sglang", "dsv41": "dsv41"}     # one SGLang + trellis-serve install
+FAMILIES = {"glm5_next": "glm", "qwen4_exp": "flashnext", "gemma4": "gemma", "deepseek_v41": "dsv41", "qwen3_5": "qwen35",
+            "ricursive": "ripple"}
+INSTALL = {"glm": "glm", "flashnext": "sglang", "gemma": "sglang", "dsv41": "dsv41", "qwen35": "sglang"}     # one SGLang + trellis-serve install
 SETUPS = ["glm", "sglang", "dsv41"]     # `setup all`, in order (dsv41 runs on the glm install's kernels)
 SERVE_INFO = os.path.join(STATE, "serve.json")     # the running `b70 serve` (for status / stop)
 
@@ -70,10 +84,52 @@ def fail(msg, code=1):
     sys.exit(code)
 
 
+QUEUE_JOB = bool(os.environ.get("B70Q_TICKET"))     # started inside a b70q job: stdout is the log the queue keeps for it
+
+
+def clear_log():
+    """Empties the log `serve` writes (its stdout, when that is a file) as a model load starts, so the file holds that
+    load and what came after it, not every load since the file was made (Greg, 2026-11-16: "it should clear the log
+    each time a model is loaded"). Left alone: a terminal or pipe, the log the queue keeps for a job this runs inside
+    (b70q submit / serve: one load a job, and the file is the job's record), and B70_KEEP_LOG=1."""
+    import fcntl
+    import stat
+    if QUEUE_JOB or os.environ.get("B70_KEEP_LOG") == "1":
+        return
+    try:
+        log = os.fstat(1)
+        if not stat.S_ISREG(log.st_mode):
+            return
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.ftruncate(1, 0)
+        # a file not opened for appending would be written at its old offset next, behind a hole: back to the start
+        for fd in (1, 2):
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) == (log.st_dev, log.st_ino) and not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND:
+                os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        pass
+
+
 # ------------------------------------------------------------------------------------------------- models and state
 
 def read_model(model_dir):
-    """(family, config) of an EXL3 model folder, family None when b70 does not serve it."""
+    """(family, config) of an EXL3 model folder (or an Edge0 release folder, or a GGUF folder: model.json
+    {"family": "gguf", "gguf": "<file>"}), family None when b70 does not serve it."""
+    try:
+        with open(os.path.join(model_dir, "model.json")) as f:
+            mj = json.load(f)
+        if mj.get("family") == "Edge0" and os.path.exists(os.path.join(model_dir, "model-skeleton.gguf")):
+            return "edge0", mj
+        if mj.get("family") == "gguf" and os.path.isfile(os.path.join(model_dir, mj.get("gguf") or "")):
+            try:
+                with open(os.path.join(model_dir, "config.json")) as f:
+                    return "gguf", {**json.load(f), **mj}
+            except (OSError, ValueError):
+                return "gguf", mj
+    except (OSError, ValueError):
+        pass
     try:
         with open(os.path.join(model_dir, "config.json")) as f:
             cfg = json.load(f)
@@ -144,6 +200,8 @@ def file_sha(path):
 
 
 def setup_done(family):
+    if family in ("ripple", "edge0", "gguf"):      # engines/glm.cpp or engines/llama.cpp only: no image
+        return True
     family = INSTALL.get(family, family)
     try:
         with open(setup_marker(family)) as f:
@@ -185,9 +243,16 @@ def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None
             os.makedirs(os.path.join(w, d), exist_ok=True)
         args += ["--overlay-src", ROOTFS, "--tmp-overlay", "/"]
         binds = ["--bind", w, "/w", "--tmpfs", "/root", "--bind", os.path.join(w, "cache"), "/root/.cache"]
+        for d in linked_dirs(model):
+            binds += ["--ro-bind", d, d]
         pp = img.get("PYTHONPATH", "")
         env.setdefault("PYTHONPATH", "/w/xpu:/w/exllamav3:/w/pylib" + (":" + pp if pp else ""))
         env.setdefault("TRITON_CACHE_DIR", "/root/.cache/triton")
+        # No SYCL_CACHE_PERSISTENT: it saved ~12 s of JIT per start, but the runtime then segfaults in getSortedImages
+        # (a kernel image with no entry name; intel/llvm#21972) on torch's batched topk, e.g. a long prompt's routing.
+        # Triton's cache holds SPIR-V, which the driver compiled to native code again in every process (~18 s of the
+        # first request); native code (ocloc, at the first compile) is cached as is
+        env.setdefault("TRITON_XPU_GEN_NATIVE_CODE", "1")
         chdir = chdir or "/w"
     elif family == "dsv41":
         w = os.path.join(REPO, "dsv41")
@@ -200,8 +265,7 @@ def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None
         pp = img.get("PYTHONPATH", "")
         env.setdefault("PYTHONPATH", "/w/dsv41/xpu:/w/glm/xpu:/w/dsv41/exllamav3:/w/glm/pylib" + (":" + pp if pp else ""))
         env.setdefault("TRITON_CACHE_DIR", "/root/.cache/triton")
-        env.setdefault("SYCL_CACHE_PERSISTENT", "1")
-        env.setdefault("SYCL_CACHE_DIR", "/root/.cache/sycl")
+        # no SYCL_CACHE_PERSISTENT, as for GLM above (getSortedImages segfault on torch's batched topk; intel/llvm#21972)
         chdir = chdir or "/w/dsv41"
     else:
         cache, run = os.path.join(STATE, "cache", family), os.path.join(STATE, "run", family)
@@ -244,7 +308,8 @@ def linked_dirs(model):
     for name in sorted(os.listdir(model)):
         path = os.path.join(model, name)
         if os.path.islink(path):
-            d = os.path.dirname(os.path.realpath(path))
+            rp = os.path.realpath(path)
+            d = rp if os.path.isdir(rp) else os.path.dirname(rp)       # a linked folder (a LoRA) is bound itself
             if d not in dirs and os.path.isdir(d):
                 dirs.append(d)
     return dirs
@@ -447,7 +512,8 @@ class _UnixHTTP(http.client.HTTPConnection):
 
 
 def b70q_socket():
-    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "b70q.sock")
+    return os.environ.get("B70Q_SOCKET") or os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                                                         "b70q.sock")
 
 
 def b70q(method, path, body=None, timeout=20):
@@ -542,12 +608,12 @@ def queue_wait_text(tid, w):
     return f"waiting for the B70: {where}{f', ~{eta:.0f} min' if eta is not None else ''} ({status})"
 
 
-def queue_done(tid, rc):
+def queue_done(tid, rc, reason=None):
     if tid is None:
         return
     for _ in range(10):
         try:
-            b70q("POST", f"/api/tickets/{tid}/done", {"exit_code": rc}, timeout=5)
+            b70q("POST", f"/api/tickets/{tid}/done", {"exit_code": rc, **({"reason": reason} if reason else {})}, timeout=5)
             return
         except OSError:
             time.sleep(1)
@@ -621,33 +687,43 @@ class Guard:
     def __init__(self, ram_start_gb):
         self.ram_floor = float(os.environ.get("B70_RAM_FLOOR_GB", "4"))
         self.psi_max = float(os.environ.get("B70_PSI_MAX", "40"))
+        self.psi_secs = float(os.environ.get("B70_PSI_SECS", "20"))     # a long prompt spikes it for a few seconds
         self.ram_start = float(os.environ.get("B70_RAM_START_GB", ram_start_gb))
         self.games = os.environ.get("B70_GAMES", r"steamapps[/\\]common[/\\]")
         self.pci, self.render = b70_pci()
         self.proc = None
         self.reason = None
+        self.expected = False       # stopped on purpose (asked to, or stepping aside for another job): exit 0
+        self.journal = None
         self.lock = threading.Lock()
 
     def check_start(self):
+        problem = self.problem()
+        if problem:
+            fail(problem, 98 if self.pci else 1)
+
+    def problem(self):
+        """Why the server must not start now, or None."""
         if not self.pci:
-            fail("no GPU on the xe driver found (the B70 needs the xe kernel driver)")
+            return "no GPU on the xe driver found (the B70 needs the xe kernel driver)"
         a = avail_gb()
         if a < self.ram_start:
-            fail(f"GUARD: not starting, only {a:.0f} GB RAM available (need {self.ram_start:.0f})", 98)
+            return f"GUARD: not starting, only {a:.0f} GB RAM available (need {self.ram_start:.0f})"
         # a Steam game under Proton opens every GPU, the B70 too, even when it renders on another card; model loads
         # beside one failed binding B70 memory (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY / DEVICE_LOST, xe "VM worker
         # error: -16"). Only checked at the start: a server already running is left alone.
         o = other_jobs(self.games, self.render, {os.getpid()})
         if o:
-            fail(f"GUARD: not starting, a game has the B70 open: {o[0]}", 98)
+            return f"GUARD: not starting, a game has the B70 open: {o[0]}"
+        return None
 
-    def stop(self, reason):
+    def stop(self, reason, expected=False):
         with self.lock:
             if self.reason or not self.proc or self.proc.poll() is not None:
                 return
-            self.reason = reason
+            self.reason, self.expected = reason, expected
         print(f"GUARD: {reason}, stopping the server", flush=True)
-        if reason != "asked to stop":       # who was using the memory, for the post-mortem
+        if not expected:                    # who was using the memory, for the post-mortem
             top = subprocess.run(["ps", "-eo", "pid,rss,args", "--sort=-rss"], capture_output=True, text=True).stdout
             for line in top.splitlines()[1:9]:
                 pid, rss, cmd = (line.split(None, 2) + ["", ""])[:3]
@@ -668,9 +744,10 @@ class Guard:
     def watch_kernel(self, t0):
         try:
             j = subprocess.Popen(["journalctl", "-k", "-f", "-n", "0", "--since", f"@{int(t0)}", "-o", "short-unix",
-                                  "--no-pager"], stdout=subprocess.PIPE, text=True)
+                                  "--no-pager"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
             return
+        self.journal = j
         tag = f"xe {self.pci}"
         for line in j.stdout:
             try:
@@ -685,15 +762,18 @@ class Guard:
         j.kill()
 
     def watch_memory(self):
+        high_since = None      # a prompt of 40K tokens or more reads 50 GB from the experts' NVMe tier and spikes the pressure
         while self.proc.poll() is None and not self.reason:
             a, p = avail_gb(), psi_full()
+            high_since = (high_since or time.time()) if p > self.psi_max else None
             if a < self.ram_floor:
                 self.stop(f"RAM low ({a:.1f} GB available, floor {self.ram_floor:.0f})")
-            elif p > self.psi_max:
-                self.stop(f"memory pressure {p:.0f}% (full avg10, max {self.psi_max:.0f}), {a:.1f} GB RAM available")
+            elif high_since and time.time() - high_since >= self.psi_secs:
+                self.stop(f"memory pressure {p:.0f}% (full avg10, max {self.psi_max:.0f}) for {self.psi_secs:.0f} s, "
+                          f"{a:.1f} GB RAM available")
             time.sleep(1)
 
-    def run(self, args, ready=None):
+    def run(self, args, ready=None, signals=True):
         t0 = time.time()
 
         def child():
@@ -705,8 +785,9 @@ class Guard:
                 pass
 
         self.proc = subprocess.Popen(args, preexec_fn=child)
-        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            signal.signal(s, lambda *_: threading.Thread(target=self.stop, args=("asked to stop",)).start())
+        if signals:
+            for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(s, lambda *_: threading.Thread(target=self.stop, args=("asked to stop", True)).start())
         threading.Thread(target=self.watch_kernel, args=(t0,), daemon=True).start()
         threading.Thread(target=self.watch_memory, daemon=True).start()
         if ready:
@@ -717,10 +798,12 @@ class Guard:
                 break
             except InterruptedError:
                 continue
-        if self.reason and self.reason != "asked to stop":
+        if self.journal:
+            self.journal.kill()
+        if self.reason and not self.expected:
             print(f"GUARD tripped: {self.reason}", flush=True)
             return 99
-        return 0 if self.reason == "asked to stop" else rc
+        return 0 if self.expected else rc
 
 
 # ------------------------------------------------------------------------------------------- warm-up and port gate
@@ -771,25 +854,510 @@ def open_when_warm(a, warm, alive):
     fill), then open the requested port. Until then the port is closed, so a client never meets a server that is up
     but still warming (SGLang answered /v1/models seconds late right after its start, and client discovery with a
     short timeout found no model)."""
+    if wait_warm(a, warm, alive):
+        threading.Thread(target=relay, args=(a.port, a.inner_port), daemon=True).start()
+        say(f"ready on http://127.0.0.1:{a.port}/v1")
+
+
+def wait_warm(a, warm, alive):
+    """Wait for the server on its inner port and send it `warm`; False when it died first."""
     url = f"http://127.0.0.1:{a.inner_port}"
     while alive():
         try:
             urllib.request.urlopen(f"{url}/v1/models", timeout=5).read()
             break
-        except OSError:
+        except (OSError, http.client.HTTPException):
             time.sleep(2)
     else:
-        return
+        return False
     t0 = time.time()
     try:
         urllib.request.urlopen(urllib.request.Request(f"{url}/v1/chat/completions", json.dumps(warm).encode(),
                                                       {"Content-Type": "application/json"}), timeout=900).read()
         say(f"warm-up request done in {time.time() - t0:.0f} s")
-    except OSError as e:
+    except (OSError, http.client.HTTPException) as e:
         say(f"warm-up request failed ({e}); opening the port anyway")
-    if alive():
-        threading.Thread(target=relay, args=(a.port, a.inner_port), daemon=True).start()
-        say(f"ready on http://127.0.0.1:{a.port}/v1")
+    return alive()
+
+
+# ---------------------------------------------------------------------------------- standby: the B70's idle model
+
+# `serve --standby` keeps the model on the B70 only while nothing else wants the card. The b70q queue loads it once the
+# card has been free a while and asks it to step aside when another job waits and no request has run on it for a
+# minute; the server reports both (busy, time since its last request) to /api/tickets/<id>/activity every few seconds.
+# Its port stays open the whole time (after the first load): while the model is unloaded, discovery is answered from
+# the last load, and a request waits for the model, putting the server in line for the card; a streamed one gets
+# keep-alive chunks meanwhile (llama.cpp's prompt_progress when it asked for them, else SSE comments), so the client's
+# first-token watchdog doesn't give up. After a reload no request was waiting for, the last request is read again (one
+# token, answered to nobody), so the next one finds its prompt in the cache: a cold 17K-token prompt takes
+# DeepSeek-V4.1 about 5 minutes.
+
+HOP_HEADERS = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "content-length", "te", "upgrade"}
+SSE_HEAD = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+
+
+def local_defaults(name):
+    """KEY=VALUE lines of ~/.config/b70/<name>.env: this machine's own defaults, kept out of the repo."""
+    path = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "b70", f"{name}.env")
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+async def read_head(reader):
+    """An HTTP/1.1 head: its first line and its headers."""
+    lines = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1").split("\r\n")
+    return lines[0], [(k.strip(), v.strip()) for k, v in (ln.split(":", 1) for ln in lines[1:] if ":" in ln)]
+
+
+async def dechunk(reader):
+    """The payload of a chunked body, piece by piece."""
+    while True:
+        size = int((await reader.readuntil(b"\r\n")).split(b";")[0].strip() or b"0", 16)
+        if not size:
+            while await reader.readuntil(b"\r\n") != b"\r\n":      # trailers
+                pass
+            return
+        yield await reader.readexactly(size)
+        await reader.readexactly(2)
+
+
+def http_answer(status, body, ctype="application/json"):
+    return f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n" \
+        .encode("latin-1") + body
+
+
+class Gate:
+    """A standby server's port: sends each request to the model while it is loaded (one request per connection, so a
+    request's end is its connection's), counts the requests in flight and when the last one ended, and holds requests
+    while the model is unloaded. Its methods without `async` are for the other threads."""
+
+    def __init__(self, port, name):
+        self.port, self.name = port, name
+        self.lock = threading.Lock()
+        self.target = None          # the model's inner port while it is loaded and warm
+        self.inflight = 0           # requests on their way to the model or back
+        self.held = 0               # requests waiting for the model
+        self.last_end = 0.0         # when the last request ended (0: none yet)
+        self.failure = None         # why the waiting requests can't be served (the model can't load now)
+        self.models = None          # the model's /v1/models answer, for discovery while it is unloaded
+        self.last_work = None       # (path, body) of the last completion request, read again after a reload
+        self.loop = self.changed = None
+
+    def listen(self):
+        if self.loop:
+            return
+        started, error = threading.Event(), []
+
+        def run():
+            loop = asyncio.new_event_loop()
+            self.changed = asyncio.Event()
+            try:
+                loop.run_until_complete(asyncio.start_server(self.handle, "127.0.0.1", self.port, reuse_address=True,
+                                                             limit=1 << 22))
+            except OSError as e:
+                error.append(e)
+                started.set()
+                return
+            self.loop = loop
+            started.set()
+            loop.run_forever()
+        threading.Thread(target=run, daemon=True).start()
+        started.wait()
+        if error:
+            raise error[0]
+
+    def _wake(self):
+        def wake():
+            self.changed.set()
+            self.changed = asyncio.Event()
+        if self.loop:
+            self.loop.call_soon_threadsafe(wake)
+
+    def open(self, target, models=None, touch=False):
+        """The model is loaded and warm on `target`; `touch` starts its quiet time now (a first load)."""
+        with self.lock:
+            self.target, self.failure = target, None
+            self.models = models or self.models
+            if touch:
+                self.last_end = time.time()
+        self._wake()
+
+    def close(self, force=False):
+        """No more requests to the model. Refused (False) while one is in flight or waiting, unless forced."""
+        with self.lock:
+            if not force and (self.inflight or self.held):
+                return False
+            self.target = None
+        return True
+
+    def refuse_waiting(self, why):
+        """The model can't load now: the waiting requests (and new ones, until clear()) are answered with `why`."""
+        with self.lock:
+            self.failure = why
+        self._wake()
+
+    def clear(self):
+        with self.lock:
+            self.failure = None
+
+    def activity(self):
+        """(in use, seconds since the last request ended) for the queue."""
+        with self.lock:
+            return bool(self.inflight or self.held), (time.time() - self.last_end if self.last_end else 1e9)
+
+    # --- the port (the gate's event loop)
+
+    async def handle(self, reader, writer):
+        try:
+            await self.serve(reader, writer)
+        except (OSError, ValueError, IndexError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            pass
+        finally:
+            writer.close()
+
+    async def serve(self, reader, writer):
+        line, headers = await read_head(reader)
+        method, path = line.split(" ")[:2]
+        h = {k.lower(): v for k, v in headers}
+        if "chunked" in h.get("transfer-encoding", "").lower():
+            body = b"".join([part async for part in dechunk(reader)])
+        else:
+            body = await reader.readexactly(int(h.get("content-length") or 0))
+        if method != "POST":            # discovery and health: no work for the model, and not activity
+            with self.lock:
+                target = self.target
+            if target is None:
+                return await self.unloaded(writer, path)
+            return await self.forward(reader, writer, line, headers, body, target)
+        try:
+            req = json.loads(body or b"{}")
+        except ValueError:
+            req = None
+        req = req if isinstance(req, dict) else {}
+        if path.split("?")[0].endswith("completions") and ("messages" in req or "prompt" in req):
+            self.last_work = (path, body)
+        stream = req.get("stream") is True
+        target, sent = await self.wait_for_model(reader, writer, stream, stream and req.get("return_progress") is True)
+        if target is None:
+            return
+        try:
+            await self.forward(reader, writer, line, headers, body, target, sent)
+        finally:
+            with self.lock:
+                self.inflight -= 1
+                self.last_end = time.time()
+
+    async def wait_for_model(self, reader, writer, stream, progress):
+        """(the model's port, whether an event stream was started meanwhile) once the request may go to the model,
+        counted in flight; (None, _) when the client hung up or the model can't load (answered)."""
+        with self.lock:
+            if self.target is not None:
+                self.inflight += 1
+                return self.target, False
+            self.held += 1
+        sent, held, t0 = False, True, time.time()
+        gone = asyncio.ensure_future(reader.read(1))
+        try:
+            while True:
+                with self.lock:
+                    target, failure = self.target, self.failure
+                    if target is not None:
+                        self.held -= 1
+                        self.inflight += 1
+                        held = False
+                if target is not None:
+                    return target, sent
+                if failure:
+                    await self.refuse(writer, failure, sent)
+                    return None, sent
+                if stream:
+                    if not sent:
+                        writer.write(SSE_HEAD)
+                        sent = True
+                    writer.write(self.keepalive(progress, t0))
+                    await writer.drain()
+                changed = asyncio.ensure_future(self.changed.wait())
+                done, _ = await asyncio.wait({changed, gone}, timeout=15, return_when=asyncio.FIRST_COMPLETED)
+                changed.cancel()
+                if gone in done:
+                    if not gone.result():
+                        return None, sent                       # the client hung up
+                    gone = asyncio.get_running_loop().create_future()
+        finally:
+            gone.cancel()
+            if held:
+                with self.lock:
+                    self.held -= 1
+
+    def keepalive(self, progress, t0):
+        if not progress:
+            return b": waiting for the model (standby: loading, or waiting for the B70)\n\n"
+        chunk = {"id": "chatcmpl-standby", "object": "chat.completion.chunk", "created": int(t0), "model": self.name,
+                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}],
+                 # nothing read yet: the model is loading or waiting for the card
+                 "prompt_progress": {"total": 0, "cache": 0, "processed": 0, "time_ms": round((time.time() - t0) * 1000)}}
+        return b"data: " + json.dumps(chunk).encode() + b"\n\n"
+
+    async def forward(self, reader, writer, line, headers, body, target, sent=False):
+        """The request to the model on a connection of its own, and its answer back; after an event stream was started
+        (`sent`), only the answer's payload, or its error as the last event."""
+        try:
+            up_r, up_w = await asyncio.open_connection("127.0.0.1", target, limit=1 << 22)
+        except OSError as e:
+            return await self.refuse(writer, f"the model's server is not answering ({e})", sent)
+        try:
+            out = [line] + [f"{k}: {v}" for k, v in headers if k.lower() not in HOP_HEADERS]
+            up_w.write(("\r\n".join(out + [f"Content-Length: {len(body)}", "Connection: close"]) + "\r\n\r\n")
+                       .encode("latin-1") + body)
+            await up_w.drain()
+            status_line, rh = await read_head(up_r)
+            chunked = any(k.lower() == "transfer-encoding" and "chunked" in v.lower() for k, v in rh)
+            if not sent:
+                keep = [f"{k}: {v}" for k, v in rh if k.lower() not in ("connection", "keep-alive")]
+                writer.write(("\r\n".join([status_line, *keep, "Connection: close"]) + "\r\n\r\n").encode("latin-1"))
+                await self.pump(lambda: up_r.read(65536), reader, writer)
+            elif status_line.split(" ")[1] != "200":
+                text = (await up_r.read(65536)).decode(errors="replace").strip()
+                await self.refuse(writer, f"the model answered {status_line.split(' ', 1)[1]}: {text[:1000]}", True)
+            elif chunked:
+                parts = dechunk(up_r)
+                await self.pump(lambda: anext(parts, b""), reader, writer)
+            else:
+                await self.pump(lambda: up_r.read(65536), reader, writer)
+        finally:
+            up_w.close()
+
+    async def pump(self, read, reader, writer):
+        """Copies read() to the client until it ends, or until the client hangs up (closing the model's connection
+        then cancels the request)."""
+        gone, piece = asyncio.ensure_future(reader.read(1)), None
+        try:
+            while True:
+                piece = piece or asyncio.ensure_future(read())
+                done, _ = await asyncio.wait({piece, gone}, return_when=asyncio.FIRST_COMPLETED)
+                if gone in done:
+                    if not gone.result():
+                        return
+                    gone = asyncio.get_running_loop().create_future()
+                if piece in done:
+                    data, piece = piece.result(), None
+                    if not data:
+                        return
+                    writer.write(data)
+                    await writer.drain()
+        finally:
+            gone.cancel()
+            if piece:
+                piece.cancel()
+
+    async def refuse(self, writer, why, sent):
+        err = json.dumps({"error": {"message": why, "type": "b70_unavailable", "code": 503}}).encode()
+        writer.write(b"data: " + err + b"\n\n" if sent else http_answer("503 Service Unavailable", err))
+        await writer.drain()
+
+    async def unloaded(self, writer, path):
+        """A GET while the model is unloaded: discovery from the last load, health; anything else 503."""
+        p = path.split("?")[0].rstrip("/")
+        if p in ("/v1/models", "/models"):
+            body = self.models or json.dumps(
+                {"object": "list", "data": [{"id": self.name, "object": "model", "owned_by": "b70"}]}).encode()
+            writer.write(http_answer("200 OK", body))
+        elif p in ("/health", "/v1/health"):
+            writer.write(http_answer("200 OK", b'{"status":"ok","model":"unloaded (standby)"}'))
+        else:
+            return await self.refuse(writer, "the model is unloaded while other work has the B70 (standby); a "
+                                             "completion request loads it again", False)
+        await writer.drain()
+
+
+def standby_turn(owner, note, opts, first, gate, stop):
+    """Waits for a turn on the B70 and returns its ticket; None without a queue daemon, or once `stop` is set. The first
+    turn waits in line like any server's (never next in line, whatever the owner); later ones wait at the back until the
+    card has been free a while (if this is the standby model that loaded last), and go to the back of the line like any
+    job as soon as a request waits for the model."""
+    body = {"owner": owner, "kind": "run", "argv": sys.argv, "cwd": os.getcwd(), "client_pid": os.getpid(),
+            "note": note, "opts": dict(opts, when_free=not first)}
+    try:
+        tid = b70q("POST", "/api/tickets", body)["id"]
+    except OSError:
+        say("no b70q queue daemon; using the B70 without it")
+        return None
+    urgent, last, last_at, down_since = first, None, 0.0, None
+    if not first:
+        say(f"standing by (b70q #{tid}): the model loads again for the next request, or when the B70 is free and it "
+            "is the standby model that loaded last")
+    while True:
+        if stop.is_set():
+            try:
+                b70q("POST", f"/api/tickets/{tid}/cancel", timeout=5)
+            except OSError:
+                pass
+            return None
+        if not urgent and gate.activity()[0]:
+            try:
+                b70q("POST", f"/api/tickets/{tid}/urgent", timeout=5)
+                urgent = True
+                say(f"a request is waiting for the model: in line for the B70 (b70q #{tid})")
+            except OSError:
+                pass
+        try:
+            w = b70q("GET", f"/api/tickets/{tid}/wait?until=granted&timeout=2", timeout=30)
+            down_since = None
+        except OSError as e:
+            down_since = down_since or time.time()
+            if time.time() - down_since > 300:
+                say(f"lost the b70q daemon for 5 minutes ({e}); using the B70 without it")
+                return None
+            stop.wait(2)
+            continue
+        tk = w["ticket"]
+        if tk["state"] == "granted":
+            say(f"the B70 is ours (b70q #{tid} {owner})")
+            return tid
+        if tk["state"] != "waiting":
+            if first:
+                fail(f"b70q #{tid} {tk['state']} while waiting: {tk.get('end_reason')}", 75)
+            say(f"b70q #{tid} {tk['state']} while waiting ({tk.get('end_reason')}); standing by again")
+            stop.wait(5)
+            return standby_turn(owner, note, opts, False, gate, stop)
+        if urgent:
+            msg = queue_wait_text(tid, w)
+            if msg != last or time.time() - last_at >= 60:
+                say(msg)
+                last, last_at = msg, time.time()
+
+
+def fetch_models(port):
+    try:
+        return urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5).read()
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+def rewarm(port, work, alive):
+    """Reads the last request's prompt again (one token, answered to nobody), so the next request finds it in the
+    model's prompt cache."""
+    path, body = work
+    try:
+        req = json.loads(body)
+    except ValueError:
+        return
+    for k in ("max_completion_tokens", "stream_options", "n"):
+        req.pop(k, None)
+    req.update(stream=True, return_progress=True, max_tokens=1)
+    t0 = time.time()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(req).encode(),
+                                                          {"Content-Type": "application/json"}), timeout=1800)
+        while r.read(65536):
+            pass
+        say(f"read the last request's prompt again in {time.time() - t0:.0f} s, so the next one finds it cached")
+    except (OSError, http.client.HTTPException) as e:
+        if alive():
+            say(f"reading the last request's prompt again failed ({e})")
+
+
+def serve_standby(a, args, ram_start, warm, record):
+    """`serve --standby` (see above). Returns the exit code: 0 once asked to stop, the server's when it failed."""
+    name = a.name or os.path.basename(os.path.abspath(a.model))
+    note = f"b70 serve {name} (standby)"
+    opts = {"server": True, "standby": True, "ram_gib": ram_start}
+    queued = not os.environ.get("B70Q_TICKET")      # inside a queue job the card is that job's: never step aside
+    gate, stop, current = Gate(a.port, name), threading.Event(), [None]
+
+    def on_signal(*_):
+        stop.set()
+        if current[0]:
+            threading.Thread(target=current[0].stop, args=("asked to stop", True), daemon=True).start()
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+
+    first = True
+    while not stop.is_set():
+        gate.clear()
+        tid = standby_turn(a.queue, note, opts, first, gate, stop) if queued else None
+        if stop.is_set():
+            break
+        guard = Guard(ram_start)
+        problem = guard.problem()
+        if problem:
+            queue_done(tid, 98, problem)
+            if first:
+                fail(problem, 98 if guard.pci else 1)
+            say(f"{problem}; trying again in a minute")
+            gate.refuse_waiting(problem)
+            stop.wait(60)
+            continue
+        if tid:
+            os.environ["B70Q_TICKET"] = str(tid)    # the server's processes are this ticket's
+        record(tid)
+        urgent, starting, yielded = first or gate.activity()[0], [first], []
+        clear_log()
+        say(f"loading {name}" + (f"; http://127.0.0.1:{a.port}/v1 opens once it is warm" if first else " again"))
+
+        def alive():
+            return guard.proc.poll() is None and not guard.reason
+
+        def report():
+            # a first load counts as in use until it is warm: its caller is waiting for the port to open
+            while alive() and not stop.is_set():
+                busy, idle = gate.activity()
+                try:
+                    r = b70q("POST", f"/api/tickets/{tid}/activity", {"busy": busy or starting[0], "idle_s": idle},
+                             timeout=5)
+                except OSError:
+                    r = {}
+                if r.get("yield") and gate.close():
+                    yielded.append(r.get("reason") or "yielded")
+                    guard.stop(f"{yielded[0]}: unloading until the B70 is free", expected=True)
+                    return
+                time.sleep(3)
+
+        def ready():
+            if tid:
+                threading.Thread(target=report, daemon=True).start()
+            if not wait_warm(a, warm, alive):
+                return
+            gate.open(a.inner_port, fetch_models(a.inner_port), touch=starting[0])
+            if starting[0]:
+                try:
+                    gate.listen()
+                except OSError as e:
+                    guard.stop(f"can't open port {a.port}: {e}")
+                    return
+                say(f"ready on http://127.0.0.1:{a.port}/v1 (standby: unloads while other work needs the B70)")
+            else:
+                say("loaded again")
+            starting[0] = False
+            if not urgent and gate.last_work:
+                rewarm(a.inner_port, gate.last_work, alive)
+
+        current[0] = guard
+        rc = guard.run(args, ready, signals=False)
+        current[0] = None
+        gate.close(force=True)
+        os.environ.pop("B70Q_TICKET", None)
+        if stop.is_set():
+            queue_done(tid, 0)
+            break
+        if yielded:
+            queue_done(tid, 0, yielded[0])     # a process of the server still on the card holds the next job (leftover)
+            first = False
+            continue
+        # the server ended on its own: the guard stopped it (a fault, low RAM) or it crashed
+        gate.refuse_waiting(f"the model's server stopped (exit {rc})")
+        queue_done(tid, rc)
+        return rc or 1
+    return 0
 
 
 # --------------------------------------------------------------------------------------------------------- serve
@@ -798,15 +1366,71 @@ def serve_glm(a, model, store):
     if not glm_store_ready(store):
         fail(f"the GLM expert store is not packed in {store}; run `b70 prepare {model}` first")
     ctx = min(a.ctx or 49152, 65536)
-    env = {"GLM_XPU_RAM_MARGIN": os.environ.get("GLM_XPU_RAM_MARGIN", "0.2")}
+    # GLM_MODE (environment, else ~/.config/b70/serve.env): quality (default) or fast.
+    #   quality: synced router with a residency bonus: decode picks a cached expert over an NVMe-only one whose router
+    #     score is < 0.1 higher. ~10-11 tok/s; KL vs the exact model 0.010-0.012 (exact 0.003), top-1 agreement 93-96%.
+    #   fast: no-sync router: only resident experts (VRAM, then RAM at a 0.2 margin), no host sync per layer. ~18-20
+    #     tok/s, but 20-29% of picks are forced substitutes: KL 0.13-0.25, top-1 agreement 77-83% (2026-10-30).
+    # GLM_XPU_* keys in serve.env apply too; the environment wins over the file, both over the mode's defaults.
+    local = local_defaults("serve")
+    mode = os.environ.get("GLM_MODE", local.get("GLM_MODE", "quality"))
+    if mode == "fast":
+        env = {"GLM_XPU_NOSYNC": "1", "GLM_XPU_RAM_MARGIN": "0.2", "GLM_XPU_RES_BONUS": "0"}
+    elif mode == "quality":
+        env = {"GLM_XPU_RAM_MARGIN": "0.2", "GLM_XPU_RES_BONUS": "0.1", "GLM_XPU_MISS_PF": "0"}
+    else:
+        fail(f"GLM_MODE={mode!r}: quality or fast")
+    env.update({k: v for k, v in local.items() if k.startswith(("GLM_XPU_", "GLM_SERVE_"))})
     env.update({k: v for k, v in os.environ.items() if k.startswith(("GLM_XPU_", "GLM_SERVE_"))})
+    # GLM_ENGINE (environment, else serve.env): python (default) = glm/xpu/serve.py in the image; cpp = the C++ engine
+    # (engines/glm.cpp, its build/glm_server: no PyTorch, run on the host, same API, arguments and quality mode)
+    engine = os.environ.get("GLM_ENGINE", local.get("GLM_ENGINE", "python"))
+    if engine == "cpp":
+        return serve_glm_cpp(a, model, store, mode, env, ctx)
+    if engine != "python":
+        fail(f"GLM_ENGINE={engine!r}: python or cpp")
     cmd = ["python3", "/w/xpu/serve.py", "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx),
            "--served-name", a.name or "glm-5.3-flash", "--store", "/nvx/glm53_flash_exl3_experts_blob.bin"]
-    if a.ram_gb:
-        cmd += ["--ram-gb", str(a.ram_gb)]
+    # lora/ and lora-*/ subfolders (e.g. lora-ablit/) are PEFT adapters, applied at load in name order
+    lora = sorted(n for n in os.listdir(model) if (n == "lora" or n.startswith("lora-"))
+                  and os.path.isfile(os.path.join(model, n, "adapter_config.json")))
+    # The server peaks at its RAM tier plus ~12 GB (the prompt read-ahead ring of 384 pinned records, the NVMe bounce
+    # ring, ~6 GB of process memory). A fixed 22 GB tier reached 33 GB on a 21.6k-token prompt with 37 GB free and
+    # tripped the guard's 4 GB floor (2026-10-28), so without --ram-gb the tier is what is free now less 12 GB, the
+    # floor and 3 GB spare: 22 GB on a quiet desktop, less beside a busy browser.
+    ram = a.ram_gb or max(12, min(22, int(avail_gb() - 19)))
+    cmd += ["--ram-gb", str(ram)]
     if a.chat_template:
         cmd += ["--chat-template", "/opt/chat_template.jinja"]
-    return sandbox("glm", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template), 40, \
+    if lora:
+        cmd += ["--lora", ",".join(f"/models/{n}" for n in lora)]   # GLM_XPU_LORA_SCALE scales them, 0 turns them off
+    # host RAM to start: the tier, ~10 GB more, and the guard's 4 GB floor (a fixed 40 kept 22 GB servers waiting)
+    return sandbox("glm", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template), int(ram + 14), \
+        {"model": a.name or "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
+def serve_glm_cpp(a, model, store, mode, env, ctx):
+    """GLM-5.3-Flash on engines/glm.cpp's glm_server, outside the image (its oneAPI runtime is linked by rpath).
+    Quality mode only (the C++ engine has no no-sync router); --chat-template is the client's prefill hook, built in."""
+    if mode != "quality":
+        fail("GLM_ENGINE=cpp serves GLM_MODE=quality only")
+    exe = os.path.join(os.path.dirname(REPO), "engines", "glm.cpp", "build", "glm_server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/glm.cpp/build.sh")
+    blob = os.path.join(store, "glm53_flash_exl3_experts_blob.bin")
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx), "--model-dir", model,
+           "--served-name", a.name or "glm-5.3-flash", "--store", blob]
+    lora = sorted(n for n in os.listdir(model) if (n == "lora" or n.startswith("lora-"))
+                  and os.path.isfile(os.path.join(model, n, "adapter_config.json")))
+    # the tier as for serve.py; the engine's other host memory is the 4.5 GB memfd prompt ring and ~3 GB of process
+    ram = a.ram_gb or max(12, min(22, int(avail_gb() - 19)))
+    cmd += ["--ram-gb", str(ram)]
+    if lora:
+        cmd += ["--lora", ",".join(os.path.join(model, n) for n in lora)]
+    env = {k: v for k, v in env.items() if k.startswith(("GLM_XPU_RES_BONUS", "GLM_XPU_LORA_SCALE", "GLM_SERVE_", "GLM_PF2"))}
+    env.update({k: v for k, v in os.environ.items() if k.startswith("GLM_PF2")})
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, int(ram + 10), \
         {"model": a.name or "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
 
 
@@ -836,8 +1460,52 @@ GEMMA_KV_UNITS = {True: 74000, False: 104000}      # with / without the drafter
 GEMMA_SWA_UNITS = {False: 7.16, True: 3.58}        # bf16 / fp8 window
 
 
+def serve_gemma_cpp(a, model):
+    """Gemma 4 on engines/glm.cpp's glm_server (G4Model), outside the image: everything on the card but the embedding
+    table. --ctx is each game's context, --parallel the games at once; --chat-template is the client's prefill hook, built in.
+    B70_GLM_SERVER names another glm_server build (llm/g4draft's data runs use their own)."""
+    exe = os.environ.get("B70_GLM_SERVER") or os.path.join(os.path.dirname(REPO), "engines", "glm.cpp", "build", "glm_server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/glm.cpp/build.sh")
+    ctx = min(a.ctx or 65536, 131072)
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx), "--model-dir", model,
+           "--served-name", a.name or "gemma-4", "--parallel", str(max(1, min(a.parallel or 1, 8)))]
+    if a.drafter:
+        cmd += ["--drafter", a.drafter]
+    env = {k: v for k, v in os.environ.items() if k.startswith(("G4_", "GLM_PREFILL", "GLM_DUMP_TOKENS"))}
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    # host RAM to start: the sliding-window checkpoints (~1 GB each, pinned; up to 3 for each game in use) and the process
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, 3 + 3 * max(1, min(a.parallel or 1, 8)), \
+        {"model": a.name or "gemma-4", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
+def serve_ripple(a, model, store):
+    """Ripple-65B on engines/glm.cpp's glm_server (RpModel), outside the image. --ctx is each game's context (the server takes
+    what fits the card), --parallel the games at once; --chat-template is the client's prefill hook, built in."""
+    exe = os.path.join(os.path.dirname(REPO), "engines", "glm.cpp", "build", "glm_server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/glm.cpp/build.sh")
+    ctx = min(a.ctx or 65536, 262144)
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx), "--model-dir", model,
+           "--served-name", a.name or "ripple", "--parallel", str(max(1, min(a.parallel or 1, 8)))]
+    if a.drafter:
+        cmd += ["--drafter", a.drafter]
+    env = {k: v for k, v in os.environ.items() if k.startswith(("G4_", "RP_", "GLM_PREFILL"))}
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    # host RAM to start: the sliding-window checkpoints (~0.3 GB each, pinned) and the process
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, 4, \
+        {"model": a.name or "ripple", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
 def serve_gemma(a, model, store):
-    """Gemma 4 (dense, EXL3) on the same SGLang + trellis-serve install as Flash-Next."""
+    """Gemma 4 (dense, EXL3): GEMMA_ENGINE (environment, else serve.env) cpp, the default = engines/glm.cpp;
+    python = the same SGLang + trellis-serve install as Flash-Next."""
+    local = local_defaults("serve")
+    engine = os.environ.get("GEMMA_ENGINE", local.get("GEMMA_ENGINE", "cpp"))
+    if engine == "cpp":
+        return serve_gemma_cpp(a, model)
+    if engine != "python":
+        fail(f"GEMMA_ENGINE={engine!r}: python or cpp")
     users = max(1, min(a.parallel or 1, 8))
     ctx = a.ctx or 32768
     env = {
@@ -920,9 +1588,100 @@ def serve_gemma(a, model, store):
             25, warm)
 
 
+def serve_qwen35(a, model, store):
+    """Qwen3.8-27B on engines/glm.cpp's glm_server (Q35Model + its vision tower), outside the image. One request at a time."""
+    base = os.path.join(os.path.dirname(REPO), "engines", "glm.cpp")
+    exe = os.path.join(base, "build-q35", "glm_server")
+    if not os.access(exe, os.X_OK):
+        exe = os.path.join(base, "build", "glm_server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/glm.cpp/build.sh")
+    ctx = min(a.ctx or 32768, 131072)
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx), "--model-dir", model,
+           "--served-name", a.name or "qwen27"]
+    env = {k: v for k, v in os.environ.items() if k.startswith(("Q35_", "GLM_PREFILL"))}
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, 4, \
+        {"model": a.name or "qwen27", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
+def serve_flashnext_cpp(a, model, ctx):
+    """Qwen3.8-Flash-Next on engines/glm.cpp's glm_server (Q4Model: every expert resident, ~14K in VRAM and the rest
+    in ~18 GB of pinned RAM; no NVMe store), outside the image. One request at a time; --chat-template is the client's prefill
+    hook, built in; tool calls in qwen3_coder form and reasoning_content as the SGLang path returns them."""
+    exe = os.path.join(os.path.dirname(REPO), "engines", "glm.cpp", "build", "glm_server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/glm.cpp/build.sh")
+    hot = os.path.join(REPO, "flashnext", "hot")
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx), "--model-dir", model,
+           "--served-name", a.name or "flashnext-uncensored",
+           "--hot", f"{hot}/{a.hot or 'gm-7500'}.json,{hot}/{a.ram_list or 'gm-ram-4500'}.json"]
+    env = {k: v for k, v in os.environ.items() if k.startswith(("Q4_", "GLM_VRAM_RESERVE"))}
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    # host RAM to start: the pinned experts (~18 GB) and the process
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, 24, \
+        {"model": a.name or "flashnext-uncensored", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
+def serve_edge0(a, model, store):
+    """Edge0-145B (latent-MoE Qwen3.8-Flash-Next, NVFP4 experts) on engines/glm.cpp's glm_server (E0Model): every expert
+    resident, the hottest in VRAM by the release's profile.bin and the rest in ~27 GB of pinned RAM, outside the image.
+    One request at a time; Qwen's chat template and qwen3_coder tool calls."""
+    exe = os.path.join(os.path.dirname(REPO), "engines", "glm.cpp", "build", "glm_server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/glm.cpp/build.sh")
+    ctx = min(a.ctx or 65536, 131072)
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx), "--model-dir", model,
+           "--served-name", a.name or "edge0"]
+    env = {k: v for k, v in os.environ.items() if k.startswith(("E0_", "GLM_VRAM_RESERVE", "GLM_PREFILL"))}
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    # host RAM to start: the pinned experts (~27 GB) and the process
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, 32, \
+        {"model": a.name or "edge0", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
+def serve_gguf(a, model, store):
+    """A GGUF on engines/llama.cpp's SYCL llama-server (horvay's Atomic fork, the one the client runs on CUDA), outside the image.
+    All layers on the B70, flash attention, q8_0 K and V (GGUF_CACHE_K / GGUF_CACHE_V), the GGUF's own MTP layer when it
+    has one (GGUF_MTP=0 turns it off). --chat-template is the client's template; sampling and the reasoning budget come per
+    request."""
+    exe = os.path.join(os.path.dirname(REPO), "engines", "llama.cpp", "build-sycl", "bin", "llama-server")
+    if not os.access(exe, os.X_OK):
+        fail(f"{exe} is not built; run engines/llama.cpp/build_sycl.sh")
+    _, mj = read_model(model)
+    gguf = os.path.join(model, mj["gguf"])
+    ctx = min(a.ctx or 32768, int(mj.get("context_max") or 262144))
+    cmd = [exe, "-m", gguf, "--host", "127.0.0.1", "--port", str(a.inner_port), "-c", str(ctx),
+           "-np", str(max(1, min(a.parallel or 1, 8))), "-ngl", "999", "-fa", "on",
+           "-ctk", os.environ.get("GGUF_CACHE_K", "q8_0"), "-ctv", os.environ.get("GGUF_CACHE_V", "q8_0"),
+           "--ctx-checkpoints", os.environ.get("GGUF_CTX_CHECKPOINTS", "8"), "--jinja", "-a", a.name or os.path.basename(model),
+           "-b", os.environ.get("GGUF_BATCH", "2048"), "-ub", os.environ.get("GGUF_UBATCH", "2048")]
+    if a.chat_template:
+        cmd += ["--chat-template-file", a.chat_template]
+    if mj.get("mtp") and os.environ.get("GGUF_MTP", "1") != "0":
+        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(mj.get("mtp_draft") or 2), "--spec-draft-n-min", "1"]
+    env = {k: v for k, v in os.environ.items() if k.startswith(("GGML_SYCL_", "SYCL_", "ZES_"))}
+    env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+    # ggml-sycl asks Level Zero's sysman for free VRAM and aborts at load when sysman is off
+    env.setdefault("ZES_ENABLE_SYSMAN", "1")
+    # the VMM pool asserts that frees come in reverse order, and Qwen3.8 with MTP frees out of order at the first request
+    env.setdefault("GGML_SYCL_ENABLE_VMM", "0")
+    # host RAM to start: the process (mmap'd weights are page cache)
+    return ["env"] + [f"{k}={v}" for k, v in sorted(env.items())] + cmd, 4, \
+        {"model": a.name or os.path.basename(model), "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+
+
 def serve_flashnext(a, model, store):
     users = max(1, min(a.parallel or 1, 8))
     ctx = min(a.ctx or 204800, 217088)
+    # FLASHNEXT_ENGINE (environment, else serve.env): python (default) = SGLang + trellis-serve in the image; cpp = the
+    # C++ engine (engines/glm.cpp, no PyTorch, run on the host, same API)
+    local = local_defaults("serve")
+    engine = os.environ.get("FLASHNEXT_ENGINE", local.get("FLASHNEXT_ENGINE", "python"))
+    if engine == "cpp":
+        return serve_flashnext_cpp(a, model, min(a.ctx or 65536, 131072))
+    if engine != "python":
+        fail(f"FLASHNEXT_ENGINE={engine!r}: python or cpp")
     hot = "/opt/b70/hot"
     env = {
         "HF_HUB_OFFLINE": "1", "ZE_AFFINITY_MASK": "0",
@@ -988,10 +1747,12 @@ def serve_flashnext(a, model, store):
 
 
 def cmd_serve(a):
+    if not a.dry_run:
+        clear_log()     # what an earlier `serve` left in the file; again as the load starts, after the wait in line
     model = os.path.abspath(a.model)
     fam, _ = read_model(model)
     if not fam:
-        fail(f"{model} is not a model b70 serves (Gemma 4, GLM-5.3-Flash, Qwen3.8-Flash-Next or DeepSeek-V4.1-Flash EXL3)")
+        fail(f"{model} is not a model b70 serves (Gemma 4, Ripple-65B, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B, DeepSeek-V4.1-Flash EXL3, Edge0 or a GGUF folder)")
     if not setup_done(fam):
         fail(f"{fam} is not set up; run `b70 setup {fam}` first")
     store = os.path.abspath(a.store or default_store(fam))
@@ -1004,31 +1765,49 @@ def cmd_serve(a):
         prepare(model, store)        # CPU and disk only: before the queue
     a.inner_port = free_port()
     args, ram_start, warm = {"glm": serve_glm, "flashnext": serve_flashnext, "gemma": serve_gemma,
-                             "dsv41": serve_dsv41}[fam](a, model, store)
+                             "dsv41": serve_dsv41, "qwen35": serve_qwen35, "ripple": serve_ripple,
+                             "edge0": serve_edge0, "gguf": serve_gguf}[fam](a, model, store)
     if a.dry_run:
         print(shlex.join(args))
         return
+    standby = a.standby or a.queue in local_defaults("serve").get("STANDBY_OWNERS", "").replace(",", " ").split()
+
+    def record(tid):
+        with open(SERVE_INFO, "w") as f:
+            json.dump({"pid": os.getpid(), "port": a.port, "model": model, "family": fam, "b70q_ticket": tid,
+                       "standby": standby}, f)
+    if standby:
+        rc = 1
+        try:
+            rc = serve_standby(a, args, ram_start, warm, record)
+        finally:
+            forget_server()
+        sys.exit(rc)
     # one model on the B70 at a time: the queue hands the card over; idle on the GPU for --idle while another job
     # waits, the queue stops this server (SIGTERM), and its caller starts it again when it is needed
     tid = queue_turn(a.queue, f"b70 serve {a.name or os.path.basename(model)}",
                      {"server": True, "idle_s": parse_duration(a.idle), "ram_gib": ram_start})
     guard = Guard(ram_start)
     guard.check_start()
-    with open(SERVE_INFO, "w") as f:
-        json.dump({"pid": os.getpid(), "port": a.port, "model": model, "family": fam, "b70q_ticket": tid}, f)
+    record(tid)
+    clear_log()
     say(f"loading {os.path.basename(model)} ({fam}); http://127.0.0.1:{a.port}/v1 opens once it is warm")
     rc = 1
     try:
         rc = guard.run(args, lambda: open_when_warm(a, warm, lambda: guard.proc.poll() is None and not guard.reason))
     finally:
         queue_done(tid, rc)
-        try:
-            with open(SERVE_INFO) as f:
-                if json.load(f).get("pid") == os.getpid():
-                    os.unlink(SERVE_INFO)
-        except (OSError, ValueError):
-            pass
+        forget_server()
     sys.exit(rc)
+
+
+def forget_server():
+    try:
+        with open(SERVE_INFO) as f:
+            if json.load(f).get("pid") == os.getpid():
+                os.unlink(SERVE_INFO)
+    except (OSError, ValueError):
+        pass
 
 
 def running_server():
@@ -1130,7 +1909,7 @@ def main():
     p.add_argument("--ram-list", help="flashnext: RAM list in flashnext/hot/ (default gm-ram-4500)")
     p.add_argument("--hot", help="flashnext: VRAM list in flashnext/hot/ (default gm-7500)")
     p.add_argument("--margin", type=float, help="flashnext: decode router margin against RAM experts (default 0.5)")
-    p.add_argument("--ram-gb", type=float, help="glm, dsv41: RAM tier size in GB (default 27 / 24)")
+    p.add_argument("--ram-gb", type=float, help="glm, dsv41: RAM tier size in GB (default: glm what is free less 19, 12-22; dsv41 24)")
     p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
     p.add_argument("--drafter", help="gemma: an assistant model folder that drafts tokens (gemma-4-*-assistant)")
     p.add_argument("--kv-pack", choices=["auto", "window", "all", "on", "off"], default="auto",
@@ -1142,9 +1921,14 @@ def main():
                                                           "DSV4.1: packs the NVMe store, ~95 / ~105 GB, once)")
     p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")
     p.add_argument("--queue", default=os.environ.get("B70Q_OWNER") or "b70",
-                   help="owner name in the b70q queue (default $B70Q_OWNER or b70; nq-… goes next in line)")
+                   help="owner name in the b70q queue (default $B70Q_OWNER or b70; nq-… goes next in line, but not "
+                        "with --standby)")
     p.add_argument("--idle", default="15m", help="the queue stops the server after this long idle on the GPU while "
                                                  "another job waits (default 15m)")
+    p.add_argument("--standby", action="store_true",
+                   help="the B70's idle model: unload when another job waits and no request has run for a minute, "
+                        "load again when the card is free or a request comes; the port stays open (default for the "
+                        "owners in STANDBY_OWNERS of ~/.config/b70/serve.env)")
     p.set_defaults(fn=cmd_serve)
     p = sub.add_parser("run", help="run a command in an install's sandbox, without the GPU")
     p.add_argument("--gpu", action="store_true", help="with the B70 (its turn in the b70q queue), under the guard "

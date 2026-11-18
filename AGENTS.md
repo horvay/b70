@@ -9,7 +9,8 @@
 - **Intel stack only:** SYCL, oneDNN, oneMKL, Level Zero. No Vulkan builds, no new torch-XPU or IPEX code. Before
   proposing a build, check `ldd` for vulkan/torch/c10.
 - **Engines are forks:** `engines/sd.cpp` (horvay/stable-diffusion.cpp `master`, with horvay/ggml `master`) and
-  `engines/audio.cpp` (horvay/audio.cpp `main`). Commit there, push to those default branches (ggml first) only when
+  `engines/audio.cpp` (horvay/audio.cpp `main`), `engines/llama.cpp` (horvay/atomic-llama-cpp-turboquant, a plain clone
+  for now, not a submodule). Commit there, push to those default branches (ggml first) only when
   Greg asks, then bump the submodule here.
 - **Builds** run on the CPU with low parallelism (`JOBS`, default 3); this machine is shared. Watch RAM and disk.
 - **Models** stay in `~/models` (`tools/mstore.ts`); never commit weights.

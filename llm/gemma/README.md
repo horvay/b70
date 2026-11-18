@@ -1,5 +1,8 @@
 # Gemma 4 31B (dense, EXL3) on the B70
 
+`b70 serve` now runs Gemma 4 on the C++ engine (`engines/glm.cpp`, its README has the design and numbers). What follows is
+the older SGLang path, still there with `GEMMA_ENGINE=python`.
+
 Gemma 4 runs on the same SGLang install as Qwen3.8-Flash-Next (`b70 setup sglang`): SGLang 0.5.20-xpu with 0xSero's
 trellis-serve EXL3 kernels and `../trellis-serve.patch`. It fits the card, so there is no expert tiering; Google's
 `gemma-4-31B-it-assistant` drafts for it.
