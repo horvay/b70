@@ -308,7 +308,8 @@ class Engine:
             glog(f"warm order: {len(order)} experts, own routing profile weight {w:.2f}")
         mtp = int(os.environ.get("GLM_XPU_MTP", "0"))
         self.model, self.config, self.cache, self.tok, self.tier = load(
-            a.model_dir, a.store, cache_size=a.cache, ram_gb=a.ram_gb, warm=order, mtp=mtp)
+            a.model_dir, a.store, cache_size=a.cache, ram_gb=a.ram_gb, warm=order, mtp=mtp, lora=a.lora,
+            lora_scale=a.lora_scale)
         from exllamav3 import Generator
         gkw = {}
         if mtp:
@@ -359,16 +360,36 @@ class Engine:
             req = self.queue.get()
             if req is None:
                 break
+            # GLM_XPU_PROFILE_FIRST=<path>: the first request (the launcher's warm-up) under cProfile, stats to <path>
+            prof_path = os.environ.pop("GLM_XPU_PROFILE_FIRST", None)
+            prof = None
+            if prof_path:
+                import cProfile
+                prof = cProfile.Profile()
+                prof.enable()
             try:
                 with torch.inference_mode():
                     self.run(req)
             except BaseException as e:  # noqa: BLE001
                 traceback.print_exc()
                 req.out.put(("error", f"{type(e).__name__}: {e}"))
+            if prof:
+                prof.disable()
+                prof.dump_stats(prof_path)
+                log(f"first request profiled to {prof_path}")
             try:
                 self.tier.save_profile(PROFILE)
             except Exception as e:  # noqa: BLE001
                 log(f"routing profile not saved: {e}")
+            # idle between requests: re-sort the expert cache by what the conversation used (tier.curate), stopping as
+            # soon as the next request arrives
+            if os.environ.get("GLM_XPU_CURATE", "0") == "1" and self.queue.empty():
+                try:
+                    with torch.inference_mode():
+                        self.tier.curate(stop=lambda: not self.queue.empty())
+                except Exception as e:  # noqa: BLE001
+                    traceback.print_exc()
+                    log(f"cache curation failed: {e}")
 
     def run(self, req):
         from exllamav3.generator import Job
@@ -378,6 +399,11 @@ class Engine:
             log(f"recurrent-state slot leak: {cache.num_slots - len(cache.free_list)} slot(s) reclaimed")
             cache.reset_states()
         P = req.ids.shape[-1]
+        trace_memory = os.environ.get("GLM_XPU_TRACE_MEMORY", "0") == "1"
+        if trace_memory:
+            free, total = self.torch.xpu.mem_get_info()
+            log(f"memory before request ({P} tokens): allocated {self.torch.xpu.memory_allocated() / 2**30:.2f} GiB, "
+                f"reserved {self.torch.xpu.memory_reserved() / 2**30:.2f} GiB, free {free / 2**30:.2f} GiB")
         job = Job(input_ids=req.ids, max_new_tokens=req.max_new, sampler=self.sampler(req.sampling),
                   stop_conditions=list(self.eos) + list(req.stops), decode_special_tokens=False,
                   seed=req.sampling.get("seed"))
@@ -394,6 +420,9 @@ class Engine:
                 stage = r.get("stage")
                 if stage == "error":
                     self.broken = f"{r.get('error')!r}"[:300]
+                    error = r.get("error")
+                    if isinstance(error, BaseException):
+                        raise RuntimeError(f"generator error: {self.broken}") from error
                     raise RuntimeError(f"generator error: {self.broken}")
                 if stage == "prefill":
                     progress.chunk(r)
@@ -668,12 +697,21 @@ def main():
     ap.add_argument("--served-name", default="glm-5.3-flash")
     ap.add_argument("--no-warm", action="store_true")
     ap.add_argument("--chat-template", help="Jinja chat template to use instead of the model's own")
+    ap.add_argument("--lora", help="PEFT LoRA adapter folder(s), comma-separated, applied at runtime (glm_xpu/lora.py)")
+    ap.add_argument("--lora-scale", type=float, default=float(os.environ.get("GLM_XPU_LORA_SCALE", "1")),
+                    help="multiplies the adapter's alpha / r; 0 leaves it off (default $GLM_XPU_LORA_SCALE or 1)")
     a = ap.parse_args()
 
     # bind first, so a taken port fails before the ~1 minute load
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         request_queue_size = 64      # clients may open several requests at once; they queue for the one GPU job
+
+        def handle_error(self, request, client_address):
+            # a client that hung up first (the client polls /v1/models with a short timeout while the model loads): no traceback
+            if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+                return
+            super().handle_error(request, client_address)
 
     srv = Server((a.host, a.port), BaseHTTPRequestHandler)
     engine = Engine(a)

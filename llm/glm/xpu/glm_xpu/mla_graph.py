@@ -88,9 +88,11 @@ def decode(m, x, params, S):
     q_lat = mla_absorb(q, m.w_uk_flat, H, m.qk_nope_head_dim)
     mla_kv_append(ckv.reshape(1, Q, m.kv_lora_rank), k_pe, layer.k, layer.v, S.bt, S.cs)
 
-    # indexer keys of these tokens ([k || pool gate] rows) into the per-token plane
-    k_idx = m._indexer_keys(x, params, 0, None, None, None)
-    mla_plane_append(k_idx.reshape(1, Q, layer.k_idx.shape[-1]), layer.k_idx, S.bt, S.cs)
+    # Key at offset 0, pool gate at D_i. Two plane-kernel stores, no aten cat of the halves.
+    k_idx, k_gate = m._indexer_keys(x, params, 0, None, None, None)
+    mla_plane_append(k_idx.reshape(1, Q, D_i), layer.k_idx, S.bt, S.cs, dst_d = 2 * D_i, dst_off = 0)
+    if k_gate is not None:
+        mla_plane_append(k_gate.reshape(1, Q, D_i), layer.k_idx, S.bt, S.cs, dst_d = 2 * D_i, dst_off = D_i)
 
     # pooled key of the pool holding each token, from its members' rows (members not written yet are masked by the
     # scorer's causal bound until the pool completes; a pool shared by two of the tokens is written twice, same value)

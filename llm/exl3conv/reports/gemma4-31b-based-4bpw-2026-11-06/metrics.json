@@ -1,0 +1,65 @@
+{
+  "model": "Gemma 4 31B-based-exl3-4.0bpw",
+  "reference": "Gemma 4 31B-based (BF16)",
+  "date": "2026-11-06",
+  "conversion": {
+    "bits": 4,
+    "head_bits": 16,
+    "out_scales": "auto",
+    "scaled_hessian": true,
+    "series": 1491,
+    "last_ticket": 1521,
+    "shards": 62,
+    "shard_bytes": 21450264401
+  },
+  "evaluations": [
+    {
+      "dataset": "held-out chat trace",
+      "tokens": 13835,
+      "conversations": 10,
+      "kl": 0.0122,
+      "kl_ci95": [
+        0.0075,
+        0.0187
+      ],
+      "top1_percent": 97.35,
+      "top1_ci95": [
+        96.57,
+        98.08
+      ],
+      "reference_ppl": 1.207,
+      "quant_ppl": 1.217
+    },
+    {
+      "dataset": "oasst2 broader chat",
+      "tokens": 101700,
+      "conversations": 199,
+      "kl": 0.9131,
+      "kl_ci95": [
+        0.8326,
+        0.9948
+      ],
+      "top1_percent": 74.49,
+      "top1_ci95": [
+        73.14,
+        75.93
+      ],
+      "reference_ppl": 753.199,
+      "quant_ppl": 815.346
+    }
+  ],
+  "serving": {
+    "ticket": 1527,
+    "exit_code": 0,
+    "drafter": "gemma-4-31B-it-assistant",
+    "context_capacity": 65536,
+    "vram_gib": 23.33,
+    "prompt_tokens": 95,
+    "decode_tok_s": [
+      37.8,
+      39.81
+    ],
+    "tool_call_verified": true,
+    "arithmetic_verified": true
+  }
+}

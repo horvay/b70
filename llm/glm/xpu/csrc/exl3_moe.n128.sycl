@@ -47,7 +47,25 @@
 using namespace exl3;
 using bf16 = sycl::ext::oneapi::bfloat16;
 
-namespace moe {
+// EXL3_MOE_NS: the prompt (DPAS) path is also built as its own library with large-GRF code generation
+// (EXL3_MOE_PREFILL_LIB, namespace moe_pf, see build.sh), which the decode GEMV must not get
+#ifndef EXL3_MOE_NS
+#define EXL3_MOE_NS moe
+#endif
+#ifdef EXL3_MOE_SPLIT_ALIGN
+// in exl3xpu/_moe_align.so (JIT): see csrc/exl3_moe_align.sycl
+void exl3_moe_launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
+                           int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
+                           int* pair_tok, float* pair_w, int* pair_of, int* blk_a, int* n_blk);
+#endif
+#ifdef EXL3_MOE_EXTERN_PREFILL
+// in exl3xpu/_moe_prefill.so (this file, EXL3_MOE_PREFILL_LIB)
+at::Tensor exl3_moe_prefill_ext(const at::Tensor& x, const at::Tensor& topk_ids, const at::Tensor& topk_w,
+                                const at::Tensor& ptrs, int64_t H, int64_t I, int64_t K, int64_t E, at::Tensor& out,
+                                int64_t debug_skip);
+#endif
+
+namespace EXL3_MOE_NS {
 
 static sycl::queue& queue_of(const at::Tensor& t) {
     return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
@@ -55,7 +73,7 @@ static sycl::queue& queue_of(const at::Tensor& t) {
 
 struct Geom {
     int H, I, K;
-    int W() const { return 8 * K; }
+    int W() const { return exl3::words_of(K); }      // K: template code (exl3_esimd.h Geo)
     size_t gu_bytes() const { return (size_t)(H / 16) * (2 * I / 16) * W() * 4; }
     size_t d_bytes() const { return (size_t)(I / 16) * (H / 16) * W() * 4; }
     size_t off_suh_g() const { return gu_bytes() + d_bytes(); }
@@ -118,7 +136,7 @@ template <int K, int NT>
 ESIMD_INLINE void planar_prev(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev) {
     constexpr int D = Geo<K>::D, G = Geo<K>::G, W = Geo<K>::WORDS;
     if constexpr (D > 1) {
-        static_assert(NT * G == 32, "planar group = 32 lanes");
+        static_assert(NT * G == 32 || NT * G == 16, "planar group = 32 lanes (16 for half-integer K)");
         auto pm = prev.template bit_cast_view<uint32_t, NT * W / G, G>();      // rows of G lanes; row t = tile t of plane 0
         auto wm = words.template bit_cast_view<uint32_t, NT * W / G, G>();
         pm.template select<NT, 1, G - 1, 1>(0, 1) = wm.template select<NT, 1, G - 1, 1>((D - 1) * NT, 0);
@@ -146,7 +164,6 @@ struct GateUpKernel {
     static constexpr int W = Geo<K>::WORDS, D = Geo<K>::D;
     using GK = GemvKernel<K, 2, MR, NT>;
     static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
-    static constexpr int L = 32 / Geo<K>::V;
     static constexpr int SLM = P * MR * 256 * 4;
 
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
@@ -240,13 +257,7 @@ struct GateUpKernel {
 #pragma unroll
                 for (int j = 0; j < NT; ++j)
 #pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        int b = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
-                        simd<float, 8> s = acc.template select<8, L>(b);
-#pragma unroll
-                        for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
-                        o.template select<8, 1>(j * 16 + h * 8) = s;
-                    }
+                    for (int h = 0; h < 2; ++h) o.template select<8, 1>(j * 16 + h * 8) = GK::cols(acc, m, j, h);
                 slm_block_store<float, NT * 16>(((p * MR + m) * 256 + proj * 128 + strip * 64) * 4, o);
             }
             barrier();
@@ -289,7 +300,6 @@ struct DownKernel {
     static constexpr int W = Geo<K>::WORDS, D = Geo<K>::D;
     using GK = GemvKernel<K, 2, MR, NT>;
     static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
-    static constexpr int L = 32 / Geo<K>::V;
     static constexpr int SLM = P * MR * 128 * 4;
     static constexpr int RB = (40 / P) < 8 ? (40 / P) : 8;   // tile-rows per batched load (I/16 = 40 for I=640)
 
@@ -357,13 +367,7 @@ struct DownKernel {
 #pragma unroll
                 for (int j = 0; j < NT; ++j)
 #pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        int b = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
-                        simd<float, 8> s = acc.template select<8, L>(b);
-#pragma unroll
-                        for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
-                        o.template select<8, 1>(j * 16 + h * 8) = s;
-                    }
+                    for (int h = 0; h < 2; ++h) o.template select<8, 1>(j * 16 + h * 8) = GK::cols(acc, m, j, h);
                 slm_block_store<float, NT * 16>(((p * MR + m) * 128 + strip * 64) * 4, o);
             }
             barrier();
@@ -424,25 +428,31 @@ ESIMD_INLINE void build4_any(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uin
                              simd<fp16, 256 * NT>& B) {
     constexpr int G = Geo<K>::G, V = Geo<K>::V, W = Geo<K>::WORDS;
     if constexpr (u < V) {
-        constexpr int TP = G >= 32 ? 1 : 32 / G;
+        constexpr int TP = G >= 32 ? 1 : (32 / G < NT ? 32 / G : NT);
         constexpr int NP = NT / TP;
-        static_assert(NT % TP == 0 && TP * G == 32, "build4_any: SIMD32 over TP whole tiles");
+        constexpr int GV = TP * G;
+        static_assert(NT % TP == 0 && (GV == 32 || GV == 16), "build4_any: SIMD32 (16) over TP whole tiles");
         constexpr int P = V == 8 ? 4 : (V == 16 ? 2 : 1);
         constexpr int STR = V == 8 ? 2 : (V == 16 ? 4 : 1);
         constexpr int h = (u >> 2) & 1;
         constexpr int R0 = 8 * ((u >> 1) & 1) + 2 * ((u >> 3) & 3) + (u & 1);
-        constexpr int C0 = 16 * h + (u & 1);
+        // V = 64 (half-integer K): lane grp holds columns 2 * grp + (u >> 5), i.e. VNNI column 4 * grp + 2 * (u >> 5)
+        constexpr int C0 = 16 * h + (u & 1) + (V == 64 ? 2 * (u >> 5) : 0);
 #pragma unroll
         for (int jp = 0; jp < NP; ++jp) {
             simd<uint32_t, W * TP> dw = words.template select<W * TP, 1>(jp * W * TP);
             simd<uint32_t, W * TP> pw = prev.template select<W * TP, 1>(jp * W * TP);
-            simd<fp16, 32> v = decode_cb_h<2, 32>(tile_states<K, u, TP, (Geo<K>::D > 1)>(dw, pw));
+            simd<fp16, GV> v = decode_cb_h<2, GV>(tile_states<K, u, TP, (Geo<K>::D > 1)>(dw, pw));
 #pragma unroll
             for (int t = 0; t < TP; ++t) {
                 auto Bm = B.template select<256, 1>(256 * (jp * TP + t)).template bit_cast_view<fp16, 8, 32>();
+                if constexpr (V == 64) {
+                    Bm.template select<1, 1, G, 4>(R0 / 2, C0) = v.template select<G, 1>(t * G);
+                } else {
 #pragma unroll
-                for (int r = 0; r < P; ++r)
-                    Bm.template select<1, 1, 8, 2>((R0 + STR * r) / 2, C0) = v.template select<8, P>(t * G + r);
+                    for (int r = 0; r < P; ++r)
+                        Bm.template select<1, 1, 8, 2>((R0 + STR * r) / 2, C0) = v.template select<8, P>(t * G + r);
+                }
             }
         }
         build4_any<K, NT, u + 1>(words, prev, B);
@@ -689,6 +699,14 @@ struct DownDpasKernel {
 };
 
 // ------------------------------------------------------------------------------------------------
+#ifdef EXL3_MOE_SPLIT_ALIGN
+static void launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
+                         int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
+                         int* pair_tok, float* pair_w, int* pair_of, int* blk_a = nullptr, int* n_blk = nullptr) {
+    ::exl3_moe_launch_align(q, ids, w, npairs, topk, E, pad, act_expert, act_start, act_cnt, n_act, act_pstart, pair_tok,
+                          pair_w, pair_of, blk_a, n_blk);
+}
+#else
 // Routing: one work-group of 1024 work-items (any number of pairs; loops with stride 1024).
 static void launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
                          int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
@@ -732,6 +750,8 @@ static void launch_align(sycl::queue& q, const int* ids, const float* w, int npa
         });
     });
 }
+
+#endif
 
 // B70 (planar4 + pair mode), us/layer device M=1 / M=4: gu,dn 10,5 66.0/205.5; 5,5 63.0/196.6; 5,10 60.6/200.3;
 // 10,10 66.1/209.1; 10,20 72.5/241.5 -> gu 5, dn 10 for M = 1 else 5 (g_dn_p = 0: auto)
@@ -817,7 +837,10 @@ static RouteBufs make_route(const at::Tensor& like, int npairs, int E, int mb = 
 // GEMV vs DPAS on B70 (us/layer, device): M=96 2323 vs 2977, 128 2669 vs 3253, 192 3195 (MR4) vs 3353, 256 3536 (MR8) vs
 // 3561, 384 4840 vs 3740, 1024 11338 vs 4474 -> DPAS from M=256 (it decodes each active expert once per 32-row block)
 static int g_prefill_min_m = 256;   // M >= this: DPAS prefill path
-static int g_prefill_k_mask = (1 << 2) | (1 << 3) | (1 << 4);   // K values with a DPAS prefill path enabled
+// bit kbit(K): K values with a DPAS prefill path enabled (K codes 25, 35 = 2.5, 3.5 bits -> bits 10, 11)
+static constexpr int kbit(int K) { return K < 10 ? K : 8 + K / 10; }
+static bool k_supported(int K) { return K == 2 || K == 3 || K == 4 || K == 25 || K == 35; }
+static int g_prefill_k_mask = (1 << 2) | (1 << 3) | (1 << 4) | (1 << kbit(25)) | (1 << kbit(35));
 // NVMe/RAM tier (N104): device int32 [1 + 2*E] victim list: [n, (old_key, slot) x n]. When set, ensure records every
 // slot it re-assigns and moe_forward_cached copies the victim's VRAM blob back to its host address (the RAM tier)
 // BEFORE the GEMV write-through fill overwrites the slot. nullptr = off (stock behaviour).
@@ -862,7 +885,7 @@ void moe_set_tier(at::Tensor ram_res, at::Tensor miss, at::Tensor safe) {
     g_safe = safe.data_ptr<int>();
 }
 void moe_set_prefill_min_m(int64_t v) { g_prefill_min_m = (int)v; }
-void moe_set_prefill_k_mask(int64_t v) { g_prefill_k_mask = (int)v; }   // bit K: DPAS prefill for K (test/fallback)
+void moe_set_prefill_k_mask(int64_t v) { g_prefill_k_mask = (int)v; }   // bit kbit(K): DPAS prefill for K (test/fallback)
 constexpr int kPrefillMB = 32;
 
 static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, const at::Tensor& topk_w,
@@ -870,7 +893,7 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
     auto& q = queue_of(x);
     int M = x.size(0), H = gm.H, I = gm.I, topk = topk_ids.size(1), npairs = M * topk;
     constexpr int MB = kPrefillMB;
-    TORCH_CHECK((gm.K == 2 || gm.K == 3 || gm.K == 4) && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
+    TORCH_CHECK(k_supported(gm.K) && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
     auto rb = make_route(x, npairs, E, MB);
     launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, MB, rb.act_expert,
                  rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of, rb.blk_a, rb.n_blk);
@@ -903,6 +926,8 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
     };
     if (gm.K == 2) run_k(std::integral_constant<int, 2>{});         // build4_any (2.51 bpw K=2 layers)
     else if (gm.K == 4) run_k(std::integral_constant<int, 4>{});    // MTP layer
+    else if (gm.K == 25) run_k(std::integral_constant<int, 25>{});  // 2.5 bits (sc_2.60bpw experts)
+    else if (gm.K == 35) run_k(std::integral_constant<int, 35>{});  // 3.5 bits
     else run_k(std::integral_constant<int, 3>{});
     int n = M * (H / 128), local = 8;
     auto run_c = [&](auto tag) {
@@ -1391,8 +1416,12 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     auto& q = queue_of(x);
     Geom gm{H, (int)I, (int)K};
     int npairs = M * topk;
-    if (M >= g_prefill_min_m && g_prefill_k_mask & (1 << K))
+    if (M >= g_prefill_min_m && g_prefill_k_mask & (1 << kbit(K)))
+#ifdef EXL3_MOE_EXTERN_PREFILL
+        return ::exl3_moe_prefill_ext(x, topk_ids, topk_w, ptrs, gm.H, gm.I, gm.K, E, out, g_debug_skip);   // DPAS
+#else
         return moe_prefill(x, topk_ids, topk_w, ptrs, gm, E, out);   // DPAS; a K left out of the mask: grouped GEMV
+#endif
     bool pair_mode = M <= g_pair_max_m;
     auto rb = make_route(x, pair_mode ? 1 : npairs, E);
     if (pair_mode) {
@@ -1409,7 +1438,7 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
     const int64_t* pp = ptrs.data_ptr<int64_t>();
     fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
-    TORCH_CHECK(K == 2 || K == 3 || K == 4, "moe: K=2, 3 or 4 only in this build");
+    TORCH_CHECK(k_supported(K), "moe: K=2, 3, 4, 2.5 (code 25) or 3.5 (code 35) only in this build");
     if (K == 4 && MR > 2) MR = 2;   // K=4 MR=4 gives wrong output on B70 (rel err 0.46 at M=16/300; MR 1, 2 exact)
     auto run_k = [&](auto kt) {
         constexpr int KK = decltype(kt)::value;
@@ -1426,6 +1455,8 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     };
     if (K == 2) run_k(std::integral_constant<int, 2>{});
     else if (K == 4) run_k(std::integral_constant<int, 4>{});   // the MTP layer's experts
+    else if (K == 25) run_k(std::integral_constant<int, 25>{});
+    else if (K == 35) run_k(std::integral_constant<int, 35>{});
     else run_k(std::integral_constant<int, 3>{});
     int n = M * (H / 128), local = 8;
     auto run_c = [&](auto tag) {
@@ -1675,7 +1706,17 @@ void memcpy_async(int64_t dst, int64_t src, int64_t nbytes) {
 
 int64_t blob_bytes(int64_t H, int64_t I, int64_t K) { return (int64_t)Geom{(int)H, (int)I, (int)K}.blob(); }
 
-}  // namespace moe
+}  // namespace EXL3_MOE_NS
+
+#ifdef EXL3_MOE_PREFILL_LIB
+at::Tensor exl3_moe_prefill_ext(const at::Tensor& x, const at::Tensor& topk_ids, const at::Tensor& topk_w,
+                                const at::Tensor& ptrs, int64_t H, int64_t I, int64_t K, int64_t E, at::Tensor& out,
+                                int64_t debug_skip) {
+    EXL3_MOE_NS::g_debug_skip = (int)debug_skip;
+    EXL3_MOE_NS::Geom gm{(int)H, (int)I, (int)K};
+    return EXL3_MOE_NS::moe_prefill(x, topk_ids, topk_w, ptrs, gm, (int)E, out);
+}
+#else
 
 TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("moe_forward(Tensor x, Tensor topk_ids, Tensor topk_w, Tensor ptrs, int I, int K, int n_experts) -> Tensor");
@@ -1717,3 +1758,4 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("moe_set_host_stride(int s) -> ()", &moe::moe_set_host_stride);
     m.def("moe_svm_prefetch(Tensor ptrs, int nbytes, Tensor like) -> ()", &moe::moe_svm_prefetch);
 }
+#endif  // EXL3_MOE_PREFILL_LIB

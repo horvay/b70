@@ -35,11 +35,14 @@ import numpy as np
 def blob_perm(H=4096, I=2048, K=3):
     """numpy int64 [rec/4]: blob word j = raw record word perm[j] (same as glm-flash-lite b70tier/glmperm.py for K=3).
 
-    A 16x16 tile is G periods of D words (D = K / gcd(K, 32), G = 8K / D). planar4 regroups 4 consecutive tiles plane by
-    plane ([D][4 tiles][G]), which is what the kernel's load_planar expects; for K = 2 or 4 (D = 1) it is the identity."""
+    A 16x16 tile is G periods of D words (D = 2K / gcd(2K, 64), G = 8K / D). planar4 regroups 4 consecutive tiles plane by
+    plane ([D][4 tiles][G]), which is what the kernel's load_planar expects; for K = 2 or 4 (D = 1) it is the identity.
+    K may be half-integer (exllamav3 1.6 "sc" quants: 2.5 bits = D 5, G 4), as in exl3_esimd.h Geo."""
     from math import gcd
-    W = 8 * K
-    D = K // gcd(K, 32)
+    K2 = round(2 * K)
+    assert abs(K2 - 2 * K) < 1e-9, K
+    W = 4 * K2
+    D = K2 // gcd(K2, 64)
     G = W // D
     ng = (H // 16) * (I // 16) * W
     r = np.arange(3 * ng + (3 * H + 3 * I) // 2, dtype=np.int64)
@@ -142,7 +145,8 @@ def layout(src, li):
             k = f"{pfx}.experts.0.{m}.{s}"
             n = src.loc[k][2]
             fields.append((f"{m}.{s}", off, n, src.loc[k][3], src.loc[k][4])); off += n
-    K = fields[0][4][-1] // 16                 # trellis [k/16, n/16, 16K]
+    K = fields[0][4][-1] / 16                  # trellis [k/16, n/16, 16K]; half-integer K for exllamav3 1.6 "sc" quants
+    K = int(K) if float(K).is_integer() else K
     return fields, trellis, al(off), K
 
 

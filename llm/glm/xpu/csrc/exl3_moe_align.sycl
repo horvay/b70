@@ -1,0 +1,50 @@
+// The MoE routing-alignment kernel, alone: an ordinary (non-ESIMD) SYCL kernel, built JIT (spir64) into
+// exl3xpu/_moe_align.so, while _moe_glm.so (ESIMD) is compiled ahead of time for the B70 (bmg-g31, -vc-codegen): the
+// vector backend that ESIMD kernels need drops ordinary kernels' names (UR_RESULT_ERROR_INVALID_KERNEL_NAME), and
+// without it the ESIMD kernels do not compile ahead of time. See exl3_moe.n128.sycl (EXL3_MOE_SPLIT_ALIGN).
+#include <sycl/sycl.hpp>
+
+// Routing: one work-group of 1024 work-items (any number of pairs; loops with stride 1024).
+void exl3_moe_launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
+                         int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
+                         int* pair_tok, float* pair_w, int* pair_of, int* blk_a, int* n_blk) {
+    constexpr int WG = 1024;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> cnt(sycl::range<1>(E), h), start(sycl::range<1>(E), h), fill(sycl::range<1>(E), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            int l = it.get_local_id(0);
+            auto g = it.get_group();
+            for (int e = l; e < E; e += WG) { cnt[e] = 0; fill[e] = 0; }
+            sycl::group_barrier(g);
+            for (int i = l; i < npairs; i += WG) {
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>(cnt[ids[i]]).fetch_add(1);
+            }
+            sycl::group_barrier(g);
+            // E <= WG: one expert per work-item
+            int c = l < E ? cnt[l] : 0;
+            int st = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+            int act = c > 0 ? 1 : 0;
+            int ai = sycl::exclusive_scan_over_group(g, act, sycl::plus<int>());
+            int nact = sycl::reduce_over_group(g, act, sycl::plus<int>());
+            int pc = (c + pad - 1) / pad * pad;
+            int pst = sycl::exclusive_scan_over_group(g, pc, sycl::plus<int>());
+            if (l < E) {
+                start[l] = st;
+                if (act) { act_expert[ai] = l; act_start[ai] = st; act_cnt[ai] = c; act_pstart[ai] = pst; }
+                if (act && blk_a)
+                    for (int j = 0; j < pc / pad; ++j) blk_a[pst / pad + j] = ai;
+            }
+            int ptot = sycl::reduce_over_group(g, pc, sycl::plus<int>());
+            if (l == 0) { n_act[0] = nact; if (n_blk) n_blk[0] = ptot / pad; }
+            sycl::group_barrier(g);
+            for (int i = l; i < npairs; i += WG) {
+                int e = ids[i];
+                int pos = start[e] + sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                      sycl::access::address_space::local_space>(fill[e]).fetch_add(1);
+                pair_tok[pos] = i / topk; pair_w[pos] = w[i]; pair_of[i] = pos;
+            }
+        });
+    });
+}
+

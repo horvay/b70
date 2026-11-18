@@ -22,7 +22,7 @@ def log(*a):
 
 
 def load(model_dir, store_bin, cache_size=32768, max_batch_size=1, ram_gb=24.0, vram_reserve_gb=3.0,
-         max_vram_slots=None, stage_slots=288, warm=None, mtp=0):
+         max_vram_slots=None, stage_slots=288, warm=None, mtp=0, lora=None, lora_scale=1.0):
     from exllamav3 import Config, Model, Cache, Tokenizer
     from exllamav3.cache import CacheLayer_fp16
     from glm_xpu import moe_patch
@@ -50,6 +50,12 @@ def load(model_dir, store_bin, cache_size=32768, max_batch_size=1, ram_gb=24.0, 
         dcache = Cache(draft, max_num_tokens=cache_size, layer_type=CacheLayer_fp16, max_batch_size=max_batch_size)
         draft.load(device=dev, progressbar=True)
         model.mtp = (draft, dcache)
+    if lora and lora_scale:
+        # before the expert tier sizes itself from free VRAM: applied after it, the adapter's VRAM came out of the
+        # prefill reserve, and the client's first 5k-token prompt failed with UR_RESULT_ERROR_OUT_OF_RESOURCES (2026-10-27)
+        from glm_xpu import lora as lora_mod
+        for d in lora.split(","):                               # several adapters add up
+            lora_mod.apply(model, d, lora_scale, log=log)
     torch.xpu.synchronize()
     free, total = torch.xpu.mem_get_info(0)
     log(f"model loaded in {time.time() - t0:.0f} s; VRAM free {free / 2**30:.2f} of {total / 2**30:.2f} GiB, "

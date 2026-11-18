@@ -1,0 +1,753 @@
+{
+ "source": "exllamav3 sc_trace.py CONVERSATIONS (MIT, Copyright (c) 2025 turboderp), github.com/turboderp-org/exllamav3",
+ "conversations": [
+  {
+   "prompt": "A farmer needs to cross a river with a wolf, a goat, a cabbage, and a second goat that eats wolves. The boat holds the farmer and two items. Find a safe crossing sequence.",
+   "followups": [
+    "Double-check your solution step by step and fix any mistakes."
+   ]
+  },
+  {
+   "prompt": "Estimate how many piano tuners work in Chicago, showing your reasoning.",
+   "followups": [
+    "Which of your assumptions is most fragile, and how would the estimate change if it's off by 2x?"
+   ]
+  },
+  {
+   "prompt": "Three friends split a restaurant bill of $127.50. Alice pays twice what Bob pays, and Carol pays $7.50 more than Bob. During payment, a 15% service charge is added to the total. How much does each person actually pay?",
+   "followups": [
+    "Verify the arithmetic carefully and present the answer as a table."
+   ]
+  },
+  {
+   "prompt": "Five houses in a row are painted different colors, and each owner has a different pet and drink. Given: the red house is left of the green one; the dog owner drinks tea; the cat lives in the first house; the milk drinker lives in the middle house; the parrot owner lives next to the cat. Invent two more consistent clues, then solve for a full assignment.",
+   "followups": [
+    "Is your solution unique? If not, show a second valid assignment."
+   ]
+  },
+  {
+   "prompt": "You have 12 balls, one of which is heavier or lighter. Using a balance scale three times, determine which ball is odd and whether it's heavy or light. Explain the full decision tree.",
+   "followups": []
+  },
+  {
+   "prompt": "A snail climbs 3 meters up a wall each day and slides down 2 meters each night. The wall is 10 meters tall. On which day does it reach the top? Now generalize to climb a, slide b, height h.",
+   "followups": [
+    "Write a one-line closed-form expression and test it on five random cases."
+   ]
+  },
+  {
+   "prompt": "Prove that the square root of 2 is irrational, then explain where the same proof breaks down if you try it on the square root of 4.",
+   "followups": [
+    "Generalize: for which integers n is sqrt(n) irrational? Prove it."
+   ]
+  },
+  {
+   "prompt": "Evaluate the integral of x^2 * e^(-x) from 0 to infinity, showing each integration by parts.",
+   "followups": [
+    "Now derive the general formula for the integral of x^n * e^(-x) and relate it to the gamma function."
+   ]
+  },
+  {
+   "prompt": "A fair coin is flipped until two heads appear in a row. What is the expected number of flips? Set up the recurrence and solve it.",
+   "followups": [
+    "Extend to three heads in a row, and give the general pattern for n heads."
+   ]
+  },
+  {
+   "prompt": "Explain the difference between pointwise and uniform convergence of function sequences, with a concrete example of a sequence that converges pointwise but not uniformly.",
+   "followups": []
+  },
+  {
+   "prompt": "Find all integer solutions to 3x + 7y = 1, then describe the full solution set of any linear Diophantine equation ax + by = c.",
+   "followups": [
+    "When does ax + by = c have no solutions? Give three concrete examples."
+   ]
+  },
+  {
+   "prompt": "A tetrahedron has vertices at (0,0,0), (1,0,0), (0,1,0), (0,0,1). Compute its volume, surface area, and the radius of its inscribed sphere.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain Bayes' theorem using a medical test example: a disease affects 1 in 1000 people, the test has 99% sensitivity and 95% specificity. What does a positive result mean?",
+   "followups": [
+    "Now compute the effect of a second, independent positive test."
+   ]
+  },
+  {
+   "prompt": "Show that the harmonic series diverges, using two different proofs.",
+   "followups": [
+    "How fast does the partial sum grow? Derive the connection to the natural logarithm."
+   ]
+  },
+  {
+   "prompt": "Write a Python function that finds the longest palindromic substring in O(n) time, with an explanation of the algorithm.",
+   "followups": [
+    "What are the edge cases and how does your implementation handle them?"
+   ]
+  },
+  {
+   "prompt": "Design a database schema for a public library system: books, copies, members, loans, holds, fines. Give the DDL and explain the key decisions.",
+   "followups": [
+    "Write the five queries the front desk will run most often."
+   ]
+  },
+  {
+   "prompt": "Implement an LRU cache in Python with O(1) get and put, first using OrderedDict, then from scratch with a doubly-linked list and dict.",
+   "followups": [
+    "Make the from-scratch version thread-safe and explain the locking strategy."
+   ]
+  },
+  {
+   "prompt": "Write a Rust function that parses a simplified INI file format into a nested HashMap, handling comments, whitespace, and duplicate keys sensibly. Include unit tests.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain what this regex does and rewrite it to be readable with named groups and comments: ^(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)$",
+   "followups": [
+    "Now write a regex that validates an IPv6 address, and explain why this is much harder."
+   ]
+  },
+  {
+   "prompt": "Here is a JavaScript function with a bug:\n\n```js\nasync function fetchAll(urls) {\n  const results = [];\n  urls.forEach(async (u) => {\n    const r = await fetch(u);\n    results.push(await r.json());\n  });\n  return results;\n}\n```\n\nExplain why it returns an empty array and fix it two different ways.",
+   "followups": [
+    "What changes if the endpoints are rate-limited to 5 concurrent requests?"
+   ]
+  },
+  {
+   "prompt": "Write a SQL query against tables orders(id, customer_id, created_at, total) and customers(id, name, country) that returns each country's top 3 customers by lifetime spend, including ties. Explain the window function used.",
+   "followups": [
+    "Rewrite it for SQLite 3.24, which lacks the window function you used."
+   ]
+  },
+  {
+   "prompt": "Implement Dijkstra's algorithm in Python using a heap, then explain why it fails with negative edge weights and what to use instead.",
+   "followups": []
+  },
+  {
+   "prompt": "Write a bash script that finds all files over 100MB modified in the last 7 days, prints them sorted by size with human-readable sizes, and handles filenames with spaces correctly.",
+   "followups": [
+    "Convert it to PowerShell."
+   ]
+  },
+  {
+   "prompt": "Explain the difference between processes and threads, then show a Python example where multiprocessing beats threading and one where threading is the right choice.",
+   "followups": [
+    "Where does asyncio fit into this picture?"
+   ]
+  },
+  {
+   "prompt": "Review this C function for bugs and undefined behavior:\n\n```c\nchar *concat(const char *a, const char *b) {\n  char buf[256];\n  strcpy(buf, a);\n  strcat(buf, b);\n  return buf;\n}\n```\n\nList every problem and write a corrected version.",
+   "followups": []
+  },
+  {
+   "prompt": "Write a Python decorator that retries a function up to n times with exponential backoff and jitter, re-raising the last exception. Type-annotate it properly.",
+   "followups": [
+    "Extend it to support async functions transparently."
+   ]
+  },
+  {
+   "prompt": "Given a CSV with columns date, store, product, units, price, write pandas code to compute monthly revenue per store, the top product per store, and a pivot table of stores x months.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain git rebase vs merge with diagrams (ASCII), when to use each, and how to recover from a rebase gone wrong using reflog.",
+   "followups": [
+    "My teammate force-pushed over my changes. Walk me through recovery step by step."
+   ]
+  },
+  {
+   "prompt": "Implement a simple Markdown-to-HTML converter in Python supporting headers, bold, italics, links, code spans and unordered lists. No external libraries.",
+   "followups": [
+    "Add support for fenced code blocks and nested lists."
+   ]
+  },
+  {
+   "prompt": "Explain why the sky is blue but sunsets are red, at a level suitable for a curious 12-year-old, then again for a physics undergraduate.",
+   "followups": [
+    "The undergraduate asks: why isn't the sky violet, since violet light scatters even more?"
+   ]
+  },
+  {
+   "prompt": "Walk through what happens inside a lithium-ion battery during charge and discharge, including the role of the electrolyte and why fast charging degrades capacity.",
+   "followups": [
+    "Compare with solid-state batteries: what actually changes and what problems remain?"
+   ]
+  },
+  {
+   "prompt": "Explain CRISPR-Cas9 gene editing: the natural bacterial mechanism, how it was adapted as a tool, and what off-target effects are.",
+   "followups": [
+    "What is base editing and how does it differ from a double-strand break approach?"
+   ]
+  },
+  {
+   "prompt": "Describe the life cycle of a massive star from protostar to supernova, and explain why iron is the end of the line for fusion.",
+   "followups": [
+    "What determines whether the remnant is a neutron star or a black hole?"
+   ]
+  },
+  {
+   "prompt": "Explain plate tectonics evidence: seafloor spreading, magnetic striping, earthquake distribution, and fossil correlation across continents.",
+   "followups": []
+  },
+  {
+   "prompt": "Why does ice float, and why is that weird for a solid? Explain hydrogen bonding and the density anomaly of water, and what a lake would look like each winter if ice sank.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain how mRNA vaccines work step by step, from injection to immune memory, and why the lipid nanoparticle matters.",
+   "followups": [
+    "How does this differ from viral-vector and protein-subunit vaccines?"
+   ]
+  },
+  {
+   "prompt": "Explain the greenhouse effect quantitatively: solar constant, albedo, black-body radiation, and derive the Earth's temperature with and without an atmosphere.",
+   "followups": [
+    "Where does the logarithmic dependence of forcing on CO2 concentration come from?"
+   ]
+  },
+  {
+   "prompt": "What is quantum entanglement, what does Bell's theorem actually rule out, and why can't entanglement be used to send information faster than light?",
+   "followups": []
+  },
+  {
+   "prompt": "Explain how a neuron fires: resting potential, ion channels, action potential propagation, and synaptic transmission. Include the actual ion concentrations.",
+   "followups": [
+    "How do local anesthetics like lidocaine interfere with this process?"
+   ]
+  },
+  {
+   "prompt": "Explain the difference between type 1 and type 2 diabetes: causes, mechanisms, typical onset, and treatment approaches.",
+   "followups": [
+    "What is insulin resistance at the cellular level?"
+   ]
+  },
+  {
+   "prompt": "A friend says antibiotics don't work on colds. Explain why they're right, what antibiotics actually do, and how antibiotic resistance evolves.",
+   "followups": []
+  },
+  {
+   "prompt": "Describe what happens physiologically during aerobic exercise: heart rate, stroke volume, oxygen delivery, and the shift between energy systems over a 60-minute run.",
+   "followups": [
+    "Explain lactate threshold and how athletes train to raise it."
+   ]
+  },
+  {
+   "prompt": "Explain how common painkillers differ: paracetamol, ibuprofen, and aspirin — mechanisms, risks, and when each is preferred.",
+   "followups": []
+  },
+  {
+   "prompt": "Trace the causes of World War I from the 1870s onward: alliance systems, imperial competition, the arms race, and the July Crisis. Where was the last realistic off-ramp?",
+   "followups": [
+    "How did the war's ending set up conditions for World War II?"
+   ]
+  },
+  {
+   "prompt": "Compare the Roman Republic's fall with the transition from Weimar Germany: institutional erosion, political violence, and the role of individual actors. Where does the analogy break?",
+   "followups": []
+  },
+  {
+   "prompt": "Explain the Silk Road: main routes, what actually moved along them (goods, ideas, diseases), and why it declined.",
+   "followups": [
+    "How did maritime trade routes change the equation after 1500?"
+   ]
+  },
+  {
+   "prompt": "Why is the Nile's annual flood central to ancient Egyptian civilization, and how did the Aswan High Dam change Egypt's agriculture and ecology?",
+   "followups": []
+  },
+  {
+   "prompt": "Describe the Meiji Restoration: what triggered it, the key reforms, and how Japan industrialized in one generation.",
+   "followups": [
+    "Contrast with China's Self-Strengthening Movement in the same period: why the different outcomes?"
+   ]
+  },
+  {
+   "prompt": "Explain how the Himalayas formed, why they're still rising, and their effect on Asian climate including the monsoon.",
+   "followups": []
+  },
+  {
+   "prompt": "Summarize the key arguments for and against rent control, citing the standard economic models involved, and give your overall assessment.",
+   "followups": [
+    "Steelman the side your assessment went against."
+   ]
+  },
+  {
+   "prompt": "Explain inflation: demand-pull vs cost-push, the role of central banks, and why moderate inflation is targeted instead of zero.",
+   "followups": [
+    "Walk through the 1970s stagflation and what it taught policymakers."
+   ]
+  },
+  {
+   "prompt": "Explain compound interest with a concrete retirement example: saving $500/month at 7% from age 25 vs starting at 35. Show the math and a year-by-year table for the first 5 years.",
+   "followups": []
+  },
+  {
+   "prompt": "What is comparative advantage? Work a two-country, two-goods numeric example where one country is worse at producing both goods yet trade still benefits both.",
+   "followups": [
+    "What real-world frictions does the model ignore, and when do they dominate?"
+   ]
+  },
+  {
+   "prompt": "Write a one-page business plan for a mobile bicycle repair service in a mid-size city: target market, pricing, unit economics, and the three biggest risks.",
+   "followups": [
+    "Draft a cold outreach email to apartment building managers proposing a partnership."
+   ]
+  },
+  {
+   "prompt": "Explain options basics: calls, puts, covered calls and protective puts, with payoff diagrams described in text and a concrete example using a $50 stock.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain the trolley problem and its main variants, what each variant is designed to probe, and how consequentialists and deontologists respond.",
+   "followups": [
+    "How do these intuitions map onto real autonomous-vehicle design decisions?"
+   ]
+  },
+  {
+   "prompt": "Compare Stoicism and Epicureanism as practical life philosophies: what each actually recommends day to day, and where they agree more than people assume.",
+   "followups": []
+  },
+  {
+   "prompt": "What is the Ship of Theseus problem, and how do different theories of identity answer it? Apply each answer to a band with no original members and a company after full turnover.",
+   "followups": []
+  },
+  {
+   "prompt": "Present the strongest argument for and against the claim that free will is compatible with determinism, then explain which premises the disagreement actually hinges on.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain Rawls' veil of ignorance and the difference principle, then apply the framework to designing a tax system.",
+   "followups": [
+    "What is Nozick's strongest objection to this framework?"
+   ]
+  },
+  {
+   "prompt": "Write a 400-word short story about a lighthouse keeper who discovers the light attracts something other than ships, with a twist ending.",
+   "followups": [
+    "Retell the same story as a series of terse logbook entries."
+   ]
+  },
+  {
+   "prompt": "Write a poem about a city at 4 a.m. in strict iambic pentameter, 16 lines, ABAB rhyme scheme. Then annotate the scansion of the first quatrain.",
+   "followups": []
+  },
+  {
+   "prompt": "Write the opening scene of a screenplay: two estranged siblings meet at a storage unit auction where their late mother's unit is up for bid. Proper screenplay format.",
+   "followups": [
+    "Continue the scene, but a stranger outbids them and offers a deal."
+   ]
+  },
+  {
+   "prompt": "Write a product description for a fictional device: a alarm clock that wakes you with the smell of coffee. Three versions: luxury brand voice, budget brand voice, and absurdist.",
+   "followups": []
+  },
+  {
+   "prompt": "Write a villanelle about forgetting a language you once spoke fluently.",
+   "followups": [
+    "Now explain the poem's imagery choices as if annotating it for a literature class."
+   ]
+  },
+  {
+   "prompt": "Tell a complete story in exactly 10 sentences, each sentence exactly one word longer than the previous, starting with a one-word sentence.",
+   "followups": []
+  },
+  {
+   "prompt": "Write a dialogue between a medieval blacksmith and a time traveler trying to explain what a website is, without using any technical vocabulary the blacksmith wouldn't know.",
+   "followups": []
+  },
+  {
+   "prompt": "Write song lyrics for a folk ballad about a container ship stuck sideways in a canal, verse-chorus-verse-chorus-bridge-chorus structure.",
+   "followups": []
+  },
+  {
+   "prompt": "Write a resignation letter for a software engineer leaving on good terms after 6 years, then a version for leaving after a dispute over unpaid overtime — professional but firm.",
+   "followups": []
+  },
+  {
+   "prompt": "Draft a press release for a small robotics startup announcing a $12M Series A round, including quotes from the CEO and lead investor.",
+   "followups": [
+    "Now write the internal all-hands announcement of the same news, different tone."
+   ]
+  },
+  {
+   "prompt": "Rewrite this passage to be clear and concise, then explain your edits: 'Due to the fact that the implementation of the aforementioned system has been delayed as a result of unforeseen circumstances, it is our recommendation that stakeholders should consider the utilization of alternative solutions in the interim period until such time as the system becomes operational.'",
+   "followups": []
+  },
+  {
+   "prompt": "Write a performance review for a fictional employee who is technically excellent but dismissive in code reviews: specific, fair, with concrete growth actions.",
+   "followups": []
+  },
+  {
+   "prompt": "Create a detailed agenda for a 90-minute quarterly planning meeting for an 8-person team, with timeboxes, pre-reads, and decision points.",
+   "followups": []
+  },
+  {
+   "prompt": "Generate a JSON object describing a fictional bookstore inventory: 8 books with nested author objects, genres arrays, stock info, and prices. Then write a JSON Schema it validates against.",
+   "followups": []
+  },
+  {
+   "prompt": "Create a YAML CI pipeline config for a Python project: lint, type-check, test on three Python versions, build a wheel, and publish on tags. Annotate each section with comments.",
+   "followups": []
+  },
+  {
+   "prompt": "Here is sales data: Q1 north 120, Q1 south 95, Q2 north 140, Q2 south 88, Q3 north 133, Q3 south 102, Q4 north 155, Q4 south 121. Present it as a markdown table with totals and growth rates, then describe three insights.",
+   "followups": []
+  },
+  {
+   "prompt": "Design a REST API for a recipe-sharing app: resources, endpoints, methods, status codes, and example request/response JSON for the three most important endpoints.",
+   "followups": [
+    "How would you version this API and handle breaking changes?"
+   ]
+  },
+  {
+   "prompt": "Convert this prose into a decision table and a flowchart (described in mermaid syntax): 'Orders over $100 ship free unless international. International orders under $100 pay $25 shipping, over $100 pay $10. Express doubles any shipping cost but is free for members on domestic orders over $100.'",
+   "followups": []
+  },
+  {
+   "prompt": "Summarize the following in three bullet points, then critique its argument: 'Remote work has permanently changed the office. Companies clinging to five-day office mandates are fighting the last war. The data shows productivity held steady or rose during remote years, and the talent market now prices flexibility as compensation. Offices will survive, but as collaboration spaces, not attendance theaters. The firms that win the next decade will be the ones that measure output, not presence.'",
+   "followups": [
+    "Write the strongest one-paragraph rebuttal from a CEO who disagrees."
+   ]
+  },
+  {
+   "prompt": "Explain what this analogy gets right and wrong: 'DNA is like a blueprint for the body.'",
+   "followups": [
+    "Propose two better analogies and their own failure modes."
+   ]
+  },
+  {
+   "prompt": "I've been offered a promotion to manager but I love hands-on engineering work. The pay bump is 15%. How should I think about this decision?",
+   "followups": [
+    "I took the job and three months in I miss coding badly. Now what?"
+   ]
+  },
+  {
+   "prompt": "My sourdough starter smells like acetone and barely rises. Diagnose the likely causes and give me a recovery plan for the next five days.",
+   "followups": []
+  },
+  {
+   "prompt": "Roleplay as a grumpy but knowledgeable hardware store employee. I come in saying my bathroom faucet drips. Stay in character and help me fix it.",
+   "followups": [
+    "I replaced the washer like you said but now it drips worse."
+   ]
+  },
+  {
+   "prompt": "I have a job interview for a data analyst role on Thursday. Run a mock interview: ask me one question at a time, starting with a behavioral one.",
+   "followups": [
+    "Give me tough but fair feedback on this answer: 'I once found an error in a report and told my boss about it.'"
+   ]
+  },
+  {
+   "prompt": "Plan a 10-day trip through Japan for two people who like hiking and food but hate crowds, in late November. Include a day-by-day itinerary.",
+   "followups": [
+    "One traveler sprains an ankle on day 4. Rework the remaining days."
+   ]
+  },
+  {
+   "prompt": "My 6-year-old asked me why people die. Give me a few honest, age-appropriate ways to answer, for a secular household, and what to avoid saying.",
+   "followups": []
+  },
+  {
+   "prompt": "Settle a debate: my partner says you should rinse pasta after cooking, I say never. Who's right and why, and are there exceptions?",
+   "followups": []
+  },
+  {
+   "prompt": "I want to start running but I've been sedentary for years and I'm 40. Give me a realistic 8-week couch-to-5k plan with injury red flags to watch for.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain the Maillard reaction and how it differs from caramelization, then give five practical kitchen techniques that exploit it.",
+   "followups": []
+  },
+  {
+   "prompt": "Design a week of dinners for a family of four where one member is vegetarian and one is gluten-free, sharing as many components as possible. Include a consolidated shopping list.",
+   "followups": []
+  },
+  {
+   "prompt": "Why does my homemade mayonnaise keep breaking? Explain the emulsion science and give a foolproof rescue method for a broken batch.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain the offside rule in football (soccer) precisely, including the tricky cases: level positions, deflections, goalkeepers, and passive offside.",
+   "followups": []
+  },
+  {
+   "prompt": "Analyze the classic Queen's Gambit Declined: main line moves 1-7 with the ideas behind each move, common traps, and typical middlegame plans for both sides.",
+   "followups": [
+    "Show a famous game in this opening and annotate the turning point."
+   ]
+  },
+  {
+   "prompt": "Explain why a 12-bar blues in E works harmonically: the chords, the role of dominant sevenths, blue notes, and why the V-IV-I turnaround resolves satisfyingly.",
+   "followups": []
+  },
+  {
+   "prompt": "Design a balanced D&D encounter for four level-5 players in a flooded temple, with terrain effects, an interesting enemy composition, and a non-combat resolution path.",
+   "followups": []
+  },
+  {
+   "prompt": "My interior door won't latch — the bolt misses the strike plate by about 3mm vertically. Walk me through diagnosis and the three standard fixes from least to most invasive.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain how to safely jump-start a car with cables, the correct connection order and why, and the cases where you should not attempt it.",
+   "followups": []
+  },
+  {
+   "prompt": "I want to build a raised garden bed, 3m x 1.2m, on a slight slope. Materials list, cost estimate, step-by-step build, and what soil mix to fill it with.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain how HTTPS actually works when I visit a website: DNS, TCP, TLS handshake, certificates, and what the padlock does and does not guarantee.",
+   "followups": [
+    "What changes with TLS 1.3 and why were older versions deprecated?"
+   ]
+  },
+  {
+   "prompt": "Explain how GPS determines position: satellites, time signals, trilateration, why relativity corrections are needed, and typical error sources.",
+   "followups": []
+  },
+  {
+   "prompt": "What actually happens from pressing the power button to seeing a login screen? BIOS/UEFI, bootloader, kernel init, services — explain the chain for a modern Linux system.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain how noise-cancelling headphones work, the difference between passive and active cancellation, and why they struggle with speech but excel with engine drone.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain large language model inference to a software engineer who knows nothing about ML: tokens, the transformer loop, KV cache, and why long contexts get slow.",
+   "followups": [
+    "Now explain quantization of such models and its quality/speed tradeoffs."
+   ]
+  },
+  {
+   "prompt": "Translate this into French, German and Japanese, preserving the informal tone, and note one interesting translation choice for each: 'Honestly, the meeting could have been an email, but at least the snacks were good.'",
+   "followups": []
+  },
+  {
+   "prompt": "Explain grammatical gender to a native English speaker: what it is, what it isn't, how it works differently in Spanish, German and Swahili, and common misconceptions.",
+   "followups": []
+  },
+  {
+   "prompt": "What is the difference between a dialect and a language? Discuss with examples from Chinese, Arabic, and Scandinavian languages, and explain the sociolinguistic factors.",
+   "followups": []
+  },
+  {
+   "prompt": "Break down the etymology of ten common English words with surprising origins, presented as a table: word, origin language, original meaning, path into English.",
+   "followups": []
+  },
+  {
+   "prompt": "请解释一下什么是区块链技术,它的核心原理是什么,以及除了加密货币之外还有哪些实际应用场景?",
+   "followups": [
+    "请针对供应链溯源这个应用,详细说明区块链具体解决了什么传统方案解决不了的问题。"
+   ]
+  },
+  {
+   "prompt": "我想学做正宗的麻婆豆腐,请给出详细的食材清单和步骤,并解释'麻'和'辣'分别来自哪里,如何平衡。",
+   "followups": []
+  },
+  {
+   "prompt": "请以'秋雨'为题写一首七言绝句,并解释其中的意象和平仄安排。",
+   "followups": [
+    "再用同样的主题写一首现代自由诗,比较两种形式的表达差异。"
+   ]
+  },
+  {
+   "prompt": "小明有一些苹果,如果每天吃3个,可以多吃4天;如果每天吃5个,就少吃4天。问小明有多少个苹果?请列方程详细求解。",
+   "followups": []
+  },
+  {
+   "prompt": "请帮我写一封正式的商务邮件:我们公司需要向长期合作的供应商提出降价10%的请求,理由是采购量将翻倍。语气要礼貌但坚定。",
+   "followups": []
+  },
+  {
+   "prompt": "初めて京都を訪れる外国人の友人に、3日間のおすすめプランを教えてください。有名な観光地だけでなく、地元の人が好む場所も含めてください。",
+   "followups": [
+    "雨の日の代替プランも提案してください。"
+   ]
+  },
+  {
+   "prompt": "取引先に納期延期をお願いするビジネスメールを書いてください。理由は部品調達の遅れで、2週間の延期が必要です。適切な敬語を使ってください。",
+   "followups": []
+  },
+  {
+   "prompt": "再帰関数とは何ですか?プログラミング初心者にもわかるように、日常の例えを使って説明してから、Pythonで階乗を計算する例を見せてください。",
+   "followups": []
+  },
+  {
+   "prompt": "「もったいない」という言葉の意味と文化的背景を説明し、他の言語に翻訳しにくい日本語の言葉を5つ挙げて、それぞれ解説してください。",
+   "followups": []
+  },
+  {
+   "prompt": "한국의 전통 발효 음식인 김치의 발효 과정을 과학적으로 설명해 주세요. 유산균의 역할과 온도가 맛에 미치는 영향도 포함해 주세요.",
+   "followups": []
+  },
+  {
+   "prompt": "처음 서울에 오는 친구에게 대중교통 이용법을 알려주세요. 티머니 카드, 지하철, 버스 환승 시스템을 포함해서 설명해 주세요.",
+   "followups": []
+  },
+  {
+   "prompt": "이력서에 쓸 자기소개서를 도와주세요. 저는 5년 경력의 마케팅 전문가이고 데이터 분석 역량이 강점입니다. 300자 정도로 작성해 주세요.",
+   "followups": [
+    "좀 더 구체적인 성과 중심으로 다시 써 주세요. 예를 들어 수치를 포함해서요."
+   ]
+  },
+  {
+   "prompt": "Explica la diferencia entre 'ser' y 'estar' para un estudiante de español, con reglas claras, ejemplos y los casos donde ambos son posibles pero cambian el significado.",
+   "followups": []
+  },
+  {
+   "prompt": "Escribe una receta detallada de paella valenciana auténtica, con los ingredientes que nunca deben faltar y los errores más comunes que cometen los principiantes.",
+   "followups": [
+    "¿Qué diferencias hay entre la paella valenciana y la paella de mariscos?"
+   ]
+  },
+  {
+   "prompt": "Resume la historia de la independencia de los países latinoamericanos en el siglo XIX: causas comunes, figuras principales y por qué se fragmentó en tantas naciones.",
+   "followups": []
+  },
+  {
+   "prompt": "Mi hijo de 8 años le tiene miedo a la oscuridad y no quiere dormir solo. ¿Qué estrategias recomiendan los psicólogos infantiles? Dame un plan práctico para dos semanas.",
+   "followups": []
+  },
+  {
+   "prompt": "Expliquez la différence entre le passé composé et l'imparfait, avec des exemples où le choix du temps change complètement le sens de la phrase.",
+   "followups": []
+  },
+  {
+   "prompt": "Rédigez une lettre de motivation pour un poste d'ingénieur logiciel dans une startup parisienne, pour un candidat avec 3 ans d'expérience qui veut quitter un grand groupe.",
+   "followups": []
+  },
+  {
+   "prompt": "Quelle est la recette traditionnelle du bœuf bourguignon ? Détaillez les étapes, le choix du vin, et expliquez pourquoi la cuisson lente transforme la viande.",
+   "followups": []
+  },
+  {
+   "prompt": "Expliquez le fonctionnement de l'Union européenne à un lycéen : les institutions principales, comment une loi est adoptée, et le débat sur la souveraineté.",
+   "followups": [
+    "Quels sont les arguments économiques pour et contre l'euro comme monnaie unique ?"
+   ]
+  },
+  {
+   "prompt": "Erkläre den Unterschied zwischen 'kennen' und 'wissen' für Deutschlernende, mit Beispielen und den häufigsten Fehlern von Englischsprachigen.",
+   "followups": []
+  },
+  {
+   "prompt": "Schreibe eine formelle E-Mail an die Hausverwaltung: Die Heizung in der Wohnung funktioniert seit einer Woche nicht, mehrere Anrufe blieben erfolglos, und du kündigst eine Mietminderung an.",
+   "followups": []
+  },
+  {
+   "prompt": "Erkläre das duale Ausbildungssystem in Deutschland: wie es funktioniert, warum es im Ausland als Vorbild gilt, und welche Schwächen es hat.",
+   "followups": []
+  },
+  {
+   "prompt": "Was ist der Unterschied zwischen Bundesrat und Bundestag? Erkläre die Gesetzgebung in Deutschland Schritt für Schritt an einem konkreten Beispiel.",
+   "followups": []
+  },
+  {
+   "prompt": "Объясните разницу между глаголами совершенного и несовершенного вида в русском языке, с примерами, где выбор вида полностью меняет смысл предложения.",
+   "followups": []
+  },
+  {
+   "prompt": "Напишите подробный рецепт настоящего борща с пошаговыми инструкциями. Объясните, зачем свёклу готовят отдельно и как добиться насыщенного цвета.",
+   "followups": []
+  },
+  {
+   "prompt": "Расскажите о творчестве Достоевского для человека, который никогда его не читал: с какого романа начать, основные темы и почему он до сих пор актуален.",
+   "followups": []
+  },
+  {
+   "prompt": "Explique a diferença entre o português do Brasil e o de Portugal: pronúncia, vocabulário, gramática e alguns mal-entendidos engraçados entre falantes.",
+   "followups": []
+  },
+  {
+   "prompt": "Escreva um roteiro de 5 dias no Rio de Janeiro para quem gosta de natureza e cultura, evitando as armadilhas turísticas mais caras. Inclua dicas de segurança realistas.",
+   "followups": []
+  },
+  {
+   "prompt": "Explique como funciona a declaração de imposto de renda para uma pessoa que acabou de começar seu primeiro emprego formal. O que é retido na fonte e o que é restituição?",
+   "followups": []
+  },
+  {
+   "prompt": "Spiega la differenza tra i vari tipi di pasta e i sughi che tradizionalmente li accompagnano: perché le forme contano, con esempi concreti e gli abbinamenti da evitare.",
+   "followups": []
+  },
+  {
+   "prompt": "Scrivi una guida di due giorni a Firenze per amanti dell'arte: itinerario, come evitare le code agli Uffizi, e tre luoghi meno conosciuti che meritano una visita.",
+   "followups": []
+  },
+  {
+   "prompt": "اشرح الفرق بين اللغة العربية الفصحى واللهجات العامية، مع أمثلة من اللهجة المصرية والشامية والخليجية، ولماذا يفهم العرب الفصحى جميعاً بينما قد لا يفهمون لهجات بعضهم البعض.",
+   "followups": []
+  },
+  {
+   "prompt": "اكتب وصفة تفصيلية لتحضير الكبسة السعودية التقليدية، مع شرح التوابل الأساسية وسر الأرز المفلفل الذي لا يتكتل.",
+   "followups": []
+  },
+  {
+   "prompt": "भारत में मानसून कैसे बनता है? इसकी प्रक्रिया को विस्तार से समझाइए और यह भी बताइए कि यह भारतीय कृषि और अर्थव्यवस्था के लिए इतना महत्वपूर्ण क्यों है।",
+   "followups": []
+  },
+  {
+   "prompt": "दाल मखनी बनाने की पूरी विधि बताइए। कौन सी दाल इस्तेमाल होती है, कितनी देर पकानी चाहिए, और रेस्टोरेंट जैसा स्वाद घर पर कैसे लाया जाए?",
+   "followups": []
+  },
+  {
+   "prompt": "Türk kahvesinin geleneksel hazırlanışını adım adım anlatır mısın? Köpüğün sırrı nedir ve fal bakma geleneği nereden geliyor?",
+   "followups": []
+  },
+  {
+   "prompt": "İstanbul'u ilk kez ziyaret edecek birine 4 günlük bir gezi planı hazırla. Hem Avrupa hem Anadolu yakasını kapsasın, ulaşım önerileriyle birlikte.",
+   "followups": []
+  },
+  {
+   "prompt": "Leg uit waarom Nederland zo goed is in watermanagement: de Deltawerken, polders en wat andere landen kunnen leren van de Nederlandse aanpak van zeespiegelstijging.",
+   "followups": []
+  },
+  {
+   "prompt": "Wyjaśnij odmianę przez przypadki w języku polskim osobie anglojęzycznej: po co jest siedem przypadków, z przykładami pokazującymi jak zmienia się znaczenie.",
+   "followups": []
+  },
+  {
+   "prompt": "Förklara begreppet 'lagom' och andra svenska ord som är svåra att översätta. Hur speglar de svensk kultur och samhälle?",
+   "followups": []
+  },
+  {
+   "prompt": "Hãy giải thích cách nấu phở bò truyền thống: nước dùng cần những gia vị gì, ninh xương bao lâu, và bí quyết để nước dùng trong mà vẫn đậm đà.",
+   "followups": []
+  },
+  {
+   "prompt": "ช่วยอธิบายวิธีทำต้มยำกุ้งแบบดั้งเดิม ต้องใช้สมุนไพรอะไรบ้าง และความแตกต่างระหว่างต้มยำน้ำใสกับน้ำข้นคืออะไร",
+   "followups": []
+  },
+  {
+   "prompt": "Jelaskan mengapa Indonesia memiliki begitu banyak gunung berapi, bagaimana Cincin Api Pasifik bekerja, dan bagaimana masyarakat hidup berdampingan dengan risiko letusan.",
+   "followups": []
+  },
+  {
+   "prompt": "Selitä suomalainen saunakulttuuri ulkomaalaiselle: saunan merkitys, käyttäytymissäännöt ja miksi sauna on niin tärkeä osa suomalaista identiteettiä.",
+   "followups": []
+  },
+  {
+   "prompt": "Explain the rules of cricket to an American baseball fan, mapping each concept to its closest baseball equivalent where one exists, in a comparison table.",
+   "followups": []
+  },
+  {
+   "prompt": "Write the same error message in five different software voices: a 1980s mainframe, a modern minimalist app, an over-friendly startup, a legal-compliance system, and a pirate.",
+   "followups": []
+  },
+  {
+   "prompt": "Compose a formal proof, a limerick, and a tweet all explaining why 0.999... equals 1.",
+   "followups": []
+  },
+  {
+   "prompt": "Interview yourself: write five hard questions a skeptical journalist would ask an AI assistant about its limitations, and answer them honestly.",
+   "followups": []
+  },
+  {
+   "prompt": "Create a glossary of 15 terms a new employee at a semiconductor fab would need to know, ordered by how soon they'll encounter each, with two-sentence definitions.",
+   "followups": []
+  }
+ ]
+}

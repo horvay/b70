@@ -473,7 +473,10 @@ def moe_ops():
         # DPAS prefill path from M >= 256 (the kernel's measured crossover). It hung the B70 on GLM shapes until the
         # gate/up work-group was split to <= 32 threads for large-GRF mode (2026-10-10, csrc/exl3_moe.n128.sycl).
         _moe.moe_set_prefill_min_m(int(os.environ.get("GLM_XPU_MOE_PREFILL_MIN_M", "256")))
-        # K values with the DPAS prefill path (bit K). K=2 / K=4 (build4_any) added 2026-10-10 for the 2.51 bpw model;
-        # GLM_XPU_MOE_PREFILL_K_MASK=8 keeps them on the grouped GEMV (K=3 only)
-        _moe.moe_set_prefill_k_mask(int(os.environ.get("GLM_XPU_MOE_PREFILL_K_MASK", str(4 | 8 | 16))))
+        # K values with the DPAS prefill path (bit kbit(K): K, or 8 + KA for half-integer K codes 25 / 35 -> bits 10 /
+        # 11). K=2 / K=4 (build4_any) added 2026-10-10 for the 2.51 bpw model; 2.5 / 3.5 (sc_2.60bpw) 2026-10-30: without
+        # them its prompts ran the grouped GEMV (4.9k tokens: MoE 17 of 31 s). GLM_XPU_MOE_PREFILL_K_MASK=8 keeps the
+        # rest on the grouped GEMV (K=3 only)
+        _moe.moe_set_prefill_k_mask(int(os.environ.get("GLM_XPU_MOE_PREFILL_K_MASK",
+                                                       str(4 | 8 | 16 | (1 << 10) | (1 << 11)))))
     return _moe

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# exl3: convert Hugging Face BF16 models to EXL3 on the Arc Pro B70, through the b70q queue.
+#
+#   exl3 build                                    build the binaries (CPU only)
+#   exl3 convert <hf dir> <out dir> [-b BITS]     queue a conversion (chunked: ~4 min pieces, resumes itself);
+#                                                 prints the job id; follow it with `b70q log <id> -f`
+#   exl3 eval --ref <bf16 dir> --test <exl3 dir> [--test ...] [--wiki]
+#                                                 KL / top-1 / perplexity against the BF16 model on chat replies
+#                                                 (waits its turn); --wiki: on raw Wikipedia text instead
+#
+# Environment: B70Q_OWNER (queue owner, default exl3conv), EXL3_MINUTES (minimum work per queue turn, default 3).
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+OWNER=${B70Q_OWNER:-exl3conv}
+
+need_build() { [[ -x $HERE/build/exl3conv && -x $HERE/build/exl3eval ]] || "$HERE/build.sh" exl3conv exl3eval; }
+
+cmd=${1:-}; shift || true
+case $cmd in
+  build) "$HERE/build.sh" exl3conv exl3eval ;;
+  convert)
+    [[ $# -ge 2 ]] || { echo "usage: exl3 convert <hf dir> <out dir> [-b BITS]" >&2; exit 2; }
+    in=$(realpath "$1"); out=$(realpath -m "$2"); shift 2
+    [[ -f $in/config.json ]] || { echo "no config.json in $in" >&2; exit 2; }
+    need_build
+    mkdir -p "$(dirname "$out")"
+    b70q submit "$OWNER" --chunked --retries 1 --vram-gib 24 --log "$out.log" -- \
+      "$HERE/tests/gpu_run.sh" -t 3600 -- "$HERE/build/exl3conv" -i "$in" -o "$out" --max-minutes "${EXL3_MINUTES:-3}" "$@"
+    ;;
+  eval)
+    need_build
+    exec b70-lease run "$OWNER" --next -- "$HERE/tests/gpu_run.sh" -t 7200 -- "$HERE/build/exl3eval" "$@"
+    ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

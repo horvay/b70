@@ -25,13 +25,25 @@ using fp16 = sycl::half;
 
 constexpr int cgcd(int a, int b) { return b == 0 ? a : cgcd(b, a % b); }
 
+// K template codes: 1..8 = integer bitrate; 10 * KA + 5 = half-integer KA + 0.5 (exllamav3 1.6 "sc" quants, mul1
+// codebook): positions alternate KA and KA + 1 bits, odd positions carrying the extra bit (exllamav3 frac_k, MASK
+// 0xAAAA), so value u of a tile ends at bit (u + 1) * KA + (u + 1) / 2 and 64 values fill 2K = 2 * KA + 1 words.
+constexpr int k2_of(int K) { return K >= 10 ? 2 * (K / 10) + 1 : 2 * K; }    // twice the bitrate
+constexpr int words_of(int K) { return 4 * k2_of(K); }                         // uint32 words per 256-value tile
+
 template <int K> struct Geo {
-    static constexpr int g = cgcd(K, 32);
-    static constexpr int D = K / g;          // words per period
-    static constexpr int V = 32 / g;         // values per period
+    static constexpr int K2 = k2_of(K);
+    static constexpr bool HALF = K >= 10;
+    static constexpr int g = cgcd(K2, 64);
+    static constexpr int D = K2 / g;         // words per period
+    static constexpr int V = 64 / g;         // values per period (64 for half-integer K: one lane covers 2 columns)
     static constexpr int G = 256 / V;        // periods per tile (vector lanes)
-    static constexpr int WORDS = 8 * K;      // words per tile
+    static constexpr int WORDS = 4 * K2;     // words per tile
+    static constexpr int NHV = V > 32 ? V / 32 : 1;   // output columns per lane (accumulator halves)
+    // end bit of value u within its period
+    static constexpr int end(int u) { return HALF ? (u + 1) * (K / 10) + (u + 1) / 2 : (u + 1) * K; }
     static_assert(V >= 8, "K with gcd(K,32) > 4 (K=8) not supported by this kernel");
+    static_assert(!HALF || (K % 10 == 5 && K / 10 >= 1 && K / 10 <= 7), "half-integer K code is 10 * KA + 5");
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -126,7 +138,7 @@ ESIMD_INLINE simd<uint32_t, Geo<K>::G * TP> tile_states(simd<uint32_t, Geo<K>::W
     // become contiguous reads (Xe regions only stride by powers of two; stride 3 costs per-element moves)
     constexpr int SS = PL ? 1 : D;      // select stride
     constexpr int PS = PL ? G : 1;      // plane step
-    constexpr int e = (u + 1) * K;                       // end bit within period
+    constexpr int e = Geo<K>::end(u);                   // end bit within period
     constexpr int i1 = (e - 1) / 32;                     // word holding last bit
     constexpr int b0 = e - 16;                           // start bit (may be negative)
     constexpr int i0 = b0 >= 0 ? b0 / 32 : -1;           // word holding first bit
@@ -461,18 +473,42 @@ struct GemvKernel {
 #else
     static constexpr bool PLANAR = D > 1;
 #endif
-    static constexpr int TP = G >= 32 ? 1 : 32 / G;     // tiles decoded per vector op (K=6: 2)
+    // tiles decoded per vector op (K=6: 2); at most NT (half-integer K, G = 4: 16 lanes over the MoE's 4 tiles)
+    static constexpr int TP = G >= 32 ? 1 : (32 / G < NT ? 32 / G : NT);
     static constexpr int GV = G * TP;                   // vector lanes
     static constexpr int NP = NT / TP;                  // tile groups per thread
     static_assert(NT % TP == 0, "NT must be a multiple of the tile pairing");
-    // accumulator layout: acc[((m * NP + jp) * 2 + h) * GV + lane]
-    static constexpr int ACC = MR * NP * 2 * GV;
+    static constexpr int NHV = Geo<K>::NHV;             // output columns per lane (2 for half-integer K)
+    // accumulator layout: acc[(((m * NP + jp) * 2 + h) * NHV + hv) * GV + lane]
+    static constexpr int ACC = MR * NP * 2 * NHV * GV;
+    static ESIMD_INLINE constexpr int acc_at(int m, int jp, int h, int hv) { return (((m * NP + jp) * 2 + h) * NHV + hv) * GV; }
+
+    // 8 output columns of tile j, half h, from the lane accumulators: lane grp of a period of V values holds column
+    // V * grp / 32 (+ hv for V = 64); V < 32 sums groups of 32 / V adjacent lanes
+    template <int ACCN>
+    static ESIMD_INLINE simd<float, 8> cols(simd<float, ACCN>& acc, int m, int j, int h) {
+        simd<float, 8> s;
+        if constexpr (NHV == 1) {
+            constexpr int L = 32 / V;
+            int b = acc_at(m, j / TP, h, 0) + (j % TP) * G;
+            s = acc.template select<8, L>(b);
+#pragma unroll
+            for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
+        } else {
+            static_assert(G * NHV == 8, "one tile half = 8 columns");
+#pragma unroll
+            for (int hv = 0; hv < NHV; ++hv)
+                s.template select<G, NHV>(hv) = acc.template select<G, 1>(acc_at(m, j / TP, h, hv) + (j % TP) * G);
+        }
+        return s;
+    }
 
     template <int u>
     static ESIMD_INLINE void step(simd<uint32_t, NT * W>& words, simd<uint32_t, NT * W>& prev,
                                   simd<fp16, MR * 16>& xr, simd<fp16, ACC>& hacc, const fp16* lut) {
         if constexpr (u < V) {
             constexpr int h = (u >> 2) & 1;
+            constexpr int hv = u >> 5;                  // V = 64: second half of the period, next column
             // row(grp, u) = R0 + STR * (grp % P): a strided replicate of the 16-row x block
             constexpr int P = V == 8 ? 4 : (V == 16 ? 2 : 1);
             constexpr int STR = V == 8 ? 2 : (V == 16 ? 4 : 1);
@@ -488,7 +524,7 @@ struct GemvKernel {
 #endif
 #pragma unroll
                 for (int m = 0; m < MR; ++m) {
-                    auto a = hacc.template select<GV, 1>(((m * NP + jp) * 2 + h) * GV);
+                    auto a = hacc.template select<GV, 1>(acc_at(m, jp, h, hv));
                     a += v * xr.template replicate_vs_w_hs<GV / P, 0, P, STR>(m * 16 + R0);
                 }
             }
@@ -556,8 +592,7 @@ struct GemvKernel {
         }
         }
 
-        // reduce groups of L = 32/V adjacent lanes -> 8 columns per half, per tile
-        constexpr int L = 32 / V;
+        // lanes -> 8 columns per half, per tile
 #pragma unroll
         for (int m = 0; m < MR; ++m) {
             if (m >= M) break;
@@ -565,13 +600,7 @@ struct GemvKernel {
             for (int j = 0; j < NT; ++j) {
                 simd<float, 16> o;
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    int base = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
-                    simd<float, 8> s = acc.template select<8, L>(base);
-#pragma unroll
-                    for (int l = 1; l < L; ++l) s += acc.template select<8, L>(base + l);
-                    o.template select<8, 1>(h * 8) = s;
-                }
+                for (int h = 0; h < 2; ++h) o.template select<8, 1>(h * 8) = cols(acc, m, j, h);
                 block_store<float, 16>(part + ((size_t)p * M + m) * N + (tile_n0 + j) * 16, o);
             }
         }
@@ -629,6 +658,7 @@ struct DpasKernel {
     template <int u, class BT>
     static ESIMD_INLINE void build(simd<uint32_t, W>& dw, simd<uint32_t, W>& dwprev, BT&& Bv) {
         if constexpr (u < V) {
+            static_assert(!Geo<K>::HALF, "half-integer K: MoE experts only");
             constexpr int e = (u + 1) * K;
             constexpr int i1 = (e - 1) / 32;
             constexpr int b0 = e - 16;
@@ -878,6 +908,7 @@ struct ReconstructKernel {
     template <int u>
     static ESIMD_INLINE void build(simd<uint32_t, W>& dw, simd<uint32_t, W>& dwprev, simd<fp16, 256>& T) {
         if constexpr (u < V) {
+            static_assert(!Geo<K>::HALF, "half-integer K: MoE experts only");
             constexpr int e = (u + 1) * K;
             constexpr int i1 = (e - 1) / 32;
             constexpr int b0 = e - 16;

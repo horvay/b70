@@ -1,0 +1,145 @@
+{
+ "source": "exllamav3 eval/qbench_prompts.py CONVERSATIONS + CONVERSATIONS_ZH (MIT, Copyright (c) 2025 turboderp), github.com/turboderp-org/exllamav3; held out from the trace prompts",
+ "conversations": [
+  {
+   "prompt": "Four hikers reach a rope bridge at night with one flashlight. They cross in 1, 2, 5 and 10 minutes respectively; the bridge holds two people, and any crossing pair moves at the slower hiker's pace. The flashlight must be walked back, not thrown. Find the minimum total crossing time and prove it can't be beaten.",
+   "followups": [
+    "Re-derive the answer if the times are 1, 3, 4 and 6 minutes, and explain which strategy changes and why.",
+    "Now five hikers: 1, 2, 5, 10 and 12 minutes. What's the optimal time?"
+   ]
+  },
+  {
+   "prompt": "Write a Python class implementing a token-bucket rate limiter: configurable capacity and refill rate, a try_acquire(n) method, monotonic time, no busy-waiting. Explain the design.",
+   "followups": [
+    "Which edge cases could break it (clock behavior, bursts, fractional refill), and how does your implementation handle each?",
+    "Port it to TypeScript with the same semantics."
+   ]
+  },
+  {
+   "prompt": "Estimate how many fuel stations operate in Germany, showing your chain of reasoning from population and driving habits up to the final number.",
+   "followups": [
+    "Which single assumption dominates the error budget, and what range does the estimate cover if that assumption is off by a factor of 2 either way?",
+    "Repeat the estimate for Norway, where EV adoption is far higher."
+   ]
+  },
+  {
+   "prompt": "Explain why you hear thunder after seeing lightning, first for a curious 10-year-old, then for an engineering student — the second version should cover the actual acoustics of the shockwave and why distant thunder rumbles instead of cracking.",
+   "followups": [
+    "The student asks: why can you sometimes see lightning but never hear any thunder at all?",
+    "Write a five-question quiz covering both explanations, with an answer key."
+   ]
+  },
+  {
+   "prompt": "Plan a 12-day self-drive trip through New Zealand's South Island for two travelers who love mountains and wildlife but want to avoid tour-bus crowds, in early March. Day-by-day itinerary with driving times.",
+   "followups": [
+    "Rework the plan for a total budget of NZ$4500 excluding flights.",
+    "A storm closes the West Coast road on day 6. Replan the remaining days on the fly."
+   ]
+  },
+  {
+   "prompt": "Prove that log base 2 of 3 is irrational, then explain exactly which property of the integers the proof leans on.",
+   "followups": [
+    "Generalize: for which pairs of integers a, b > 1 is log base a of b rational? Prove your characterization.",
+    "Explain the proof to someone comfortable with fractions but who has never seen a proof by contradiction."
+   ]
+  },
+  {
+   "prompt": "Design a database schema for a multi-location physiotherapy clinic: practitioners, patients, appointment types, rooms, recurring availability, bookings, cancellations and waitlists. Give the DDL and justify the key modeling decisions.",
+   "followups": [
+    "The clinic adds video consultations that don't occupy rooms but still bill. What changes?",
+    "Write the four queries the reception desk runs constantly, with indexes to support them."
+   ]
+  },
+  {
+   "prompt": "Three roommates share an apartment. Rent is $2,340, split in proportion to bedroom size: Dana's room is 14 m², Eli's is 11 m², Fern's is 9 m². Utilities add $187 split evenly, and Eli gets a $40 credit for handling maintenance. Compute what each person owes, to the cent, and verify the totals reconcile.",
+   "followups": [
+    "Present the full calculation as a table and double-check every rounding step.",
+    "Now redo the split if the utility bill is instead divided in the same proportion as rent."
+   ]
+  },
+  {
+   "prompt": "Summarize the main economic arguments for and against a substantially higher minimum wage, citing the standard competitive and monopsony models, then give your overall read of the empirical literature.",
+   "followups": [
+    "Steelman the position your overall read went against, as persuasively as you can.",
+    "How do the arguments change for a regional minimum wage indexed to local median income?"
+   ]
+  },
+  {
+   "prompt": "Write a 400-word short story about a museum night guard who notices that one painting is slightly different every morning, with an ending that recontextualizes the whole story.",
+   "followups": [
+    "Critique your story's use of foreshadowing and rewrite the weakest paragraph.",
+    "Retell the same events as a sequence of terse incident reports filed by the guard."
+   ]
+  },
+  {
+   "prompt": "四名徒步者在夜里到达一座绳桥，只有一只手电筒。他们过桥分别需要1、2、5和10分钟；桥一次最多承载两人，同行的两人必须按较慢者的速度前进。手电筒必须有人拿回来，不能扔过去。求最短的总过桥时间，并证明无法更短。",
+   "followups": [
+    "如果四人的时间改为1、3、4和6分钟，重新推导答案，并说明策略在哪里变了、为什么。",
+    "现在有五名徒步者：1、2、5、10和12分钟。最优时间是多少？"
+   ]
+  },
+  {
+   "prompt": "用Python写一个令牌桶限流器类：容量和填充速率可配置，提供try_acquire(n)方法，使用单调时钟，不要忙等待。解释你的设计。",
+   "followups": [
+    "哪些边界情况可能让它出错（时钟行为、突发流量、非整数填充），你的实现分别是怎么处理的？",
+    "把它移植到TypeScript，保持相同的语义。"
+   ]
+  },
+  {
+   "prompt": "估算德国有多少座加油站在营业，从人口和驾驶习惯出发，一步步展示推理链，直到给出最终数字。",
+   "followups": [
+    "哪一个假设对误差影响最大？如果这个假设偏差两倍（无论偏大还是偏小），估算值的范围是多少？",
+    "对挪威重复这个估算，那里的电动车普及率高得多。"
+   ]
+  },
+  {
+   "prompt": "解释为什么先看到闪电、后听到雷声：先讲给一个好奇的10岁孩子听，再讲给一个工科大学生听——第二个版本要涵盖冲击波的实际声学原理，以及为什么远处的雷声是隆隆声而不是炸响。",
+   "followups": [
+    "这个学生接着问：为什么有时候能看到闪电，却完全听不到雷声？",
+    "围绕这两种解释出一份五道题的小测验，并附答案。"
+   ]
+  },
+  {
+   "prompt": "为两位热爱山地和野生动物、但想避开旅游大巴人群的旅行者，规划一次12天的新西兰南岛自驾游，时间在三月初。给出逐日行程和驾驶时间。",
+   "followups": [
+    "把计划改成总预算4500新西兰元（不含机票）。",
+    "第6天一场风暴封闭了西海岸公路。临时重新规划剩下的行程。"
+   ]
+  },
+  {
+   "prompt": "证明以2为底3的对数是无理数，然后准确说明这个证明依赖整数的哪一条性质。",
+   "followups": [
+    "推广：对于哪些整数对a, b > 1，以a为底b的对数是有理数？证明你的刻画。",
+    "向一个熟悉分数、但从未见过反证法的人解释这个证明。"
+   ]
+  },
+  {
+   "prompt": "为一家多门店物理治疗诊所设计数据库模式：治疗师、患者、预约类型、诊室、周期性的可用时段、预约、取消和候补名单。给出DDL并说明关键建模决策的理由。",
+   "followups": [
+    "诊所新增了视频问诊，不占用诊室但仍然计费。需要改什么？",
+    "写出前台最常执行的四条查询，并给出支持它们的索引。"
+   ]
+  },
+  {
+   "prompt": "三个室友合租一套公寓。房租2340美元，按卧室面积比例分摊：Dana的房间14平方米，Eli的11平方米，Fern的9平方米。水电费187美元平均分摊，Eli因为负责维修获得40美元抵扣。计算每人应付多少（精确到美分），并核对总额是否对得上。",
+   "followups": [
+    "把完整计算过程列成表格，并逐一复核每个四舍五入步骤。",
+    "如果水电费改为按与房租相同的比例分摊，重新计算。"
+   ]
+  },
+  {
+   "prompt": "总结大幅提高最低工资的主要经济学论据（支持与反对），引用标准的竞争模型和买方垄断模型，然后给出你对实证研究文献的总体判断。",
+   "followups": [
+    "尽可能有说服力地为你总体判断所不支持的那一方做最强辩护。",
+    "如果是与当地收入中位数挂钩的地区性最低工资，这些论据会有什么变化？"
+   ]
+  },
+  {
+   "prompt": "写一篇400字的短篇小说：一位博物馆夜班保安发现某幅画每天早上都有细微的不同，结尾要让整个故事的意义发生反转。",
+   "followups": [
+    "评价你这篇故事中伏笔的运用，并重写最弱的一段。",
+    "把同样的事件改写成保安提交的一系列简短事件报告。"
+   ]
+  }
+ ]
+}

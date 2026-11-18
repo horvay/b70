@@ -1,0 +1,6 @@
+  layer 60 (207 s)
+
+101700 scored tokens in 199 conversations. Against Gemma 4 31B-based (BF16):
+  model                                        KL(bf16||m) [95% CI]       top-1 [95% CI]             median   p99 KL     ppl
+  Gemma 4 31B-based (BF16)                 -                          -                               -        - 753.199
+  Gemma 4 31B-based-exl3-4.0bpw            0.9131 [0.8326, 0.9948]    74.49% [73.14, 75.93]     0.07108  12.1048 815.346
