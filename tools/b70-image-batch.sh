@@ -54,7 +54,7 @@ if n == 0:
 EOF
 
 # Context (model) options of the sd-cli command line; everything else is per job.
-ctx_with_value=" --diffusion-model --llm --vae --lora-model-dir --llm_vision --tokenizer "
+ctx_with_value=" --diffusion-model --llm --vae --lora-model-dir --llm_vision --tokenizer --params-backend "
 ctx_flags=" --diffusion-fa --vae-conv-direct -v "
 
 base=() base_key="" base_env=() vision="" outs=() logs=()
@@ -115,7 +115,7 @@ for ((j = 0; j < n; j++)); do echo "  $((j + 1)): ${outs[j]}"; done
 if [[ $("$SD_FAST_BIN" --help 2>/dev/null | grep -c -- --multi-jobs) -gt 0 ]]; then
   env ${base_env[@]+"${base_env[@]}"} "$SD_FAST_BIN" "${base[@]}" --multi-jobs "$JOBS_JSONL" > "$BATCH_LOG" 2>&1 &
 else
-  # Builds without --multi-jobs (MiniMax-H3-Image's upstream sd.cpp-h3img): one process per still, in order, with the
+  # Builds without --multi-jobs (sd.cpp-h3img has it since 2026-11-17; this stays for older builds): one process per still, in order, with the
   # same "[multi] job N/M start:/saved" markers in BATCH_LOG, so callers follow and split it the same way.
   (
     for ((j = 1; j <= n; j++)); do

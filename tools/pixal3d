@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Pixal3D (TencentARC, single image -> 3D mesh) on the Arc Pro B70: engines/sd.cpp/xpu_sdpa/xpu_pixal3d (SYCL + oneDNN).
+#   tools/pixal3d IMAGE -o OUT.glb [--res 512|1024|1536]    or    tools/pixal3d --views DIR -o OUT.glb ...
+#   tools/pixal3d IMAGE -o OUT.glb [--res 512|1024|1536] [--seed N] [--fov RAD] [--steps N] [--no-tex] [--decimate FACES] [--keep DIR]
+# IMAGE: RGBA whose alpha is the subject mask (some pixels below 128; Qwen PNGs carry a 254/255 alpha that is no mask), or a studio shot on a plain neutral backdrop (keyed out by
+# pixal3d/key_bg.py, no model). Every model runs on the B70 through the b70q queue; nothing runs a model on the CPU.
+# Not ported yet: BiRefNet background removal (other backgrounds) and the MoGe-2 FOV estimate, so --fov sets the
+# camera (default 0.4 rad, about an 85 mm portrait; upstream suggests 0.2 when faces look distorted).
+# OUT: .glb (Y up, facing +Z) or .obj. Texture (per-vertex base colour) is on at --res 1024/1536 unless --no-tex.
+# --decimate N: write OUT reduced to about N faces by vertex clustering (2 s; colour stays clean down to ~300000).
+#   --keep-full also writes the full mesh to OUT_full.glb (hundreds of MB); --collapse uses edge collapse (stalls high).
+# Defaults as upstream's inference.py: seed 42, 12 steps per stage, --res 1024 (1536 is upstream's standard mode).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+B70=$(dirname "$ROOT")
+X=$B70/engines/sd.cpp/xpu_sdpa
+PY=${PIXAL3D_PY:-$HOME/ai/ComfyUI/.venv/bin/python}  # numpy/scipy/PIL for key_bg.py only
+
+usage() { sed -n 2,13p "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+IMAGE="" VIEWS="" OUT="" RES=1024 SEED=42 FOV=0.4 STEPS=12 KEEP="" TEX=1 DEC=0 EXTRA=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out) OUT="$2"; shift 2 ;;
+    --views) VIEWS=$(readlink -f "$2"); shift 2 ;;  # multi-view folder: transforms.json + RGBA views (the _mv weights)
+    --res) RES="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    --fov) FOV="$2"; shift 2 ;;
+    --steps) STEPS="$2"; shift 2 ;;
+    --keep) KEEP="$2"; shift 2 ;;
+    --no-tex) TEX=0; shift ;;
+    --decimate) DEC="$2"; shift 2 ;;
+    --keep-full|--collapse) EXTRA+=("$1"); shift ;;
+    -h|--help) usage 0 ;;
+    -*) echo "pixal3d: unknown option $1" >&2; usage 2 ;;
+    *) [[ -z $IMAGE ]] || usage 2; IMAGE="$1"; shift ;;
+  esac
+done
+[[ ( -n $IMAGE || -n $VIEWS ) && -n $OUT ]] || usage 2
+[[ -n $VIEWS || -f $IMAGE ]] || { echo "pixal3d: no such image: $IMAGE" >&2; exit 2; }
+case $RES in 512|1024|1536) ;; *) echo "pixal3d: --res must be 512, 1024 or 1536" >&2; exit 2 ;; esac
+[[ $RES == 512 ]] && TEX=0
+OUT=$(readlink -f "$OUT")
+WORK=${KEEP:-$(mktemp -d "${TMPDIR:-/tmp}/pixal3d.XXXXXX")}
+mkdir -p "$WORK"
+[[ -n $KEEP ]] || trap 'rm -rf "$WORK"' EXIT
+
+if [[ -z $VIEWS ]]; then
+# subject mask: the image's own alpha, else key out the plain backdrop (no model)
+if python3 -c "import sys; from PIL import Image; im=Image.open(sys.argv[1]); sys.exit(0 if im.mode in ('RGBA','LA') and im.getextrema()[-1][0] < 128 else 1)" "$IMAGE"; then
+  RGBA=$(readlink -f "$IMAGE")
+else
+  RGBA=$WORK/rgba.png
+  "$PY" "$X/pixal3d/key_bg.py" "$IMAGE" "$RGBA" >&2
+fi
+
+fi
+if [[ -n $VIEWS ]]; then SRC=(--views "$VIEWS"); else SRC=(--image "$RGBA"); fi
+CMD=("$X/xpu_pixal3d" "${SRC[@]}" --out "$OUT" --res "$RES" --seed "$SEED" --fov "$FOV" --steps "$STEPS")
+(( TEX )) && CMD+=(--tex)
+(( DEC > 0 )) && CMD+=(--decimate "$DEC" "${EXTRA[@]}")
+[[ -n $KEEP ]] && CMD+=(--dump "$WORK" --ply "$WORK/raw.ply")
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+if [[ -n ${B70Q_TICKET:-} ]]; then
+  "${CMD[@]}"
+else
+  b70-lease run "${B70_OWNER:-pixal3d}" --note "pixal3d $(basename "${IMAGE:-$VIEWS}") res $RES" -- "${CMD[@]}"
+fi

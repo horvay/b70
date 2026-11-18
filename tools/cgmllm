@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# CG-MLLM 4B image-to-3D (JreamH/CGMLLM-4B-i2o: an 8.5 B parameter Qwen3-VL-based model that generates a shape from one
+# image) on the Arc Pro B70: engines/sd.cpp/xpu_sdpa/xpu_cgmllm (SYCL + oneDNN, no torch).
+#   tools/cgmllm IMAGE -o OUT.glb [--seed N] [--steps N] [--cfg X] [--octree 256|384|512] [--border X] [--decimate FACES] [--keep DIR]
+# IMAGE: RGBA whose alpha is the subject mask (some pixels below 128), or a studio shot on a plain neutral backdrop
+# (keyed out by pixal3d/key_bg.py, no model). Upstream removes backgrounds with rembg (u2net); that is not ported.
+# OUT: .glb or .obj, shape only (the model makes no colour). --octree: grid cells per side for the surface
+# (upstream: 512). --decimate N: also write OUT reduced to about N faces (the full mesh goes to OUT_full.glb).
+# Defaults as upstream's inference.py --mode i2obj: 50 timesteps, image CFG 7.5, border 0.15. Every model runs on the
+# B70 through the b70q queue; nothing runs a model on the CPU. Weights: xpu_sdpa/cgmllm/fetch_models.sh.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+B70=$(dirname "$ROOT")
+X=$B70/engines/sd.cpp/xpu_sdpa
+PY=${CGMLLM_PY:-$HOME/ai/ComfyUI/.venv/bin/python}  # numpy/scipy/PIL for key_bg.py only
+
+usage() { sed -n 2,10p "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+IMAGE="" OUT="" KEEP="" ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out) OUT="$2"; shift 2 ;;
+    --seed|--steps|--cfg|--octree|--border|--decimate) ARGS+=("$1" "$2"); shift 2 ;;
+    --keep-floaters) ARGS+=("$1"); shift ;;
+    --keep) KEEP="$2"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    -*) echo "cgmllm: unknown option $1" >&2; usage 2 ;;
+    *) [[ -z $IMAGE ]] || usage 2; IMAGE="$1"; shift ;;
+  esac
+done
+[[ -n $IMAGE && -n $OUT ]] || usage 2
+[[ -f $IMAGE ]] || { echo "cgmllm: no such image: $IMAGE" >&2; exit 2; }
+OUT=$(readlink -f "$OUT")
+WORK=${KEEP:-$(mktemp -d "${TMPDIR:-/tmp}/cgmllm.XXXXXX")}
+mkdir -p "$WORK"
+[[ -n $KEEP ]] || trap 'rm -rf "$WORK"' EXIT
+
+# subject mask: the image's own alpha, else key out the plain backdrop (no model)
+if python3 -c "import sys; from PIL import Image; im=Image.open(sys.argv[1]); sys.exit(0 if im.mode in ('RGBA','LA') and im.getextrema()[-1][0] < 128 else 1)" "$IMAGE"; then
+  RGBA=$(readlink -f "$IMAGE")
+else
+  RGBA=$WORK/rgba.png
+  "$PY" "$X/pixal3d/key_bg.py" "$IMAGE" "$RGBA" >&2
+fi
+
+CMD=("$X/xpu_cgmllm" --image "$RGBA" --out "$OUT" "${ARGS[@]}")
+[[ -n $KEEP ]] && CMD+=(--dump "$WORK")
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+if [[ -n ${B70Q_TICKET:-} ]]; then
+  "${CMD[@]}"
+else
+  b70-lease run "${B70_OWNER:-cgmllm}" --note "cgmllm $(basename "$IMAGE")" -- "${CMD[@]}"
+fi

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Hunyuan3D 2.1 image -> textured 3D mesh (tencent/Hunyuan3D-2.1: the shape model and the PBR paint model) on the Arc Pro
+# B70: engines/sd.cpp/xpu_sdpa/xpu_hunyuan3d (SYCL + oneDNN, no torch).
+#   tools/hunyuan3d IMAGE -o OUT.glb [--seed N] [--steps N] [--cfg X] [--octree 256|384|512] [--faces N] [--paint-steps N]
+#                   [--no-paint] [--png] [--keep DIR] [--mv FRONT,LEFT,BACK,RIGHT [--mv-model turbo|mv]]
+# --mv: the shape from up to four RGBA views with Hunyuan3D-2mv (tencent/Hunyuan3D-2mv; an empty slot skips a view;
+# LEFT is the object's left side, its front toward the picture's left edge); IMAGE is then only the paint reference.
+# Default turbo, 5 steps; --mv-model mv (30 steps, CFG) needs fetch_models.sh --mv.
+# IMAGE: RGBA whose alpha is the subject mask (some pixels below 128), or a studio shot on a plain neutral backdrop
+# (keyed out by pixal3d/key_bg.py, no model). Upstream removes backgrounds with rembg; that is not ported.
+# OUT: one GLB (glTF frame: Y up, front +Z) with --faces triangles (default 40000, upstream's), UVs, and 2048 base colour
+# and metallic-roughness textures (JPEG; --png for PNG). --no-paint: the untextured mesh only.
+# Defaults as upstream (shape 50 steps, CFG 5) except the surface grid: 512, sampled coarse to fine, finer and twice
+# as fast as upstream's dense 384; paint 6 views, 15 steps, guidance 3, Real-ESRGAN 4x.
+# --keep DIR keeps the intermediate images (control maps, painted views, textures) and tensor dumps.
+# Every model runs on the B70 through the b70q queue; mesh and texture work runs on the CPU.
+# Weights: engines/sd.cpp/xpu_sdpa/hunyuan3d/fetch_models.sh.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+B70=$(dirname "$ROOT")
+X=$B70/engines/sd.cpp/xpu_sdpa
+PY=${HY3D_PY:-$HOME/ai/ComfyUI/.venv/bin/python}  # numpy/scipy/PIL for key_bg.py only
+
+usage() { sed -n 2,16p "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+IMAGE="" OUT="" KEEP="" ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out) OUT="$2"; shift 2 ;;
+    --seed|--steps|--cfg|--octree|--border|--faces|--paint-steps|--mv|--mv-model) ARGS+=("$1" "$2"); shift 2 ;;
+    --no-paint|--png|--keep-floaters) ARGS+=("$1"); shift ;;
+    --keep) KEEP="$2"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    -*) echo "hunyuan3d: unknown option $1" >&2; usage 2 ;;
+    *) [[ -z $IMAGE ]] || usage 2; IMAGE="$1"; shift ;;
+  esac
+done
+[[ -n $IMAGE && -n $OUT ]] || usage 2
+[[ -f $IMAGE ]] || { echo "hunyuan3d: no such image: $IMAGE" >&2; exit 2; }
+OUT=$(readlink -f "$OUT")
+WORK=${KEEP:-$(mktemp -d "${TMPDIR:-/tmp}/hunyuan3d.XXXXXX")}
+mkdir -p "$WORK"
+[[ -n $KEEP ]] || trap 'rm -rf "$WORK"' EXIT
+
+# subject mask: the image's own alpha, else key out the plain backdrop (no model)
+if python3 -c "import sys; from PIL import Image; im=Image.open(sys.argv[1]); sys.exit(0 if im.mode in ('RGBA','LA') and im.getextrema()[-1][0] < 128 else 1)" "$IMAGE"; then
+  RGBA=$(readlink -f "$IMAGE")
+else
+  RGBA=$WORK/rgba.png
+  "$PY" "$X/pixal3d/key_bg.py" "$IMAGE" "$RGBA" >&2
+fi
+
+CMD=("$X/xpu_hunyuan3d" --image "$RGBA" --out "$OUT" "${ARGS[@]}")
+[[ -n $KEEP ]] && CMD+=(--dump "$WORK")
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+if [[ -n ${B70Q_TICKET:-} ]]; then
+  "${CMD[@]}"
+else
+  b70-lease run "${B70_OWNER:-hunyuan3d}" --note "hunyuan3d $(basename "$IMAGE")" -- "${CMD[@]}"
+fi

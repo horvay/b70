@@ -31,6 +31,7 @@ decode and writing wavs, but not the one-time model load (10-18 s).
 | Final + fused projections (`D3_FUSE` unset, i.e. on; off by default) | eval 20 | 67.8 ms (-8%) | ~0.148 expected | ~29 GiB | 1.3% / 0.748 (20) |
 | Final, batch 32, activations padded to 128 columns (`D3_PAD_N=128 D3_PAD_TYPES=f16,q8_0`) | bench 96 | 131.6 ms | ~0.130 at full slot use | 31.7 GiB (too close to 32) | not scored |
 | **ggml SYCL backend instead of Vulkan (`D3_BACKEND=sycl`, horvay/audio.cpp 3bf3607: XMX matmuls for 2-32 rows, fused MUL_MAT_ID, oneMKL transposed conv), batch 16** | **bench 256** | **51.0 ms** | **0.132** | not measured | **0.7% / 0.752 (20)** |
+| SYCL, batch 16 / **24** / 32 (capacity 768), `batchsize.sh` (2026-11-18) | bench 128 | | 0.167 / **0.120** / 0.123 | 29.8 / **30.3** / 30.8 GiB | not scored; on SYCL batch 24 pays, 32 does not. Use 24 |
 
 ## Where the time goes (stock port)
 

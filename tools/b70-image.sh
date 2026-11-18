@@ -82,6 +82,7 @@ Qwen Image 2.1 Q8_0 + Qwen3-VL Q8_0 on the B70, euler sampler. <lora:NAME:W> in 
               named <Picture 1>, <Picture 2>... in the prompt. Native 16 MP (4096x4096; 4736x3552, 5024x3360, 5472x3072,
               6272x2688 and their portraits); works from about 4 MP. Sides are multiples of 32. Default 2048x2048.
               The transformer blocks always run in libxpu_h3 (int8 W8A8, SD_XPU_H3_INT8=1); <lora:> tags go to it.
+              --batch runs every still in one process (sd-cli --multi-jobs): the blocks and encoders load once.
 --turbo (MOSS): the 8-step DMD2 LoRA (loras/moss_base_8step_dmd2), 8 steps, CFG 1.
 --hires (MOSS): a second pass at 1.5x (Lanczos, 8 steps, denoise 0.15). HIRES_SCALE, HIRES_STEPS and
 HIRES_STRENGTH override those.
@@ -161,7 +162,8 @@ case "$MODEL" in
     fi ;;
   h3)
     MODELS="${H3_IMAGE_DIR:-$HOME/models/image/minimax-h3-image}"
-    [[ -z "$SD_CLI_SET" ]] && SD_CLI="$B70/engines/sd.cpp-h3img/build-sycl/bin/sd-cli" SD_FAST_BIN="$SD_CLI"
+    # the installed copy (build_sycl.sh renames it into place when a build is done), not the build tree's file
+    [[ -z "$SD_CLI_SET" ]] && SD_CLI="$B70/engines/sd.cpp-h3img/bin/sd-cli" SD_FAST_BIN="$SD_CLI"
     model_file=diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors
     llm_file=$te/qwen3vl_32b_minimax_h3-Q4_K_M.gguf vision_file=""   # the GGUF holds the vision tower
     vae_file=vae/minimax_h3_image_vae_fp16.safetensors
@@ -235,6 +237,9 @@ if [[ "$XPU" -eq 1 ]]; then
     # the tags are the block library's alone (the ggml graph has no blocks to apply them to)
     PROMPT=$(sed -E 's/<lora:[^>]*>//g' <<<"$PROMPT")
     extra+=(--offload-to-cpu --rng cpu)
+    # H3_VAE_RESIDENT=1: the 1.1 GB VAE stays on the card (not offloaded with the text encoder), so a batch does not
+    # copy it over for every reference encode and decode
+    [[ ${H3_VAE_RESIDENT:-0} == 1 ]] && extra+=(--params-backend "vae=SYCL0")
   elif [[ "$MODEL" == qwen ]]; then
     export SD_XPU_QWEN21_LIB="${SD_XPU_QWEN21_LIB:-$XPU_DIR/libxpu_qwen21.so}" SD_XPU_QWEN21_VERBOSE=1
     export SD_XPU_QWEN21_WEIGHTS="${SD_XPU_QWEN21_WEIGHTS:-$MODELS/noctQAnime_v10_int8_convrot.safetensors}"
