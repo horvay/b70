@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# End-to-end check of b70q with a private daemon (own socket, port 7871, state in a temp dir, no legacy lock, 15 s turns,
-# 4 s grace). Jobs are `sleep`/`sh`, never the GPU, so this is safe while the real queue runs.
+# End-to-end check of b70q with a private daemon (own socket, port 7871, state in a temp dir, no legacy lock, a card it
+# sees as unused). Jobs are `sleep`/`sh`, never the GPU, so this is safe while the real queue runs.
 # usage: test/smoke.sh
 set -u
 cd "$(dirname "$0")/.."
 T=$(mktemp -d /tmp/b70q-smoke.XXXX)
-export B70Q_STATE=$T/state B70Q_SOCKET=$T/b70q.sock B70Q_PORT=7871 B70Q_LEGACY_LOCK=off B70Q_TURN_MIN=0.25 B70Q_GRACE_S=4 B70_LEASE_POLL=600
+export B70Q_STATE=$T/state B70Q_SOCKET=$T/b70q.sock B70Q_PORT=7871 B70Q_LEGACY_LOCK=off B70_LEASE_POLL=600 B70Q_TEST_EMPTY_CARD=1
 L=$PWD/bin/b70-lease Q=$PWD/bin/b70q DB=$T/state/b70q.db
 bun src/daemon.ts > $T/daemon.log 2>&1 < /dev/null & D=$!
 trap 'kill $D 2>/dev/null; wait $D 2>/dev/null; [[ -n ${KEEP:-} ]] && echo "kept $T" || rm -rf $T' EXIT
@@ -23,19 +23,19 @@ check "status shows the acquire holder" "$($L status | head -1 | grep -c "t-acq 
 out=$($L run t-acq -- echo same-owner 2>/dev/null); check "same-owner run nests in the acquire" "$out" same-owner
 $L release $tok 2>/dev/null; check "release frees the card" "$($L status | head -1)" "lease: free"
 
-# turns: loopA loops 3 s jobs; B, C arrive at 1 s, 2 s; nq-gm (next in line) at 8 s
+# first in, first out (Greg, 2026-11-17): loopA queues its next 3 s job right after each one ends and still waits
+# behind B (1 s) and C (2 s); an nq owner (4 s) gets no priority; only --next (5 s) moves up, once B is done.
 first=$(( $(q 'SELECT MAX(id) FROM tickets') + 1 ))
-for i in 1 2; do $L run loopA -- true 2>/dev/null; done   # history: loopA loops
-first=$(( $(q 'SELECT MAX(id) FROM tickets') + 1 ))
-( for i in 1 2 3 4 5 6 7; do $L run loopA -- sleep 3 2>/dev/null; done ) & P1=$!
+( for i in 1 2 3 4; do $L run loopA -- sleep 3 2>/dev/null; done ) & P1=$!
 sleep 1; $L run ownerB -- sleep 3 2>/dev/null & P2=$!
 sleep 1; $L run ownerC -- sleep 3 2>/dev/null & P3=$!
-sleep 6; $L run nq-gm -- sleep 2 2>/dev/null & P4=$!
-wait $P1 $P2 $P3 $P4   # (a bare wait would also wait for the daemon)
+sleep 2; $L run nq-gm -- sleep 2 2>/dev/null & P4=$!
+sleep 1; $L run prio --next -- sleep 2 2>/dev/null & P5=$!
+wait $P1 $P2 $P3 $P4 $P5   # (a bare wait would also wait for the daemon)
 order=$(q "SELECT group_concat(owner, ' ') FROM (SELECT owner FROM tickets WHERE id >= $first ORDER BY granted_at)")
-check "turns + next in line" "$order" "loopA loopA loopA nq-gm loopA loopA ownerB ownerC loopA loopA"
-gaps=$(q "SELECT MAX(b.granted_at - a.ended_at) FROM tickets a JOIN tickets b ON b.granted_at = (SELECT MIN(granted_at) FROM tickets WHERE granted_at > a.granted_at) WHERE a.id >= $first AND a.owner IN ('ownerB','ownerC','nq-gm')")
-check "no idle gap after one-off jobs" "$(( gaps < 1000 ))" 1
+check "first in, first out; only --next moves up" "$order" "loopA ownerB prio ownerC loopA nq-gm loopA loopA"
+gaps=$(q "SELECT MAX(b.granted_at - a.ended_at) FROM tickets a JOIN tickets b ON b.granted_at = (SELECT MIN(granted_at) FROM tickets WHERE granted_at > a.granted_at) WHERE a.id >= $first AND b.id >= $first")
+check "no idle gap between jobs" "$(( gaps < 1000 ))" 1
 
 $L run hold -- sleep 3 2>/dev/null & H=$!; sleep 0.5
 $L run waiter -- true 2>/dev/null & W=$!; sleep 1; kill -TERM $W; wait $W; check "SIGTERM while waiting exits 143" $? 143
@@ -56,6 +56,13 @@ check "a submit that can't start fails" "$(q "SELECT state FROM tickets WHERE id
 $Q pause testing >/dev/null; $L run during-pause -- true 2>/dev/null & W=$!; sleep 2
 check "pause holds the queue" "$(q "SELECT state FROM tickets WHERE owner='during-pause'")" waiting
 $Q resume >/dev/null; wait $W; check "resume releases it" "$(q "SELECT state FROM tickets WHERE owner='during-pause'")" done
+# pause while a job runs: it finishes, the next one waits until resumed
+$L run p-run -- sleep 2 2>/dev/null & R=$!; sleep 0.5; $L run p-next -- true 2>/dev/null & W=$!; sleep 0.3
+$Q pause testing >/dev/null
+check "paused with a job on the card: status says so" "$(curl -s --unix-socket $B70Q_SOCKET http://x/api/state | grep -c 'nothing new starts after it')" 1
+wait $R; check "...the job finishes" $? 0
+sleep 1.5; check "...and the next one waits" "$(q "SELECT state FROM tickets WHERE owner='p-next'")" waiting
+$Q resume >/dev/null; wait $W; check "...until resumed" "$(q "SELECT state FROM tickets WHERE owner='p-next'")" done
 check "status format" "$($L status | sed -n '1s/^lease: .*/lease/p;2s/^vram_gib: [0-9.]*$/vram/p' | tr '\n' ' ')" "lease vram "
 check "second daemon refuses to start" "$(timeout 5 bun src/daemon.ts 2>&1 | grep -c 'already running')" 1
 
@@ -79,6 +86,13 @@ check "exit file written once, at the end" "$(cat $W2/chunk.log.exit)" 0
 rm -f $W2/count; id=$(cd $W2 && $Q submit t-chunk2 --chunked -- sh chunk.sh 2>/dev/null); $Q wait $id 2>/dev/null; rc=$?
 check "wait follows a chunked job to its last chunk" "$rc $(q "SELECT COUNT(*) FROM tickets WHERE grp=$id AND state='done'")" "0 3"
 check "on-exit hook ran once" "$(wc -l < $W2/hook.out | tr -d ' ') $(cut -d' ' -f2,3 $W2/hook.out)" "1 0 done"
+
+# a chunk queues at the back: a job queued while chunk 1 runs gets the card before chunk 2 (--no-turn is accepted, old)
+mkdir -p $W2/nt; printf 'sleep 2\n' > $W2/nt/slow.sh; cat $W2/chunk.sh >> $W2/nt/slow.sh
+id=$(cd $W2/nt && $Q submit t-noturn --chunked --no-turn -- sh slow.sh 2>/dev/null); sleep 1
+oid=$($Q submit t-other -- sleep 1 2>/dev/null); $Q wait $id 2>/dev/null
+check "another job runs between chunks" \
+  "$(q "SELECT (SELECT granted_at FROM tickets WHERE id=$oid) < (SELECT granted_at FROM tickets WHERE grp=$id AND chunk=1)")" 1
 
 # retries: fails once, then succeeds
 cat > $W2/flaky.sh <<'EOS'

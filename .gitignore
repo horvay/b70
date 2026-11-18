@@ -1,3 +1,16 @@
 # build outputs and local state live inside the submodules / subtrees; nothing here but code
 *.log
 __pycache__/
+# engines that are plain clones with their own history (see AGENTS.md), not part of this repo
+/engines/llama.cpp/
+/engines/sd.cpp-h3img/
+/engines/sd.cpp-moss/
+# glm.cpp build trees, A/B snapshots, compiled review binaries
+/engines/glm.cpp/build/
+/engines/glm.cpp/build-*/
+/engines/glm.cpp/snap-*/
+/engines/glm.cpp/review/decode_trace
+/engines/glm.cpp/review/graph-smoke
+*.o
+# test picture of a real-looking bank statement: not published
+/engines/glm.cpp/tests/q35v_test.jpg

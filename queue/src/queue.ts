@@ -1,10 +1,18 @@
 // The B70 queue: who has the card, who waits, and what the card is doing.
 //
-// One holder at a time. Waiting tickets are served FIFO with 30-minute turns: an owner whose jobs come in a loop
-// (an H3 batch, Drama 3 chunks) keeps the card for its next job while its turn lasts, then the oldest ticket of another
-// owner goes next. Tickets with priority (NQ's game master, `b70q now`) go next in line, ahead of turns. Nothing is
-// ever preempted. The card is only granted when nothing outside the queue is using it: processes without a ticket
+// One holder at a time. Waiting tickets are served first in, first out, and nothing else (Greg, 2026-11-17: no turns,
+// no owner rules). Only the submitter can move a ticket up: `--next` or `b70q now` puts it ahead of the tickets
+// without priority, still in arrival order among the ones that have it. A chunk or retry of a job queues at the back
+// like a new job. Nothing is ever preempted. The card is only granted when nothing outside the queue is using it: processes without a ticket
 // (Greg's manual runs), leftovers of an ended ticket, or a holder of the old flock-based lease.
+//
+// Standby servers (opts.standby, a chat model server) are models that stay loaded until the card is wanted for something
+// else. Several can be registered (one per owner); the one loaded last is the current one. It loads when nothing else
+// wants the card (it waits at the back with opts.when_free until the card has been free for STANDBY_SETTLE_MS) and steps
+// aside when a job arrives while it is not in use. The others stay unloaded until a request comes for one: that one goes
+// to the back of the line like any job (never ahead of it) and, once loaded, is the current one. It reports whether it is
+// in use (activity()), so a request in flight is never cut off; a standby server that doesn't report is judged by the
+// GPU and stopped instead.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Database } from "bun:sqlite";
@@ -17,7 +25,7 @@ export interface Alert { id: number; key: string; t: number; level: "info" | "wa
 export interface Usage { vram: number; gtt: number; sys: number; rss: number; busy: number; cpu: number; pids: number[] }
 export interface Other { pid: number; comm: string; cmd: string; vram: number; gtt: number; sys: number; busy: number; why: "outside" | "leftover"; ticket?: number; owner?: string }
 export interface RingPoint { t: number; vram: number; power?: number; util?: number; temp?: number; vramTemp?: number; memAvail: number; holder?: number; hvram?: number; hgtt?: number; hsys?: number; hrss?: number }
-export type CardStatus = { kind: "idle" | "running" | "paused" | "outside" | "leftover" | "legacy" | "fault" | "reserved" | "vram" | "ram"; text: string };
+export type CardStatus = { kind: "idle" | "running" | "paused" | "outside" | "leftover" | "legacy" | "fault" | "vram" | "ram"; text: string };
 
 const now = () => Date.now();
 const gib = (b: number) => (b / 2 ** 30).toFixed(1);
@@ -33,14 +41,14 @@ export class Queue {
   status: CardStatus = { kind: "idle", text: "idle" };
   paused = false; pauseReason = "";
   faultUntil = 0; faults: number[] = [];
-  turn?: { owner: string; since: number; lastEnd?: number };
-  reserve?: { owner: string; until: number };
+  standbyOrder: string[] = []; // owners of standby servers in the order they last loaded: the last one is the current one
   alerts = new Map<string, Alert>();
   private waiters = new Map<number, Set<() => void>>();
   private listeners = new Set<(ev: string, data: unknown) => void>();
   private legacyFd = -1;
   private legacyHeld = false;
-  private health = new Map<number, { lastActive: number; cpu: number; cpuRate: number; vram: number; idleSince?: number; gpuIdleSince?: number }>();
+  private health = new Map<number, Health>();
+  private freeSince = now(); // when the card last became free: a standby server loads once it has been free a while
   private aggFrom = now();
   private killTimers = new Map<number, Timer>();
   private killed = new Map<number, string>(); // ticket -> why we stopped it (no retry after a kill)
@@ -52,7 +60,7 @@ export class Queue {
       this.alerts.set(`db:${a.id}`, { ...a, key: `db:${a.id}`, ticket: a.ticket ?? undefined });
     const meta = (k: string) => (db.query("SELECT value FROM meta WHERE key=?").get(k) as { value: string } | null)?.value;
     this.paused = meta("paused") === "1"; this.pauseReason = meta("pause_reason") ?? "";
-    const turn = meta("turn"); if (turn) this.turn = JSON.parse(turn);
+    try { this.standbyOrder = JSON.parse(meta("standby_order") ?? "[]"); } catch {}
     if (C.LEGACY_LOCK !== "off") {
       fs.mkdirSync(path.dirname(C.LEGACY_LOCK), { recursive: true });
       this.legacyFd = fs.openSync(C.LEGACY_LOCK, "a");
@@ -67,11 +75,22 @@ export class Queue {
   private emit(ev: string, data: unknown) { for (const fn of this.listeners) fn(ev, data); }
 
   holder(): Ticket | undefined { for (const t of this.active.values()) if (t.state === "granted") return t; }
-  waiting(): Ticket[] { return [...this.active.values()].filter((t) => t.state === "waiting").sort((a, b) => b.priority - a.priority || a.seq - b.seq); }
+  waiting(): Ticket[] {
+    return [...this.active.values()].filter((t) => t.state === "waiting")
+      .sort((a, b) => Number(whenFree(a)) - Number(whenFree(b)) || b.priority - a.priority || a.seq - b.seq);
+  }
+  // The tickets that want the card now: all waiting ones but standby servers waiting for the card to be free.
+  contenders(): Ticket[] { return this.waiting().filter((t) => !whenFree(t)); }
+  // The standby server that loads when the card is free: the one that loaded last (Greg, 2026-11-17: it stays the
+  // card's idle model until a request loads another one). One that never loaded comes after all that did.
+  nextStandby(): Ticket | undefined {
+    const rank = (t: Ticket) => this.standbyOrder.lastIndexOf(t.owner);
+    return this.waiting().filter(whenFree).sort((a, b) => rank(b) - rank(a) || a.seq - b.seq)[0];
+  }
   get(id: number): Ticket | undefined { return this.active.get(id) ?? (this.db.query("SELECT * FROM tickets WHERE id=?").get(id) as Ticket | null) ?? undefined; }
 
   private static SAVED = ["state", "seq", "priority", "client_pid", "client_start", "child_pid", "granted_at", "ended_at", "exit_code",
-    "end_reason", "peak_vram", "peak_gtt", "peak_sys", "peak_rss", "energy_j", "busy_s", "log"] as const;
+    "end_reason", "peak_vram", "peak_gtt", "peak_sys", "peak_rss", "energy_j", "busy_s", "log", "output", "opts"] as const;
   private save(t: Ticket) {
     const cols = Queue.SAVED;
     this.db.query(`UPDATE tickets SET ${cols.map((c) => `${c}=?`).join(", ")} WHERE id=?`).run(...cols.map((c) => t[c] ?? null), t.id);
@@ -88,8 +107,10 @@ export class Queue {
     if (h && r.kind === "run" && (r.parent === h.id || (h.kind === "acquire" && h.owner === owner))) return { id: h.id, nested: true };
     const argv = r.argv ?? [];
     const opts = cleanOpts(r.opts ?? {});
-    const maxSeq = (this.db.query("SELECT MAX(seq) AS m FROM tickets").get() as { m: number | null }).m ?? 0;
-    const priority = r.priority ?? (C.NEXT_OWNERS.test(owner) ? 1 : 0);
+    const maxSeq = this.maxSeq();
+    // Greg, 2026-11-17: a standby server is never next in line, starting or loading for a request; it waits at the back
+    // like any job (and one waiting for a free card has no place in line at all: urgent() gives it one).
+    const priority = opts.standby ? 0 : r.priority ?? 0;
     const res = this.db.query(`INSERT INTO tickets (owner, kind, state, seq, priority, argv, cwd, jobtype, client_pid, client_start, min_gib, ttl_s,
       created_at, opts, note, grp, chunk, attempt) VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       owner, r.kind, maxSeq + 1, priority, JSON.stringify(argv), r.cwd ?? "", jobtype(owner, r.kind, argv),
@@ -103,17 +124,39 @@ export class Queue {
       this.db.query("UPDATE tickets SET log=?, grp=COALESCE(grp, ?) WHERE id=?").run(log, id, id);
     }
     this.active.set(id, this.db.query("SELECT * FROM tickets WHERE id=?").get(id) as Ticket);
+    // A standby server starting (not one waiting to load again after stepping aside) replaces its owner's one before it.
+    if (opts.standby && !opts.when_free) this.replaceStandby(id, owner, r.client_pid);
     this.tick();
     return { id };
   }
 
-  // The next run of a submitted job: another chunk, or a retry after a failure. Same spec, back of the line.
-  private again(t: Ticket, what: "chunk" | "attempt") {
+  // One standby server per owner (Greg, 2026-11-17; other owners' ones stay). A new one stops its owner's old one at
+  // once, loaded or waiting, even mid-request, and the old one never loads again.
+  private replaceStandby(newId: number, owner: string, clientPid?: number) {
+    const why = `replaced by a newer standby server (#${newId} ${owner})`;
+    for (const t of [...this.active.values()]) {
+      if (t.id === newId || !opt(t).standby || t.owner !== owner || (clientPid && t.client_pid === clientPid)) continue;
+      if (t.state === "granted") this.kill(t.id, why);
+      else if (t.state === "waiting") {
+        // its server waits for a free card in its own loop: ending the ticket alone would send it back in line
+        const pid = t.kind === "run" && alive(t.client_pid, t.client_start) ? t.client_pid : null;
+        this.cancel(t.id, why);
+        if (pid) try { process.kill(pid, "SIGTERM"); } catch {}
+      }
+    }
+  }
+
+  private maxSeq(): number { return (this.db.query("SELECT MAX(seq) AS m FROM tickets").get() as { m: number | null }).m ?? 0; }
+
+  // The next run of a submitted job: another chunk, or a retry after a failure, at the back of the line; or a standby
+  // server that stepped aside, waiting for the card to be free again. Same spec.
+  private again(t: Ticket, what: "chunk" | "attempt" | "standby") {
     let spec: { argv: string[]; cwd?: string; env?: Record<string, string>; log?: string };
     try { spec = JSON.parse(fs.readFileSync(path.join(C.SPEC_DIR, `${t.id}.json`), "utf8")); } catch { return; }
+    const standby = what === "standby";
     const { id } = this.enqueue({
-      owner: t.owner, kind: "submit", argv: spec.argv, cwd: spec.cwd, env: spec.env, log: spec.log, priority: t.priority,
-      min_gib: t.min_gib, opts: JSON.parse(t.opts || "{}"), note: t.note ?? undefined, grp: t.grp ?? t.id,
+      owner: t.owner, kind: "submit", argv: spec.argv, cwd: spec.cwd, env: spec.env, log: spec.log, priority: standby ? 0 : t.priority,
+      min_gib: t.min_gib, opts: { ...opt(t), ...(standby ? { when_free: true } : {}) }, note: t.note ?? undefined, grp: t.grp ?? t.id,
       chunk: t.chunk + (what === "chunk" ? 1 : 0), attempt: what === "attempt" ? t.attempt + 1 : 0,
     });
     return id;
@@ -129,7 +172,7 @@ export class Queue {
   done(id: number, exit_code: number | null, reason = "exited") {
     const t = this.active.get(id); if (!t) return;
     const why = this.killed.get(id);
-    if (why) this.end(t, why.startsWith("idle") ? "done" : "failed", why, exit_code);
+    if (why) this.end(t, /^(idle|yield|replaced)/.test(why) ? "done" : "failed", why, exit_code);
     else this.end(t, exit_code === 0 || t.kind === "acquire" ? "done" : "failed", reason, exit_code);
   }
 
@@ -138,6 +181,45 @@ export class Queue {
     if (t.state === "granted") return false;
     this.end(t, "cancelled", reason, null);
     return true;
+  }
+
+  // A request waits for a standby server that is waiting for a free card: it goes in line like any job now, at the
+  // back (Greg, 2026-11-17: no priority). Once loaded it is the current standby model.
+  urgent(id: number) {
+    const t = this.active.get(id); if (!t || t.state !== "waiting") return false;
+    const o = opt(t);
+    if (!o.when_free) return true;
+    delete o.when_free;
+    t.opts = JSON.stringify(o); t.seq = this.maxSeq() + 1;
+    this.save(t); this.tick();
+    return true;
+  }
+
+  // A standby server's report, every few seconds while it holds the card: busy = requests in flight or waiting for
+  // it (a model still loading for one counts), idle_s = time since its last request ended. The answer says whether to
+  // step aside now; the server unloads, ends its ticket with `reason`, and waits for the card to be free again.
+  activity(id: number, b: { busy?: boolean; idle_s?: number }): { yield: boolean; reason?: string } {
+    const t = this.active.get(id), hs = this.health.get(id);
+    if (!t || t.state !== "granted" || !hs || !opt(t).standby) return { yield: false };
+    hs.report = { at: now(), busy: !!b.busy, idleSince: now() - Math.max(0, Number(b.idle_s) || 0) * 1000 };
+    const reason = this.yieldFor(hs);
+    if (!reason) hs.yieldAt = undefined; else hs.yieldAt ??= now();
+    return reason ? { yield: true, reason } : { yield: false };
+  }
+
+  // Why a standby holder should step aside now (another ticket wants the card, or a process outside the queue started
+  // on it, and the server is not in use), or undefined.
+  // Why a standby server should step aside: a job waits, something outside the queue uses the card, or the queue is
+  // paused (the card is wanted for something else). Only once the server has been quiet for STANDBY_QUIET_MS.
+  private yieldFor(hs: Health): string | undefined {
+    const next = this.contenders()[0];
+    const outside = this.others.find((o) => o.why === "outside");
+    if (!next && !outside && !this.paused) return;
+    const r = hs.report;
+    if (r && now() - r.at < C.STANDBY_REPORT_MS) { if (r.busy || now() - r.idleSince < C.STANDBY_QUIET_MS) return; }
+    else if (!hs.gpuIdleSince || now() - hs.gpuIdleSince < C.STANDBY_QUIET_MS) return; // not reporting: the GPU's word
+    return next ? `yielded to #${next.id} ${next.owner}`
+      : outside ? `yielded to ${outside.comm} (pid ${outside.pid}) outside the queue` : "yielded: the queue is paused";
   }
 
   bump(id: number) {
@@ -214,9 +296,9 @@ export class Queue {
         else if (k.kind === "submit" && !k.client_pid && t - k.granted_at! > 120_000) this.end(k, "failed", "runner never started", null);
       }
     }
-    if (this.reserve && t >= this.reserve.until) this.reserve = undefined;
     this.status = this.computeStatus();
-    if (this.status.kind === "idle" || this.status.kind === "reserved") {
+    if (this.status.kind !== "idle") this.freeSince = t;
+    if (this.status.kind === "idle") {
       const pick = this.pick();
       if (pick && this.takeLegacy()) { this.grant(pick); if (this.holder()) this.status = this.computeStatus(); }
       else if (pick) this.status = { kind: "legacy", text: `old b70-lease holder: ${this.legacyHolderText()}` };
@@ -225,14 +307,13 @@ export class Queue {
   }
 
   private pick(): Ticket | undefined {
-    const waiting = this.waiting();
-    if (!waiting.length) return;
-    if (waiting[0].priority > 0) return waiting[0];
-    const t = now();
-    if (this.reserve && t < this.reserve.until) return waiting.find((w) => w.owner === this.reserve!.owner);
-    const live = this.turn && t - this.turn.since < C.TURN_MS;
-    if (live) return waiting.find((w) => w.owner === this.turn!.owner) ?? waiting[0];
-    return waiting.find((w) => w.owner !== this.turn?.owner) ?? waiting[0];
+    const waiting = this.contenders();
+    if (!waiting.length) {
+      // only standby servers wait: the current one loads as soon as nothing is queued
+      const standby = this.nextStandby();
+      return standby && now() - this.freeSince >= C.STANDBY_SETTLE_MS ? standby : undefined;
+    }
+    return waiting[0];
   }
 
   private grant(k: Ticket) {
@@ -255,14 +336,10 @@ export class Queue {
     }
     k.state = "granted"; k.granted_at = now();
     this.save(k);
-    // A turn starts when another owner gets the card, or when the same owner comes back after a break (not a loop).
-    // Next-in-line jobs slip in between turns without starting one of their own.
-    const t = this.turn;
-    if (!k.priority && (!t || t.owner !== k.owner || (!t.lastEnd || k.granted_at - t.lastEnd > C.GRACE_MS + 5000))) {
-      this.turn = { owner: k.owner, since: k.granted_at };
-      this.setMeta("turn", JSON.stringify(this.turn));
+    if (o.standby) {
+      this.standbyOrder = [...this.standbyOrder.filter((x) => x !== k.owner), k.owner].slice(-20);
+      this.setMeta("standby_order", JSON.stringify(this.standbyOrder));
     }
-    this.reserve = undefined;
     this.health.set(k.id, { lastActive: now(), cpu: -1, cpuRate: 0, vram: 0 });
     this.writeHolder(k);
     if (k.kind === "submit") this.launch(k);
@@ -276,8 +353,10 @@ export class Queue {
     const killedWhy = this.killed.get(k.id);
     this.killed.delete(k.id);
     // A chunked job that says "more to do" is a finished chunk; a failed job with retries left runs again.
-    let follow: "chunk" | "attempt" | undefined;
-    if (k.kind === "submit" && wasGranted && !killedWhy) {
+    let follow: "chunk" | "attempt" | "standby" | undefined;
+    // A standby server the daemon runs (`b70q serve --standby`) and stopped for another job waits to load again.
+    if (k.kind === "submit" && wasGranted && o.standby && killedWhy?.startsWith("yield")) follow = "standby";
+    else if (k.kind === "submit" && wasGranted && !killedWhy) {
       if (o.more_code && rc === o.more_code) { state = "done"; reason = `chunk ${k.chunk + 1} done, more to do`; follow = "chunk"; }
       else if (state === "failed" && k.attempt < (o.retries ?? 0)) { reason = `${reason}; retrying (${k.attempt + 1}/${o.retries})`; follow = "attempt"; }
     }
@@ -289,10 +368,6 @@ export class Queue {
     if (wasGranted) {
       this.releaseLegacy();
       this.clearHolder();
-      this.loopers.delete(k.owner);
-      if (this.turn?.owner === k.owner) { this.turn.lastEnd = now(); this.setMeta("turn", JSON.stringify(this.turn)); }
-      if (!k.priority && this.turn?.owner === k.owner && now() - this.turn.since < C.TURN_MS && (follow === "chunk" || this.loops(k.owner)))
-        this.reserve = { owner: k.owner, until: now() + C.GRACE_MS };
       this.stats = undefined;
     }
     // Queued only now, after the card is released, so the follow-up can be granted cleanly.
@@ -302,27 +377,6 @@ export class Queue {
     this.notify(k.id);
     this.emit("ended", k);
     queueMicrotask(() => this.tick());
-  }
-
-  // Does this owner run its jobs in a loop (usually asks again within the grace time after a job ends)? Only then is
-  // the card kept for its next job; a one-off job's owner isn't coming back, so the next owner starts at once.
-  private loopers = new Map<string, boolean>();
-  private loops(owner: string): boolean {
-    let v = this.loopers.get(owner);
-    if (v === undefined) {
-      const rows = (this.db.query("SELECT created_at, ended_at FROM tickets WHERE owner=? AND kind!='acquire' ORDER BY id DESC LIMIT 12").all(owner) as
-        { created_at: number; ended_at: number | null }[]).reverse();
-      let pairs = 0, quick = 0;
-      for (let i = 1; i < rows.length; i++) {
-        if (rows[i - 1].ended_at == null) continue;
-        pairs++;
-        const gap = rows[i].created_at - rows[i - 1].ended_at!;
-        if (gap >= -1000 && gap <= C.GRACE_MS) quick++;
-      }
-      v = pairs > 0 && quick / pairs >= 0.5;
-      this.loopers.set(owner, v);
-    }
-    return v;
   }
 
   // The whole job (all chunks/retries) is over: write the exit file and run the on-exit hook.
@@ -339,7 +393,7 @@ export class Queue {
 
   private computeStatus(): CardStatus {
     const h = this.holder();
-    if (h) return { kind: "running", text: `#${h.id} ${h.owner}` };
+    if (h) return { kind: "running", text: `#${h.id} ${h.owner}${opt(h).standby ? " (standby)" : ""}${this.paused ? `; queue paused (${this.pauseReason || "paused"}): nothing new starts after it` : ""}` };
     if (this.paused) return { kind: "paused", text: this.pauseReason || "paused" };
     if (now() < this.faultUntil) return { kind: "fault", text: `xe fault; holding until ${new Date(this.faultUntil).toLocaleTimeString()}` };
     const outside = this.others.filter((o) => o.why === "outside");
@@ -347,8 +401,11 @@ export class Queue {
     const left = this.others.filter((o) => o.why === "leftover");
     if (left.length) return { kind: "leftover", text: `leftover of #${left[0].ticket} ${left[0].owner ?? ""}: ${left[0].comm} (pid ${left[0].pid}) still on the card` };
     if (!this.legacyFree()) return { kind: "legacy", text: `old b70-lease holder: ${this.legacyHolderText()}` };
-    if (this.reserve && this.waiting().some((w) => w.owner !== this.reserve!.owner))
-      return { kind: "reserved", text: `kept ${Math.ceil((this.reserve.until - now()) / 1000)} s for ${this.reserve.owner}'s next job (turn)` };
+    const standby = this.contenders().length ? undefined : this.nextStandby();
+    if (standby) {
+      const left = Math.ceil((this.freeSince + C.STANDBY_SETTLE_MS - now()) / 1000);
+      return { kind: "idle", text: `idle; the standby model (#${standby.id} ${standby.owner}) loads ${left > 0 ? `in ${left} s` : "now"}` };
+    }
     return { kind: "idle", text: "idle" };
   }
 
@@ -413,6 +470,29 @@ export class Queue {
     return out;
   }
 
+  // The file a job's output goes to, for the dashboard's log: stdout or stderr of the job's deepest process that writes
+  // to a regular file (make_real's sd-cli writes its own run.log under a quiet batch log). A new file has to show up in
+  // two samples in a row, so a short-lived helper (`jq … > jobs.jsonl`) doesn't take over.
+  private outputSeen?: { id: number; file: string };
+  private trackOutput(h: Ticket, pids: number[], procs: Map<number, Proc>) {
+    let best: { depth: number; mtime: number; file: string } | undefined;
+    for (const pid of pids) {
+      let depth = 0;
+      for (let p = procs.get(pid); p && depth < 64; p = procs.get(p.ppid)) depth++;
+      for (const fd of [1, 2]) {
+        try {
+          const link = `/proc/${pid}/fd/${fd}`, file = fs.readlinkSync(link);
+          const st = fs.statSync(link), named = fs.statSync(file); // the same file under that name here (not in a sandbox)
+          if (!st.isFile() || named.ino !== st.ino || named.dev !== st.dev) continue;
+          if (!best || depth > best.depth || (depth === best.depth && st.mtimeMs > best.mtime)) best = { depth, mtime: st.mtimeMs, file };
+        } catch {}
+      }
+    }
+    if (!best || best.file === h.output) { this.outputSeen = undefined; return; }
+    if (this.outputSeen?.id === h.id && this.outputSeen.file === best.file) { h.output = best.file; this.outputSeen = undefined; }
+    else this.outputSeen = { id: h.id, file: best.file };
+  }
+
   private clientPids(): Map<number, number> {
     const m = new Map<number, number>();
     for (const t of this.active.values()) if (t.state === "granted" && t.client_pid) m.set(t.client_pid, t.id);
@@ -444,6 +524,7 @@ export class Queue {
     this.usage = h ? u : undefined;
 
     if (h) {
+      this.trackOutput(h, u.pids, s.procs);
       h.peak_vram = Math.max(h.peak_vram, u.vram); h.peak_gtt = Math.max(h.peak_gtt, u.gtt);
       h.peak_sys = Math.max(h.peak_sys, u.sys); h.peak_rss = Math.max(h.peak_rss, u.rss);
       if (s.power !== undefined) h.energy_j += s.power * dt;
@@ -463,7 +544,7 @@ export class Queue {
   }
 
   private checkHolder(h: Ticket, u: Usage, s: Sample, dt: number) {
-    const hs = this.health.get(h.id) ?? { lastActive: now(), cpu: -1, cpuRate: 0, vram: 0 };
+    const hs: Health = this.health.get(h.id) ?? { lastActive: now(), cpu: -1, cpuRate: 0, vram: 0 };
     const cpuRate = hs.cpu >= 0 && dt > 0 ? Math.max(0, (u.cpu - hs.cpu) / dt) : 0;
     hs.cpuRate = hs.cpuRate * 0.9 + cpuRate * 0.1; // ~20 s average
     const active = u.busy > 0.02 || cpuRate > 0.2 || Math.abs(u.vram - hs.vram) > 64 * 2 ** 20;
@@ -471,14 +552,29 @@ export class Queue {
     hs.cpu = u.cpu; hs.vram = u.vram;
     this.health.set(h.id, hs);
     const held = now() - h.granted_at!;
-    const others = this.waiting().length;
-
-    // Servers (idle_s): stop one that has had nothing to do on the GPU for idle_s while others wait.
+    const others = this.contenders().length;
     const o = opt(h);
+
+    // Standby servers step aside when they are not in use and another job waits (activity() tells a reporting one).
+    // One that doesn't report is stopped; one told to step aside (it stops reporting while it unloads) gets
+    // STANDBY_YIELD_MS to end its ticket, then is stopped too.
+    if (o.standby) {
+      hs.gpuIdleSince = u.busy < 0.02 ? hs.gpuIdleSince ?? now() : undefined;
+      if (this.killed.has(h.id)) return;
+      if (hs.yieldAt) {
+        if (now() - hs.yieldAt > C.STANDBY_YIELD_MS) this.kill(h.id, `${this.yieldFor(hs) ?? "yielded"} (it did not step aside)`);
+        return;
+      }
+      const why = this.yieldFor(hs);
+      if (why && !(hs.report && now() - hs.report.at < C.STANDBY_REPORT_MS)) this.kill(h.id, why);
+      return;
+    }
+
+    // Servers (idle_s): stop one that has had nothing to do on the GPU for idle_s while others wait or the queue is paused.
     if (o.idle_s) {
       hs.gpuIdleSince = u.busy < 0.02 ? hs.gpuIdleSince ?? now() : undefined;
-      if (hs.gpuIdleSince && now() - hs.gpuIdleSince > o.idle_s * 1000 && others) {
-        this.kill(h.id, `idle server stopped after ${Math.round(o.idle_s / 60)} min idle (${others} waiting)`);
+      if (hs.gpuIdleSince && now() - hs.gpuIdleSince > o.idle_s * 1000 && (others || this.paused)) {
+        this.kill(h.id, `idle server stopped after ${Math.round(o.idle_s / 60)} min idle (${others ? `${others} waiting` : "queue paused"})`);
         hs.gpuIdleSince = undefined;
       }
       return;
@@ -602,24 +698,33 @@ export class Queue {
     const t = now();
     let at = t;
     if (h) at += Math.max(60_000, this.estimate(h) - (t - h.granted_at!));
-    const queue = this.waiting().map((k, i) => {
+    // A standby server waiting for a free card is not in line (it loads when nothing is queued): it is reported on its own.
+    const queue = this.contenders().map((k, i) => {
       const est = this.estimate(k);
-      const v = { ...this.ticketView(k), position: i + 1, eta_start: at, est_ms: est };
+      const v = { ...this.ticketView(k), position: i + 1, eta_start: this.paused ? null : at, est_ms: est }; // paused: not until resumed
       at += est;
       return v;
     });
+    // The standby models: the loaded one (it holds the card, idle or in use), any in line for a request, and the
+    // unloaded ones; current = the one that loads when the card is free (the one loaded last).
+    const next = h && opt(h).standby ? undefined : this.nextStandby();
+    const standby = [
+      ...(h && opt(h).standby ? [{ ...this.ticketView(h), loaded: true, current: true, busy: !!this.health.get(h.id)?.report?.busy,
+        idle_ms: this.health.get(h.id)?.report ? Math.max(0, t - this.health.get(h.id)!.report!.idleSince) : null }] : []),
+      ...queue.filter((k) => k.opts.standby).map((k) => ({ ...k, loaded: false, current: false, busy: false, idle_ms: null })),
+      ...this.waiting().filter(whenFree).sort((a, b) => Number(b === next) - Number(a === next) || a.seq - b.seq)
+        .map((k) => ({ ...this.ticketView(k), loaded: false, current: k === next, busy: false, idle_ms: null })),
+    ];
     return {
       t,
       card: s && { vramUsed: s.vramUsed, vramTotal: s.vramTotal, power: s.power, temp: s.temp, vramTemp: s.vramTemp, util: s.util, freq: s.freq, memAvail: s.memAvail, memTotal: s.memTotal },
       status: this.status,
       holder: h ? { ...this.ticketView(h), usage: this.usage, est_ms: this.estimate(h) } : null,
-      turn: this.turn && { ...this.turn, left_ms: Math.max(0, C.TURN_MS - (t - this.turn.since)) },
-      reserve: this.reserve,
       queue,
+      standby,
       others: this.others,
       alerts: [...this.alerts.values()].sort((a, b) => b.t - a.t),
       paused: this.paused, pauseReason: this.pauseReason, faultUntil: this.faultUntil,
-      config: { turn_ms: C.TURN_MS, grace_ms: C.GRACE_MS },
     };
   }
 
@@ -627,6 +732,12 @@ export class Queue {
     const { argv, opts, ...rest } = k;
     return { ...rest, argv: JSON.parse(argv) as string[], opts: JSON.parse(opts || "{}") as Opts };
   }
+}
+
+interface Health {
+  lastActive: number; cpu: number; cpuRate: number; vram: number; idleSince?: number; gpuIdleSince?: number;
+  report?: { at: number; busy: boolean; idleSince: number }; // a standby server's last activity report
+  yieldAt?: number; // when a standby server was first told to step aside
 }
 
 export interface Stat { jobtype: string; owner: string; n: number; failed: number; median_ms: number; p90_ms: number; p90_vram: number; max_vram: number; max_rss: number; last: number }
@@ -638,6 +749,8 @@ export interface EnqueueRequest {
 }
 
 const opt = (t: Ticket): Opts => { try { return JSON.parse(t.opts || "{}"); } catch { return {}; } };
+// a standby server waiting at the back until the card is free
+const whenFree = (t: Ticket) => t.state === "waiting" && !!opt(t).when_free;
 
 function cleanOpts(o: Opts): Opts {
   const out: Opts = {};
@@ -651,5 +764,7 @@ function cleanOpts(o: Opts): Opts {
   if (pos(o.ram_gib)) out.ram_gib = o.ram_gib;
   if (pos(o.vram_gib)) out.vram_gib = o.vram_gib;
   if (o.server) out.server = true;
+  if (o.standby) { out.standby = true; out.server = true; }
+  if (o.standby && o.when_free) out.when_free = true;
   return out;
 }

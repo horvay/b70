@@ -6,12 +6,36 @@ let state: Any = null;
 let ring: Any[] = [];
 let history: Any[] = [];
 let stats: Any[] = [];
-let samples: Any[] = [];
 let rangeMin = 15;
-let tlHours = 24;
 const ownerById = new Map<number, string>();
 
 const $ = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector(s) as T;
+// The page stays open for days and these sections change every second, so patch the nodes that are there instead of
+// replacing them. Anything watching the DOM can keep what we remove: Video Speed Controller's MutationObserver holds it
+// on requestIdleCallback, which piled up GBs of detached nodes in a tab left in the background.
+const parsed = document.createElement("template");
+function morph(el: Node, to: Node) {
+  let a = el.firstChild, b = to.firstChild;
+  while (b) {
+    const next = b.nextSibling;
+    if (!a) el.appendChild(b);
+    else {
+      const after: ChildNode | null = a.nextSibling;
+      if (a.nodeName !== b.nodeName) el.replaceChild(b, a);
+      else if (a instanceof Element) {
+        for (const { name } of [...a.attributes]) if (!(b as Element).hasAttribute(name)) a.removeAttribute(name);
+        for (const { name, value } of (b as Element).attributes) if (a.getAttribute(name) !== value) a.setAttribute(name, value);
+        morph(a, b);
+      } else if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue;
+      a = after;
+    }
+    b = next;
+  }
+  while (a) { const after: ChildNode | null = a.nextSibling; el.removeChild(a); a = after; }
+}
+function setHTML(el: Element, html: string) { parsed.innerHTML = html; morph(el, parsed.content); }
+function setText(el: Element, text: string) { if (el.textContent !== text) el.textContent = text; }
+function setClass(el: Element, name: string) { if (el.className !== name) el.className = name; }
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 const gib = (b: number | null | undefined, d = 1) => (b == null ? "–" : (b / 2 ** 30).toFixed(d));
 const clock = (t?: number | null) => (t ? new Date(t).toLocaleTimeString("en-GB", { hour12: false, hour: "2-digit", minute: "2-digit" }) : "–");
@@ -33,12 +57,13 @@ function color(owner: string, a = 1) {
   return `hsla(${h % 360}, 62%, ${owner.endsWith("stills") ? 70 : 60}%, ${a})`;
 }
 const cmd = (argv: string[]) => esc((argv ?? []).join(" ").replace(/\s+/g, " "));
-// Labels for a ticket: server, chunk n, retry n; plus its note.
-function tags(t: Any): string {
+// Labels for a ticket: its kind (but in the history), server or standby, chunk n, retry n.
+function tags(t: Any, kind = true): string {
   const o = t.opts ?? {};
   const out: string[] = [];
-  if (t.kind !== "run") out.push(`<span class="tag">${t.kind}</span>`);
-  if (o.server) out.push(`<span class="tag">server${o.idle_s ? ` · idle ${dur(o.idle_s * 1000)}` : ""}</span>`);
+  if (kind && t.kind !== "run") out.push(`<span class="tag">${t.kind}</span>`);
+  if (o.standby) out.push(`<span class="tag">standby${o.when_free ? " · when free" : ""}</span>`);
+  else if (o.server) out.push(`<span class="tag">server${o.idle_s ? ` · idle ${dur(o.idle_s * 1000)}` : ""}</span>`);
   if (o.more_code || t.chunk) out.push(`<span class="tag">chunk ${t.chunk + 1}</span>`);
   if (t.attempt) out.push(`<span class="tag next">retry ${t.attempt}/${o.retries ?? "?"}</span>`);
   if (t.priority) out.push('<span class="tag next">next</span>');
@@ -56,6 +81,7 @@ async function post(path: string, body?: unknown) {
   cancel: (id: number, owner: string) => confirm(`Take #${id} ${owner} out of the queue?`) && post(`/api/tickets/${id}/cancel`),
   bump: (id: number) => post(`/api/tickets/${id}/bump`),
   ack: (id: number) => post(`/api/alerts/${id}/ack`),
+  ackAll: () => Promise.all(state.alerts.map((a: Any) => post(`/api/alerts/${a.id}/ack`))),
 };
 
 // --- header -------------------------------------------------------------------------------------------------------------
@@ -63,21 +89,26 @@ async function post(path: string, body?: unknown) {
 function renderHeader() {
   const s = state;
   const pill = $("#pill");
-  pill.className = `pill ${s.status.kind}`;
-  pill.textContent = s.status.kind.toUpperCase();
-  $("#statusText").textContent = s.status.kind === "running" ? "" : s.status.text;
+  setClass(pill, `pill ${s.status.kind}`);
+  setText(pill, s.status.kind.toUpperCase());
+  $("#pausePill").hidden = !s.paused || s.status.kind === "paused"; // paused with a job still finishing
+  setText($("#statusText"), s.status.kind === "running" && !s.paused ? "" : s.status.text);
   const k = s.card;
   if (k) {
     const kpi = (label: string, val: string, frac?: number) =>
       `<div class="kpi"><b>${val}</b><span>${label}</span>${frac != null ? `<div class="bar"><i style="width:${Math.min(100, frac * 100).toFixed(1)}%"></i></div>` : ""}</div>`;
-    $("#kpis").innerHTML = kpi("VRAM GiB", `${gib(k.vramUsed)} / ${gib(k.vramTotal, 0)}`, k.vramUsed / k.vramTotal) +
+    setHTML($("#kpis"), kpi("VRAM GiB", `${gib(k.vramUsed)} / ${gib(k.vramTotal, 0)}`, k.vramUsed / k.vramTotal) +
       kpi("power", `${k.power?.toFixed(0) ?? "–"} W`) + kpi("GPU busy", `${((k.util ?? 0) * 100).toFixed(0)}%`) +
-      kpi("temp", `${k.temp?.toFixed(0) ?? "–"}°C`) + kpi("host RAM free", `${gib(k.memAvail)} GiB`, 1 - k.memAvail / k.memTotal);
+      kpi("temp", `${k.temp?.toFixed(0) ?? "–"}°C`) + kpi("host RAM free", `${gib(k.memAvail)} GiB`, 1 - k.memAvail / k.memTotal));
   }
   const btn = $("#pauseBtn");
-  btn.textContent = s.paused ? "Resume queue" : "Pause queue";
-  btn.className = s.paused ? "" : "danger";
-  btn.onclick = () => s.paused ? post("/api/resume") : post("/api/pause", { reason: prompt("Why pause the queue?", "paused from the dashboard") || undefined });
+  setText(btn, s.paused ? "Resume queue" : "Pause queue");
+  setClass(btn, s.paused ? "" : "danger");
+  btn.onclick = () => {
+    if (s.paused) return post("/api/resume");
+    const reason = prompt("Pause the queue? The job on the card finishes, idle servers step aside, and nothing new starts until you resume.\n\nReason (shown in the queue):", "paused from the dashboard");
+    if (reason !== null) post("/api/pause", { reason: reason || undefined });
+  };
 }
 
 // --- now / queue ---------------------------------------------------------------------------------------------------------
@@ -88,25 +119,23 @@ function renderNow() {
   if (!h) {
     const last = history.find((t) => t.ended_at && t.granted_at);
     const next = s.queue[0];
-    el.innerHTML = `<div class="title"><span class="owner" style="color:var(--dim)">${s.status.kind === "idle" ? "Idle" : esc(s.status.kind)}</span></div>
+    setHTML(el, `<div class="title"><span class="owner" style="color:var(--dim)">${s.status.kind === "idle" ? "Idle" : esc(s.status.kind)}</span></div>
       <div class="meta">${esc(s.status.text)}</div>
       ${last ? `<div class="meta">Last job: <span class="dot" style="background:${color(last.owner)}"></span>${esc(last.owner)} #${last.id}, ended ${dateClock(last.ended_at)} (${dur(Date.now() - last.ended_at)} ago)</div>` : ""}
-      ${next ? `<div class="meta">Next: <b>${esc(next.owner)}</b> #${next.id}</div>` : ""}`;
+      ${next ? `<div class="meta">Next: <b>${esc(next.owner)}</b> #${next.id}</div>` : ""}`);
     return;
   }
   const u = h.usage ?? {};
   const el2 = Date.now() - h.granted_at;
   const frac = h.est_ms ? el2 / h.est_ms : 0;
-  const turn = s.turn && s.turn.owner === h.owner && s.queue.some((q: Any) => q.owner !== h.owner)
-    ? `turn: ${dur(s.turn.left_ms)} left, then ${esc(s.queue.find((q: Any) => q.owner !== h.owner)?.owner)}` : "";
   const card = s.card ?? {};
   const gauge = (label: string, val: string, f?: number, sub = "") =>
     `<div class="gauge"><span>${label}</span><b>${val}</b>${f != null ? `<div class="bar"><i style="width:${Math.min(100, f * 100).toFixed(1)}%"></i></div>` : ""}${sub ? `<span>${sub}</span>` : ""}</div>`;
-  el.innerHTML = `
+  setHTML(el, `
     <div class="title"><span class="dot" style="background:${color(h.owner)}"></span><span class="owner">${esc(h.owner)}</span>
       <span class="mono" style="color:var(--dim)">#${h.id}</span>${tags(h)}</div>
-    <div class="meta">since ${dateClock(h.granted_at)} · running ${dur(el2)}${h.est_ms ? ` of ~${dur(h.est_ms)} (typical)` : ""} · waited ${dur(h.granted_at - h.created_at)}${turn ? ` · ${turn}` : ""}</div>
-    ${h.est_ms ? `<div class="progress"><i style="width:${Math.min(100, frac * 100)}%;${frac > 1 ? "background:var(--warn)" : ""}"></i></div>` : ""}
+    <div class="meta">since ${dateClock(h.granted_at)} · running ${dur(el2)}${h.est_ms ? ` of ~${dur(h.est_ms)} (typical)` : ""} · waited ${dur(h.granted_at - h.created_at)}</div>
+    ${h.est_ms ? `<div class="progress"><i style="width:${Math.min(100, frac * 100).toFixed(1)}%;${frac > 1 ? "background:var(--warn)" : ""}"></i></div>` : ""}
     <div class="cmd">${note(h)}${cmd(h.argv)}</div>
     <div class="gauges">
       ${gauge("VRAM", `${gib(u.vram)} GiB`, (u.vram ?? 0) / (card.vramTotal || 1), `peak ${gib(h.peak_vram)}`)}
@@ -120,7 +149,7 @@ function renderNow() {
       <button class="danger" onclick="b70q.kill(${h.id}, '${esc(h.owner)}')">Kill</button>
       ${h.kind === "acquire" ? `<button onclick="b70q.release(${h.id})">Release</button><span class="cmd">ttl ${dur((h.ttl_s ?? 0) * 1000)}</span>` : ""}
       ${h.client_pid ? `<span class="cmd">pid ${h.client_pid}${h.child_pid ? ` → ${h.child_pid}` : ""}</span>` : ""}
-    </div>`;
+    </div>`);
 }
 
 function learned(jobtype: string) { return stats.find((s) => s.jobtype === jobtype); }
@@ -128,59 +157,88 @@ function learned(jobtype: string) { return stats.find((s) => s.jobtype === jobty
 function renderQueue() {
   const el = $("#queue .body");
   const q = state.queue;
-  $("#queue h2").innerHTML = `Queue <small>${q.length ? `${q.length} waiting · FIFO, ${dur(state.config.turn_ms)} turns` : ""}</small>`;
-  if (!q.length) { el.innerHTML = `<div class="empty">Nothing waiting.</div>`; return; }
-  el.innerHTML = `<table><tr><th></th><th>owner</th><th>#</th><th class="num">waiting</th><th class="num">starts ~</th><th class="num">takes ~</th><th class="num">VRAM ~</th><th>command</th><th></th></tr>
+  setHTML($("#queue h2"), `Queue <small>${q.length ? `${q.length} waiting · first in, first out` : ""}</small>` +
+    (state.paused ? `<small style="color:var(--err)">paused: nothing starts until you resume</small>` : ""));
+  if (!q.length) { setHTML(el, `<div class="empty">Nothing waiting.</div>`); return; }
+  setHTML(el, `<table><tr><th></th><th>owner</th><th>#</th><th class="num">waiting</th><th class="num">starts ~</th><th class="num">takes ~</th><th class="num">VRAM ~</th><th>command</th><th></th></tr>
     ${q.map((t: Any) => {
       const l = learned(t.jobtype);
       return `<tr class="${t.priority ? "prio" : ""}"><td class="num">${t.position}</td>
-        <td><span class="dot" style="background:${color(t.owner)}"></span><span class="owner">${esc(t.owner)}</span>${tags(t)}</td>
-        <td class="num">${t.id}</td><td class="num">${dur(Date.now() - t.created_at)}</td><td class="num">${clock(t.eta_start)}</td>
+        <td style="white-space:nowrap"><span class="dot" style="background:${color(t.owner)}"></span><span class="owner">${esc(t.owner)}</span>${tags(t)}</td>
+        <td class="num">${t.id}</td><td class="num">${dur(Date.now() - t.created_at)}</td><td class="num">${state.paused ? "paused" : clock(t.eta_start)}</td>
         <td class="num">${l ? dur(t.est_ms) : `<span style="color:var(--faint)">${dur(t.est_ms)}?</span>`}</td>
         <td class="num">${l ? gib(l.p90_vram) : "–"}</td>
-        <td class="cmd">${note(t)}${cmd(t.argv).slice(0, 140)}</td>
+        <td class="cmd line" title="${cmd(t.argv)}">${note(t)}${cmd(t.argv)}</td>
         <td style="white-space:nowrap"><button class="small" title="move to the front" onclick="b70q.bump(${t.id})">▲</button>
           <button class="small danger" title="take out of the queue" onclick="b70q.cancel(${t.id}, '${esc(t.owner)}')">✕</button></td></tr>`;
-    }).join("")}</table>`;
+    }).join("")}</table>`);
 }
 
+// The standby models stay loaded until the card is wanted for something else. The current one (loaded last) loads when
+// nothing is queued; another one loads only for a request, in line like any job, and is the current one after that.
+function renderStandby() {
+  const list: Any[] = state.standby ?? [];
+  $("#standby").hidden = !list.length;
+  setHTML($("#standby h2"), list.length > 1 ? "Standby models" : "Standby model");
+  setHTML($("#standby .body"), list.map((b) => {
+    const led = b.loaded ? (b.busy ? "use" : "on") : b.position || b.current ? "wait" : "off";
+    const what = b.loaded
+      ? (b.busy ? "loaded, answering a request" : `loaded, idle${b.idle_ms != null ? ` for ${dur(b.idle_ms)}` : ""}; steps aside when a job is queued`)
+      : b.position ? `in line to load (${b.position} in the queue)`
+      : b.current ? "unloaded; the current model, loads as soon as nothing is queued"
+      : "unloaded; loads when a request comes in";
+    return `<div class="row"><span class="led ${led}"></span><span class="dot" style="background:${color(b.owner)}"></span><span class="owner">${esc(b.owner)}</span>
+      <span class="mono" style="color:var(--dim)">#${b.id}</span><span class="what">${esc(b.note ?? "")} · ${what}</span></div>`;
+  }).join(""));
+}
+
+// Alerts, and processes on the card outside the queue (the queue waits for them) or left over from a job.
 function renderAlerts() {
-  const a = state.alerts;
-  $("#alerts .body").innerHTML = a.length ? a.slice(0, 20).map((x: Any) =>
+  const a = state.alerts, o = state.others;
+  $("#alerts").hidden = !a.length && !o.length;
+  setHTML($("#alerts h2"), `Alerts${a.length > 1 ? '<button class="small close" onclick="b70q.ackAll()">dismiss all</button>' : ""}`);
+  setHTML($("#alerts .body"), o.map((x: Any) =>
+    `<div class="alert"><span class="lvl warn">${x.why === "outside" ? "outside the queue" : `leftover of #${x.ticket}`}</span>
+      <span class="msg"><span class="mono">${esc(x.comm)} ${x.pid}</span> · ${gib(x.vram)} GiB · ${(x.busy * 100).toFixed(0)}% busy${x.owner ? ` · ${esc(x.owner)}` : ""}
+      <div class="cmd">${esc(x.cmd).slice(0, 160)}</div></span>
+      ${x.ticket ? `<button class="small danger" onclick="b70q.kill(${x.ticket}, '${esc(x.owner ?? "")}')">kill</button>` : ""}</div>`).join("") +
+    a.slice(0, 20).map((x: Any) =>
     `<div class="alert"><span class="lvl ${x.level}">${x.level}</span><span class="msg">${esc(x.msg)}</span><time>${dateClock(x.t)}</time>
-      <button class="small" title="dismiss" onclick="b70q.ack(${x.id})">✓</button></div>`).join("") : `<div class="empty">No alerts.</div>`;
+      <button class="small" title="dismiss" onclick="b70q.ack(${x.id})">✓</button></div>`).join(""));
 }
 
-function renderOthers() {
-  const o = state.others;
-  $("#others .body").innerHTML = o.length ? `<table><tr><th>what</th><th>process</th><th class="num">VRAM</th><th class="num">busy</th><th>command</th><th></th></tr>
-    ${o.map((x: Any) => `<tr><td>${x.why === "outside" ? '<span class="lvl warn">outside the queue</span>' : `<span class="lvl warn">leftover of #${x.ticket}</span> ${esc(x.owner ?? "")}`}</td>
-      <td class="mono">${esc(x.comm)} ${x.pid}</td><td class="num">${gib(x.vram)}</td><td class="num">${(x.busy * 100).toFixed(0)}%</td><td class="cmd">${esc(x.cmd).slice(0, 120)}</td>
-      <td>${x.ticket ? `<button class="small danger" onclick="b70q.kill(${x.ticket}, '${esc(x.owner ?? "")}')">kill</button>` : ""}</td></tr>`).join("")}</table>`
-    : `<div class="empty">Only queue jobs are using the card. Anything else using it (your manual runs) shows up here, and the queue waits for it.</div>`;
+// How a past job ended: "exit 0", "exit 1", or the reason it was stopped.
+function result(t: Any): string {
+  if (t.state === "granted") return "running";
+  if (t.end_reason === "exited") return `exit ${t.exit_code ?? "?"}`;
+  return `${t.end_reason ?? ""}${t.exit_code != null ? ` (exit ${t.exit_code})` : ""}`;
 }
 
 function renderHistory() {
-  const rows = history.filter((t) => t.state !== "waiting").slice(0, 40);
-  $("#history .body").innerHTML = `<table><tr><th>#</th><th>owner</th><th>state</th><th class="num">queued</th><th class="num">waited</th><th class="num">ran</th>
-    <th class="num">VRAM</th><th class="num">GTT+sys</th><th class="num">RAM</th><th class="num">Wh</th><th>result</th><th>command</th></tr>
-    ${rows.map((t) => `<tr><td class="num">${t.id}</td><td><span class="dot" style="background:${color(t.owner)}"></span>${esc(t.owner)}${tags(t)}</td>
-      <td class="state-${t.state}">${t.state}</td><td class="num">${dateClock(t.created_at)}</td>
+  const rows = history.filter((t) => t.state !== "waiting");
+  setHTML($("#history .body"), rows.length ? `<table class="past"><tr><th class="num">#</th><th>owner</th><th>job</th><th>result</th><th class="num">queued</th>
+    <th class="num">waited</th><th class="num">ran</th><th class="num" title="peak VRAM, GiB">VRAM</th><th class="num opt" title="peak GTT + system memory, GiB">GTT+sys</th>
+    <th class="num opt" title="peak host RAM, GiB">RAM</th><th class="num opt">Wh</th><th>command</th></tr>
+    ${rows.map((t) => `<tr><td class="num">${t.id}</td><td class="clip" title="${esc(t.owner)}"><span class="dot" style="background:${color(t.owner)}"></span>${esc(t.owner)}</td>
+      <td class="clip job" title="${esc(t.note)}">${tags(t, false)} ${esc(t.note)}</td>
+      <td class="clip" title="${esc(result(t))}"><span class="state-${t.state}">${t.state === "granted" ? "running" : t.state}</span>
+        ${t.state === "granted" ? "" : `<span class="dim">${esc(result(t))}</span>`}</td>
+      <td class="num">${dateClock(t.created_at)}</td>
       <td class="num">${dur((t.granted_at ?? t.ended_at ?? Date.now()) - t.created_at)}</td>
       <td class="num">${t.granted_at ? dur((t.ended_at ?? Date.now()) - t.granted_at) : "–"}</td>
-      <td class="num">${gib(t.peak_vram)}</td><td class="num">${gib(t.peak_gtt + t.peak_sys)}</td><td class="num">${gib(t.peak_rss)}</td>
-      <td class="num">${(t.energy_j / 3600).toFixed(0)}</td>
-      <td>${t.state === "granted" ? "running" : esc(`${t.exit_code ?? ""} ${t.end_reason ?? ""}`.trim())}</td>
-      <td class="cmd">${note(t)}${cmd(t.argv).slice(0, 120)}</td></tr>`).join("")}</table>`;
+      <td class="num">${gib(t.peak_vram)}</td><td class="num opt">${gib(t.peak_gtt + t.peak_sys)}</td><td class="num opt">${gib(t.peak_rss)}</td>
+      <td class="num opt">${(t.energy_j / 3600).toFixed(0)}</td>
+      <td class="cmd line" title="${cmd(t.argv)}">${cmd(t.argv)}</td></tr>`).join("")}</table>`
+    : `<div class="empty">No jobs in the last 3 days.</div>`);
 }
 
 function renderStats() {
-  $("#stats .body").innerHTML = stats.length ? `<table><tr><th>job type</th><th class="num">runs</th><th class="num">failed</th><th class="num">median</th><th class="num">p90</th>
+  setHTML($("#stats .body"), stats.length ? `<table class="past"><tr><th>job type</th><th class="num">runs</th><th class="num">failed</th><th class="num">median</th><th class="num">p90</th>
     <th class="num">VRAM p90</th><th class="num">VRAM max</th><th class="num">RAM max</th><th class="num">last run</th></tr>
     ${stats.map((s) => `<tr><td><span class="dot" style="background:${color(s.owner)}"></span>${esc(s.jobtype)}</td><td class="num">${s.n}</td>
       <td class="num">${s.failed || ""}</td><td class="num">${dur(s.median_ms)}</td><td class="num">${dur(s.p90_ms)}</td><td class="num">${gib(s.p90_vram)}</td>
       <td class="num">${gib(s.max_vram)}</td><td class="num">${gib(s.max_rss)}</td><td class="num">${dateClock(s.last)}</td></tr>`).join("")}</table>`
-    : `<div class="empty">No finished jobs yet. Every job's run time, VRAM and RAM are recorded here by job type.</div>`;
+    : `<div class="empty">No finished jobs yet. Every job's run time, VRAM and RAM are recorded here by job type.</div>`);
 }
 
 // --- live charts --------------------------------------------------------------------------------------------------------
@@ -240,83 +298,85 @@ function resizeCharts() {
     const host = $({ vram: "#chVram", power: "#chPower", util: "#chUtil", temp: "#chTemp" }[k]!);
     c.setSize({ width: host.clientWidth, height: 150 });
   }
-  renderTimeline();
 }
 
-// --- timeline (Gantt) ---------------------------------------------------------------------------------------------------
+// --- log ----------------------------------------------------------------------------------------------------------------
+// The output of the job on the card, or of the last job while the card is idle: the file the job's processes write to
+// (the daemon finds it), else a submitted job's own log. Progress bars redraw their line with \r; colours are dropped.
 
-function renderTimeline() {
-  const host = $("#timeline");
-  const W = host.clientWidth || 1000;
-  const t1 = Date.now(), t0 = t1 - tlHours * 3600_000;
-  const tickets = history.filter((t) => (t.ended_at ?? t1) >= t0 && t.created_at <= t1 && (t.granted_at || t.state === "waiting"));
-  const lanes: string[] = [];
-  for (const t of [...tickets].sort((a, b) => a.created_at - b.created_at)) if (!lanes.includes(t.owner)) lanes.push(t.owner);
-  const L = 180, R = 12, top = 58, rowH = 24;
-  const H = top + Math.max(1, lanes.length) * rowH + 8;
-  const x = (t: number) => L + ((Math.max(t0, Math.min(t1, t)) - t0) / (t1 - t0)) * (W - L - R);
-  let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
-  // power strip: how hard the card worked
-  const ps = samples.filter((s) => s.t >= t0);
-  if (ps.length) {
-    const maxP = 320, sh = 26, base = 30;
-    svg += `<text x="${L - 8}" y="${base - 8}" text-anchor="end">power</text>`;
-    svg += `<path d="M${x(ps[0].t)},${base} ${ps.map((s) => `L${x(s.t).toFixed(1)},${(base - Math.min(1, (s.power ?? 0) / maxP) * sh).toFixed(1)}`).join(" ")} L${x(ps[ps.length - 1].t)},${base} Z" fill="#f5b94233" stroke="#f5b942" stroke-width="1"/>`;
+const ESCAPES = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b[\]P^_][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g;
+const MAX_LINES = 4000, MAX_CHARS = 16 * 2 ** 20, MAX_PARTIAL = 2 ** 20;
+const pre = $("#logText");
+const done = document.createTextNode(""), cur = document.createTextNode("");
+const lg = { key: "", offset: 0, lines: 0, partial: "", ended: false, busy: false };
+// what a line shows after its \r redraws: the last non-empty pass
+const shown = (l: string) => { const p = l.split("\r"); for (let i = p.length - 1; i > 0; i--) if (p[i]) return p[i]; return p[0]; };
+const home = (f: string) => f.replace(/^\/home\/[^/]+\//, "~/");
+
+function logMessage(text: string) {
+  setClass(pre, "msg"); setText(pre, text);
+}
+
+let lastHolder = 0;
+function logSource(): { t: Any; live: boolean } | "stale" | undefined {
+  if (state.holder) return { t: (lastHolder = state.holder.id, state.holder), live: true };
+  if (lastHolder && !history.some((t) => t.id === lastHolder && t.ended_at)) return "stale"; // until history has its end
+  const last = history.find((t) => t.ended_at && t.granted_at);
+  return last && { t: last, live: false };
+}
+
+async function pollLog() {
+  if (lg.busy || !state) return;
+  const src = logSource();
+  if (src === "stale") return;
+  if (!src) { lg.key = ""; setText($("#logWhat"), ""); logMessage("Nothing has run on the card yet."); return; }
+  const { t, live } = src, file = t.output ?? t.log;
+  const key = `${t.id}|${file}|${t.ended_at ?? ""}`;
+  if (key !== lg.key) {
+    Object.assign(lg, { key, offset: -256 * 1024, lines: 0, partial: "", ended: false });
+    const what = live ? `#${t.id} ${t.owner}` : `last job #${t.id} ${t.owner}, ended ${dateClock(t.ended_at)} (${`${t.exit_code ?? ""} ${t.end_reason ?? ""}`.trim()})`;
+    setHTML($("#logWhat"), `${esc(what)}${file ? ` · <span title="${esc(file)}">${esc(home(file))}</span>` : ""}`);
+    if (!file) return logMessage(`No log to show: the output of #${t.id} goes to the terminal or program that started it, not to a file.`);
+    pre.className = ""; pre.replaceChildren(done, cur); done.data = ""; cur.data = "";
   }
-  // hour grid
-  const step = tlHours <= 6 ? 3600_000 / 2 : tlHours <= 24 ? 2 * 3600_000 : 6 * 3600_000;
-  for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
-    svg += `<line x1="${x(t)}" x2="${x(t)}" y1="${top - 14}" y2="${H}" stroke="#1f2530"/><text x="${x(t)}" y="${top - 18}" text-anchor="middle">${dateClock(t)}</text>`;
-  }
-  lanes.forEach((o, i) => {
-    const y = top + i * rowH;
-    svg += `<rect x="0" y="${y}" width="${W}" height="${rowH}" fill="${i % 2 ? "#ffffff05" : "transparent"}"/>`;
-    svg += `<rect x="8" y="${y + 8}" width="9" height="9" rx="2" fill="${color(o)}"/><text class="lane-label" x="24" y="${y + 16}">${esc(o.length > 24 ? o.slice(0, 23) + "…" : o)}</text>`;
-  });
-  for (const t of tickets) {
-    const y = top + lanes.indexOf(t.owner) * rowH;
-    const g = t.granted_at, e = t.ended_at ?? t1;
-    // waiting: thin line from queued to start
-    const w1 = g ?? e;
-    if (w1 - t.created_at > 5000) svg += `<line x1="${x(t.created_at)}" x2="${x(w1)}" y1="${y + 12}" y2="${y + 12}" stroke="${color(t.owner, 0.45)}" stroke-width="2" stroke-dasharray="2 3"/>`;
-    if (g) {
-      const fail = t.state === "failed";
-      svg += `<rect data-id="${t.id}" x="${x(g)}" y="${y + 4}" width="${Math.max(2, x(e) - x(g))}" height="${rowH - 8}" rx="3"
-        fill="${color(t.owner, t.state === "granted" ? 0.95 : 0.75)}" stroke="${fail ? "#ff6b6b" : "none"}" stroke-width="${fail ? 1.5 : 0}"/>`;
+  if (!file || lg.ended) return;
+  lg.busy = true;
+  try {
+    const r = await fetch(`/api/tickets/${t.id}/log?src=output&offset=${lg.offset}`);
+    if (!r.ok || key !== lg.key) return;
+    const j = await r.json();
+    if (lg.offset >= 0 && j.size < lg.offset) { lg.key = ""; return; } // the file was truncated or replaced: read it again
+    let text = lg.partial + j.text;
+    if (lg.offset < 0 && j.start > 0) text = text.slice(text.indexOf("\n") + 1); // started mid-line
+    lg.offset = j.offset;
+    lg.ended = !live;
+    const lines = text.replace(ESCAPES, "").split("\n");
+    lg.partial = lines.pop()!.slice(-MAX_PARTIAL); // a progress bar may never end its line
+    if (!lines.length && cur.data === shown(lg.partial)) return;
+    const end = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
+    if (lines.length) {
+      done.appendData(lines.map(shown).join("\n") + "\n");
+      lg.lines += lines.length;
+      if (lg.lines > MAX_LINES * 1.25) { // keep the last MAX_LINES
+        const all = done.data.split("\n"); done.data = all.slice(-MAX_LINES - 1).join("\n"); lg.lines = MAX_LINES;
+      }
+      if (done.length > MAX_CHARS) done.deleteData(0, done.length - MAX_CHARS / 2);
     }
-  }
-  svg += `<line x1="${x(t1)}" x2="${x(t1)}" y1="${top - 14}" y2="${H}" stroke="#5fb3ff" stroke-dasharray="3 3"/>`;
-  svg += `</svg>`;
-  host.innerHTML = lanes.length ? svg : `<div class="empty">No jobs in the last ${tlHours} h.</div>${svg}`;
-  const tip = $("#tip");
-  host.querySelectorAll("rect[data-id]").forEach((r) => {
-    r.addEventListener("mousemove", (ev) => {
-      const t = history.find((h) => h.id === Number((r as SVGElement).dataset.id));
-      if (!t) return;
-      const me = ev as MouseEvent;
-      tip.innerHTML = `<b>#${t.id} ${esc(t.owner)}</b> <span class="tag">${t.kind}</span><div>${dateClock(t.granted_at)} – ${t.ended_at ? dateClock(t.ended_at) : "now"}
-        · ran ${dur((t.ended_at ?? Date.now()) - t.granted_at)} · waited ${dur(t.granted_at - t.created_at)}</div>
-        <div>VRAM ${gib(t.peak_vram)} GiB · GTT+sys ${gib(t.peak_gtt + t.peak_sys)} · RAM ${gib(t.peak_rss)} GiB · ${(t.energy_j / 3600).toFixed(0)} Wh</div>
-        <div>${esc(t.state)} ${esc(t.exit_code ?? "")} ${esc(t.end_reason ?? "")}</div><div class="cmd">${cmd(t.argv).slice(0, 300)}</div>`;
-      tip.style.display = "block";
-      tip.style.left = `${Math.min(me.clientX + 14, innerWidth - 480)}px`;
-      tip.style.top = `${me.clientY + 14}px`;
-    });
-    r.addEventListener("mouseleave", () => (tip.style.display = "none"));
-  });
+    cur.data = shown(lg.partial);
+    if (end) pre.scrollTop = pre.scrollHeight;
+  } finally { lg.busy = false; }
 }
 
 // --- data ---------------------------------------------------------------------------------------------------------------
 
 async function refresh() {
-  const [h, s, sm] = await Promise.all([
-    fetch(`/api/history?hours=${Math.max(tlHours, 24)}&limit=3000`).then((r) => r.json()),
+  const [h, s] = await Promise.all([
+    fetch("/api/history?hours=72&limit=300").then((r) => r.json()),
     fetch("/api/stats").then((r) => r.json()),
-    fetch(`/api/samples?hours=${tlHours}`).then((r) => r.json()),
   ]);
-  history = h; stats = s; samples = sm;
+  history = h; stats = s;
   for (const t of history) ownerById.set(t.id, t.owner);
-  renderHistory(); renderStats(); renderTimeline();
+  renderHistory(); renderStats();
   if (state) renderNow();
 }
 
@@ -325,7 +385,7 @@ function onState(s: Any) {
   state = s;
   if (s.holder) ownerById.set(s.holder.id, s.holder.owner);
   for (const q of s.queue) ownerById.set(q.id, q.owner);
-  renderHeader(); renderNow(); renderQueue(); renderAlerts(); renderOthers();
+  renderHeader(); renderNow(); renderQueue(); renderStandby(); renderAlerts();
   const key = `${s.holder?.id}|${s.queue.map((q: Any) => q.id).join(",")}`;
   if (key !== lastKey) { lastKey = key; refresh(); }
 }
@@ -348,10 +408,20 @@ function connect() {
 for (const b of document.querySelectorAll<HTMLButtonElement>("#range button")) b.onclick = () => {
   rangeMin = Number(b.dataset.min); document.querySelectorAll("#range button").forEach((x) => x.classList.toggle("on", x === b)); updateCharts();
 };
-for (const b of document.querySelectorAll<HTMLButtonElement>("#tlRange button")) b.onclick = () => {
-  tlHours = Number(b.dataset.h); document.querySelectorAll("#tlRange button").forEach((x) => x.classList.toggle("on", x === b)); refresh();
+// History and job types, in a dialog
+const past = $<HTMLDialogElement>("#past");
+$("#historyBtn").onclick = () => { refresh(); past.showModal(); };
+$("#pastClose").onclick = () => past.close();
+past.onclick = (ev) => { if (ev.target === past) past.close(); }; // a click on the backdrop
+for (const b of document.querySelectorAll<HTMLButtonElement>("#pastTabs button")) b.onclick = () => {
+  document.querySelectorAll("#pastTabs button").forEach((x) => x.classList.toggle("on", x === b));
+  $("#history").hidden = b.dataset.tab !== "history"; $("#stats").hidden = b.dataset.tab !== "stats";
+  $("#pastNote").textContent = b.dataset.tab === "history" ? HISTORY_NOTE : "learned from past runs; queue estimates come from these";
 };
+const HISTORY_NOTE = "last 3 days · VRAM, GTT+sys and RAM are peaks in GiB";
+$("#pastNote").textContent = HISTORY_NOTE;
 addEventListener("resize", () => { clearTimeout((window as Any)._rs); (window as Any)._rs = setTimeout(resizeCharts, 150); });
 setInterval(refresh, 60_000);
-setInterval(() => { if (state) { renderNow(); renderQueue(); } }, 1000); // tick the clocks
+setInterval(() => { if (state) { renderNow(); renderQueue(); renderStandby(); } }, 1000); // tick the clocks
+setInterval(pollLog, 1000);
 connect();

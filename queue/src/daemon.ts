@@ -86,21 +86,24 @@ async function handle(req: Request, tcp: boolean): Promise<Response> {
       try { return new Response(fs.readFileSync(path.join(C.SPEC_DIR, `${id}.json`))); } catch { return bad("no spec", 404); }
     }
     if (action === "log") {
-      if (!t.log) return bad("no log for this ticket (only submitted jobs have one)", 404);
+      // src=output: the file the job's processes write to (the dashboard), else the submitted job's own log
+      const file = url.searchParams.get("src") === "output" ? t.output ?? t.log : t.log;
+      if (!file) return bad("no log for this ticket (only submitted jobs have one)", 404);
       const off = Number(url.searchParams.get("offset") ?? 0);
       try {
-        const fd = fs.openSync(t.log, "r");
+        const fd = fs.openSync(file, "r");
         const size = fs.fstatSync(fd).size;
         const start = off < 0 ? Math.max(0, size + off) : Math.min(off, size);
         const buf = Buffer.alloc(Math.min(size - start, 4 * 2 ** 20));
         fs.readSync(fd, buf, 0, buf.length, start); fs.closeSync(fd);
-        return json({ offset: start + buf.length, size, text: buf.toString("utf8") });
-      } catch { return json({ offset: 0, size: 0, text: "" }); }
+        return json({ offset: start + buf.length, size, start, path: file, text: buf.toString("utf8") });
+      } catch { return json({ offset: 0, size: 0, start: 0, path: file, text: "" }); }
     }
     if (req.method !== "POST") return bad("POST required", 405);
     if (action === "started") { q.started(id, body); return json({ ok: true }); }
     if (action === "done") { q.done(id, body.exit_code ?? null, body.reason); return json({ ok: true }); }
-    const ok = action === "release" ? q.release(id) : action === "cancel" ? q.cancel(id) : action === "kill" ? q.kill(id) : action === "bump" ? q.bump(id) : null;
+    if (action === "activity") return json(q.activity(id, body));
+    const ok = action === "release" ? q.release(id) : action === "cancel" ? q.cancel(id) : action === "kill" ? q.kill(id) : action === "bump" ? q.bump(id) : action === "urgent" ? q.urgent(id) : null;
     if (ok === null) return bad(`unknown action ${action}`, 404);
     return ok ? json({ ok: true }) : bad(`#${id} is ${t.state}; can't ${action} it`, 409);
   }

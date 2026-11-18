@@ -6,16 +6,20 @@
 //   b70q submit <owner> [options] -- <cmd>   queue a job the daemon runs on its own (survives this shell); prints its id
 //       --creates PATH    skip when PATH exists          --retries N        run again after a failure (crash, OOM)
 //       --chunked         exit 99 = more to do: run again from the back of the line (--more-code N for another code)
+//       --no-turn         (old) no effect: every job is first in, first out
 //       --log PATH        output here (default ~/.local/state/b70q/logs/<id>.log)   --exit-file PATH  exit code here
 //       --on-exit 'cmd'   run when the job (all chunks/retries) is over; env B70Q_TICKET B70Q_EXIT B70Q_STATE B70Q_LOG
 //       --ram-gib N       start only when N GiB host RAM is free     --vram-gib N   expected VRAM (shown)
 //       --note TEXT       label in the queue      --next   next in line      --min-gib N   (old) max VRAM in use at start
 //   b70q serve <owner> [--idle 15m] [options] -- <cmd>   a server: stopped after --idle on the GPU while others wait
+//   b70q serve <owner> --standby [options] -- <cmd>      a model that stays loaded: loads when the card is free, stopped
+//                                                        when a job waits and the GPU has been idle a minute, then
+//                                                        queued again to load when the card is free
 //   b70q wait <id>                       block until a ticket ends; exits with its exit code
 //   b70q log <id> [-f]                   output of a submitted job
 //   b70q acquire <owner> [--ttl 4h] | release <id>
 //   b70q kill <id> | cancel <id> | bump <id>
-//   b70q pause [reason] | resume | ack <alert-id>
+//   b70q pause [reason] | resume | ack <alert-id>   pause: the job on the card finishes, nothing new starts
 //   b70q history [n] | stats | web
 import { PORT } from "./config";
 import { api, dur, gib, up } from "./client";
@@ -47,15 +51,22 @@ async function ls() {
     console.log(`\n${c("b", "Now")}  #${h.id} ${c("cyan", h.owner)} (${h.kind}) for ${dur(s.t - h.granted_at)}${h.est_ms ? c("dim", ` of ~${dur(h.est_ms)}`) : ""}`);
     if (h.note) console.log(`  ${h.note}`);
     if (h.argv.length) console.log(`  ${c("dim", cmdText(h.argv))}`);
-    console.log(`  VRAM ${gib(u.vram)} GiB  GTT ${gib(u.gtt)}  sys ${gib(u.sys)}  RAM ${gib(u.rss)} GiB  GPU ${((u.busy ?? 0) * 100).toFixed(0)}%` +
-      (s.turn && s.turn.owner === h.owner ? c("dim", `  turn left ${dur(s.turn.left_ms)}`) : ""));
+    console.log(`  VRAM ${gib(u.vram)} GiB  GTT ${gib(u.gtt)}  sys ${gib(u.sys)}  RAM ${gib(u.rss)} GiB  GPU ${((u.busy ?? 0) * 100).toFixed(0)}%`);
   }
   if (s.queue.length) {
     console.log(`\n${c("b", "Queue")}`);
     table([["", "#", "owner", "kind", "waiting", "starts ~", "takes ~", "command"].map((x) => c("dim", x)),
       ...s.queue.map((t: any) => [String(t.position), String(t.id), (t.priority ? c("yel", "▲ ") : "") + t.owner,
-        t.kind + (t.opts?.server ? " server" : "") + (t.chunk ? ` chunk ${t.chunk + 1}` : "") + (t.attempt ? ` retry ${t.attempt}` : ""),
+        t.kind + (t.opts?.standby ? (t.opts.when_free ? " standby (when free)" : " standby") : t.opts?.server ? " server" : "") + (t.chunk ? ` chunk ${t.chunk + 1}` : "") + (t.attempt ? ` retry ${t.attempt}` : ""),
         dur(s.t - t.created_at), clock(t.eta_start), dur(t.est_ms), (t.note ? `${t.note}: ` : "") + cmdText(t.argv)])]);
+  }
+  for (const b of s.standby ?? []) {   // models that stay loaded until the card is wanted; the current one loads when it is free
+    if (b === s.standby[0]) console.log(`\n${c("b", "Standby")}`);
+    console.log(`  #${b.id} ${c("cyan", b.owner)}  ${b.note ?? ""}  ` + (b.loaded
+      ? c("grn", "loaded") + c("dim", b.busy ? ", in use" : `, idle${b.idle_ms != null ? ` ${dur(b.idle_ms)}` : ""}; steps aside when a job waits`)
+      : b.position ? c("yel", "in line") + c("dim", ` (${b.position} in the queue) to load`)
+      : b.current ? c("yel", "unloaded") + c("dim", "; the current model: loads as soon as nothing is queued")
+      : c("dim", "unloaded; loads when a request comes in")));
   }
   if (s.others.length) {
     console.log(`\n${c("b", "Also on the card")}`);
@@ -122,7 +133,7 @@ switch (cmd) {
   case "submit": case "serve": {
     const owner = rest.shift()!;
     const f = flags(rest, SUBMIT_FLAGS);
-    if (cmd === "serve") { f.opts.server = true; f.opts.idle_s ??= 15 * 60; }
+    if (cmd === "serve") { f.opts.server = true; if (!f.opts.standby) f.opts.idle_s ??= 15 * 60; }
     if (!owner || owner.startsWith("-") || !rest.length) { console.error(`b70q ${cmd} <owner> [options] -- <cmd...>`); process.exit(2); }
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "B70Q_TICKET")) as Record<string, string>;
     const r = await api("POST", "/api/tickets", {

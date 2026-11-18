@@ -8,7 +8,8 @@
 //
 // options: --min-gib N (old), --next, --note TEXT, --creates PATH (skip if it exists), --ram-gib N (wait for free host
 // RAM), --vram-gib N (expected), --idle DUR (server: stopped after DUR idle on the GPU while others wait), --server
-// (same, 15 min), --on-exit 'shell cmd', --exit-file PATH. Durations: 90, 90s, 15m, 4h.
+// (same, 15 min), --standby (server: the card's idle model, see the README), --on-exit 'shell cmd', --exit-file PATH.
+// Durations: 90, 90s, 15m, 4h.
 //
 // <cmd> gets B70Q_TICKET=<id> in its environment: the daemon uses it to measure the job and to spot leftovers, and a
 // b70-lease run inside it (a script that takes the lease itself) runs at once instead of deadlocking. After `acquire`,
@@ -56,10 +57,12 @@ export function parseFlags(rest: string[], allow: Set<string>, oldStyle = false)
         case "--vram-gib": f.opts.vram_gib = Number(val(a)); break;
         case "--idle": f.opts.idle_s = parseTtl(val(a)); f.opts.server = true; break;
         case "--server": f.opts.server = true; f.opts.idle_s ??= 15 * 60; break;
+        case "--standby": f.opts.standby = true; f.opts.server = true; break;
         case "--on-exit": f.opts.on_exit = ["bash", "-c", val(a)]; break;
         case "--exit-file": f.opts.exit_file = val(a); break;
         case "--retries": f.opts.retries = Number(val(a)); break;
         case "--chunked": f.opts.more_code = 99; break;
+        case "--no-turn": break; // (old) turns are gone: every job is FIFO
         case "--more-code": f.opts.more_code = Number(val(a)); break;
       }
     }
@@ -68,9 +71,9 @@ export function parseFlags(rest: string[], allow: Set<string>, oldStyle = false)
   return f;
 }
 
-export const RUN_FLAGS = new Set(["--min-gib", "--next", "--note", "--creates", "--ram-gib", "--vram-gib", "--idle", "--server", "--on-exit", "--exit-file"]);
+export const RUN_FLAGS = new Set(["--min-gib", "--next", "--note", "--creates", "--ram-gib", "--vram-gib", "--idle", "--server", "--standby", "--on-exit", "--exit-file"]);
 export const ACQUIRE_FLAGS = new Set([...RUN_FLAGS, "--ttl"]);
-export const SUBMIT_FLAGS = new Set([...RUN_FLAGS, "--retries", "--chunked", "--more-code", "--log"]);
+export const SUBMIT_FLAGS = new Set([...RUN_FLAGS, "--retries", "--chunked", "--more-code", "--log", "--no-turn"]);
 
 async function legacy(args: string[], why = "queue daemon not running; using the old lock"): Promise<never> {
   say(why);
@@ -143,12 +146,15 @@ export async function acquire(owner: string, ttlS: number, f: JobFlags = { opts:
   return id;
 }
 
+// Tickets that want the card now (a standby server waiting for a free card doesn't).
+const contenders = (st: any): any[] => st.queue.filter((t: any) => !t.opts?.when_free);
+
 function holderLine(st: any): string {
   const h = st.holder;
   if (h) return `${h.owner} pid=${h.client_pid ?? 0} since=${new Date(h.granted_at).toLocaleString("sv-SE")} mode=${h.kind} ticket=${h.id}`;
   const k = st.status.kind;
-  if (k === "idle" && !st.queue.length) return "free";
-  if (k === "idle") return `queued: ${st.queue.length} waiting`;
+  if (k === "idle" && !contenders(st).length) return "free";
+  if (k === "idle") return `queued: ${contenders(st).length} waiting`;
   return `${k}: ${st.status.text}`;
 }
 
@@ -187,17 +193,17 @@ async function main(args: string[]): Promise<number> {
   if (cmd === "status") {
     console.log(`lease: ${holderLine(st)}`);
     console.log(`vram_gib: ${st.card ? (st.card.vramUsed / 2 ** 30).toFixed(2) : ""}`);
-    console.log(`queue: ${st.queue.length} waiting`);
+    console.log(`queue: ${contenders(st).length} waiting`);
     return 0;
   }
   if (cmd === "vram") { console.log(st.card ? (st.card.vramUsed / 2 ** 30).toFixed(2) : ""); return 0; }
-  if (cmd === "waiters") { console.log(st.queue.length); return 0; }
+  if (cmd === "waiters") { console.log(contenders(st).length); return 0; }
   if (cmd === "yield") {
     // Between two holds of a chunked job: if anyone is waiting, wait until one of them has the card.
     const max = Number(rest[0] ?? 120) * 1000, t0 = Date.now();
     await Bun.sleep(3000);
     let s = await api("GET", "/api/state");
-    while (Date.now() - t0 < max && s.queue.length && !s.holder) { await Bun.sleep(2000); s = await api("GET", "/api/state"); }
+    while (Date.now() - t0 < max && contenders(s).length && !s.holder) { await Bun.sleep(2000); s = await api("GET", "/api/state"); }
     if (Date.now() - t0 > 3500) say(`yielded ${Math.round((Date.now() - t0) / 1000)}s, now ${holderLine(s)}`);
     return 0;
   }

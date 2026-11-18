@@ -33,6 +33,9 @@ export interface Sample {
   procs: Map<number, Proc>;
 }
 
+// Tests: a card nobody uses (the real one may be busy with the real queue's jobs).
+const EMPTY = process.env.B70Q_TEST_EMPTY_CARD === "1";
+
 export class Card {
   slot = ""; sysdev = ""; render = ""; fd = -1;
   private hwmon?: string;
@@ -99,12 +102,12 @@ export class Card {
     const mem = meminfo();
     const procs = scanProcs();
     return {
-      t, vramUsed: used, vramTotal: total, power, util,
+      t, vramUsed: EMPTY ? 0 : used, vramTotal: total, power, util,
       temp: this.paths.temp ? (readInt(this.paths.temp) ?? 0) / 1000 : undefined,
       vramTemp: this.paths.vramTemp ? (readInt(this.paths.vramTemp) ?? 0) / 1000 : undefined,
       freq: this.gt ? readInt(`${this.gt}/freq0/act_freq`) : undefined,
       memAvail: mem.MemAvailable ?? 0, memTotal: mem.MemTotal ?? 0,
-      clients: this.clients(procs), procs,
+      clients: EMPTY ? [] : this.clients(procs), procs,
     };
   }
 

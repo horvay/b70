@@ -28,6 +28,7 @@ export interface Ticket {
   peak_vram: number; peak_gtt: number; peak_sys: number; peak_rss: number;
   energy_j: number; busy_s: number;
   log: string | null;
+  output: string | null; // the file the job's output goes to, found from its processes (dashboard log)
   opts: string; // JSON Opts
   note: string | null; // human label shown in the queue
   grp: number | null; // first ticket of a chunked/retried series
@@ -46,6 +47,8 @@ export interface Opts {
   ram_gib?: number; // wait until this much host RAM is available before starting
   vram_gib?: number; // expected VRAM, shown in the queue
   server?: boolean;
+  standby?: boolean; // server: the card's idle model; steps aside when another job waits and it is not in use
+  when_free?: boolean; // standby: waiting at the back until the card is free (cleared by urgent())
 }
 
 export function open(): Database {
@@ -80,7 +83,7 @@ export function open(): Database {
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
   `);
   const cols = new Set((db.query("PRAGMA table_info(tickets)").all() as { name: string }[]).map((c) => c.name));
-  for (const [c, def] of [["opts", "TEXT NOT NULL DEFAULT '{}'"], ["note", "TEXT"], ["grp", "INTEGER"], ["chunk", "INTEGER NOT NULL DEFAULT 0"], ["attempt", "INTEGER NOT NULL DEFAULT 0"]])
+  for (const [c, def] of [["opts", "TEXT NOT NULL DEFAULT '{}'"], ["note", "TEXT"], ["grp", "INTEGER"], ["chunk", "INTEGER NOT NULL DEFAULT 0"], ["attempt", "INTEGER NOT NULL DEFAULT 0"], ["output", "TEXT"]])
     if (!cols.has(c)) db.exec(`ALTER TABLE tickets ADD COLUMN ${c} ${def}`);
   const cutoff = Date.now() - KEEP_DAYS * 86_400_000;
   db.query("DELETE FROM samples WHERE t < ?").run(cutoff);

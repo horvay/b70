@@ -11,14 +11,18 @@
   <header>
     <div class="brand">B70 <span>queue</span></div>
     <div id="pill" class="pill">…</div>
+    <div id="pausePill" class="pill paused" hidden title="the job on the card finishes; nothing new starts until the queue is resumed">PAUSED</div>
     <div id="statusText" class="statusText"></div>
     <div class="kpis" id="kpis"></div>
-    <div class="actions"><button id="pauseBtn"></button></div>
+    <div class="actions"><button id="historyBtn">History</button><button id="pauseBtn"></button></div>
   </header>
   <main>
-    <section class="card now" id="now"><h2>Now</h2><div class="body"></div></section>
-    <section class="card queue" id="queue"><h2>Queue</h2><div class="body"></div></section>
-    <section class="card wide live">
+    <div class="pair">
+      <section class="card now" id="now"><h2>Now</h2><div class="body"></div></section>
+      <section class="card queue" id="queue"><h2>Queue</h2><div class="body"></div></section>
+    </div>
+    <section class="card standby" id="standby" hidden><h2>Standby model</h2><div class="body"></div></section>
+    <section class="card live">
       <h2>Live <span class="seg" id="range"><button data-min="15" class="on">15 min</button><button data-min="60">1 h</button></span></h2>
       <div class="charts">
         <div><h3>VRAM <small>GiB · card / current job</small></h3><div id="chVram"></div></div>
@@ -27,16 +31,15 @@
         <div><h3>Temperature <small>°C · GPU / VRAM</small></h3><div id="chTemp"></div></div>
       </div>
     </section>
-    <section class="card wide">
-      <h2>Timeline <span class="seg" id="tlRange"><button data-h="6">6 h</button><button data-h="24" class="on">24 h</button><button data-h="72">3 d</button></span></h2>
-      <div id="timeline"></div>
-    </section>
-    <section class="card alerts" id="alerts"><h2>Alerts</h2><div class="body"></div></section>
-    <section class="card others" id="others"><h2>Also on the card</h2><div class="body"></div></section>
-    <section class="card wide" id="history"><h2>History</h2><div class="body"></div></section>
-    <section class="card wide" id="stats"><h2>Job types <small>learned from past runs; queue estimates come from these</small></h2><div class="body"></div></section>
+    <section class="card alerts" id="alerts" hidden><h2>Alerts</h2><div class="body"></div></section>
+    <section class="card log" id="log"><h2>Log <small id="logWhat"></small></h2><pre id="logText"></pre></section>
   </main>
-  <div id="tip" class="tip"></div>
+  <dialog id="past">
+    <h2><span class="seg" id="pastTabs"><button data-tab="history" class="on">History</button><button data-tab="stats">Job types</button></span>
+      <small id="pastNote"></small><button class="small close" id="pastClose" title="close (Esc)">✕</button></h2>
+    <div id="history"><div class="body"></div></div>
+    <div id="stats" hidden><div class="body"></div></div>
+  </dialog>
   <script type="module" src="./app.ts"></script>
 </body>
 </html>

@@ -19,11 +19,14 @@ export const LEGACY_LOCK = env("B70Q_LEGACY_LOCK", path.join(LEGACY_DIR, "lock")
 export const LEGACY_HOLDER = path.join(LEGACY_DIR, "holder");
 export const LEGACY_SCRIPT = path.join(import.meta.dir, "..", "legacy", "b70-lease");
 
-// Scheduling (Greg, 2026-10-21): FIFO with 30-minute turns; NQ's game master goes next in line; manual runs outside
-// the queue are detected and waited for.
-export const TURN_MS = num("B70Q_TURN_MIN", 30) * 60_000;
-export const GRACE_MS = num("B70Q_GRACE_S", 20) * 1000; // card kept for the turn owner's next job in a loop
-export const NEXT_OWNERS = new RegExp(env("B70Q_NEXT_OWNERS", "^(nq|neverending)"), "i");
+// Scheduling (Greg, 2026-11-17): first in, first out; only the submitter's --next / `b70q now` moves a ticket up.
+// Manual runs outside the queue are detected and waited for.
+// Standby servers, the card's idle model (Greg, 2026-10-23): one loads once nothing is queued (Greg, 2026-10-25: no
+// wait after the card frees; B70Q_STANDBY_SETTLE_S brings one back), and steps aside for another job once no request has run on it for STANDBY_QUIET.
+export const STANDBY_SETTLE_MS = num("B70Q_STANDBY_SETTLE_S", 0) * 1000;
+export const STANDBY_QUIET_MS = num("B70Q_STANDBY_QUIET_S", 60) * 1000;
+export const STANDBY_REPORT_MS = 15_000; // a standby server that hasn't reported for this long is judged by the GPU
+export const STANDBY_YIELD_MS = 60_000; // told to step aside this long ago and still on the card: stopped
 
 // Card. Outside-queue processes count as using the card above this much VRAM.
 export const FOREIGN_MIN_BYTES = num("B70Q_FOREIGN_MIB", 256) * 2 ** 20;
