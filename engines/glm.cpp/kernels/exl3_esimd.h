@@ -299,13 +299,22 @@ struct HadInKernel {
     const TIn* x; const fp16* suh; fp16* xh;
     int M, Kdim, S, x_stride, Mp;   // Mp: padded row count of the blocked xh layout
     int row_major;                  // 1: plain [S][M][Kdim] output (prefill GEMM operand)
+    int zero_pad = 0;               // blocked layout: threads for rows M .. Mp - 1 too, which write the pad rows' zeros
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         int id = it.get_global_id(0);
         int kb_n = Kdim / 128;
         int kb = id % kb_n;
-        int m = (id / kb_n) % M;
-        int g = id / (kb_n * M);
+        const int Mr = zero_pad ? Mp : M;
+        int m = (id / kb_n) % Mr;
+        int g = id / (kb_n * Mr);
         if (g >= S) return;
+        if (m >= M) {
+            int kt = Kdim / 16;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                block_store<fp16, 16>(xh + (((size_t)g * kt + kb * 8 + i) * Mp + m) * 16, simd<fp16, 16>(0));
+            return;
+        }
         simd<TIn, 128> xi = block_load<TIn, 128>(x + (size_t)m * x_stride + kb * 128);
         simd<fp16, 128> su = block_load<fp16, 128>(suh + (size_t)g * Kdim + kb * 128);
         simd<float, 128> v = convert<float>(xi) * convert<float>(su);
@@ -333,6 +342,11 @@ template <typename TOut, typename TPart = float>
 struct HadOutKernel {
     const TPart* part; const fp16* svh; TOut* out;
     int M, N, P, out_stride;
+    // a merged linear (Exl3Linear::merge): nsh > 0 outputs, output s holds columns c_s .. c_(s + 1) - 1 as [M, width]
+    // (scalars, not arrays: a kernel argument array indexed at run time would live in private memory)
+    int nsh = 0;
+    TOut* o0 = nullptr; TOut* o1 = nullptr; TOut* o2 = nullptr; TOut* o3 = nullptr;
+    int c1 = 0, c2 = 0, c3 = 0, c4 = 0;
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         int id = it.get_global_id(0);
         int nb_n = N / 128;
@@ -345,7 +359,17 @@ struct HadOutKernel {
         fwht128(v);
         simd<fp16, 128> sv = block_load<fp16, 128>(svh + nb * 128);
         v = v * kRsqrt128 * convert<float>(sv);
-        block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
+        TOut* dst = out + (size_t)m * out_stride + nb * 128;
+        if (nsh > 0) {
+            const int c = nb * 128;
+            TOut* o = o0;
+            int lo = 0, hi = c1;
+            if (nsh > 1 && c >= c1) { o = o1; lo = c1; hi = c2; }
+            if (nsh > 2 && c >= c2) { o = o2; lo = c2; hi = c3; }
+            if (nsh > 3 && c >= c3) { o = o3; lo = c3; hi = c4; }
+            dst = o + (size_t)m * (hi - lo) + (c - lo);
+        }
+        block_store<TOut, 128>(dst, convert<TOut>(v));
     }
 };
 
@@ -357,6 +381,7 @@ template <typename TIn>
 struct HadInQ8Kernel {
     const TIn* x; const fp16* suh; int8_t* xq; float* sx;
     int M, Kdim, S, x_stride, Ms;   // Ms: row stride of xq / sx (M padded for the GEMM)
+    float smul = 1.0f;              // sx = scale * smul (glm.cpp folds the weights' static scale in here)
     ESIMD_INLINE simd<float, 128> blk(int g, int m, int kb) const {
         simd<TIn, 128> xi = block_load<TIn, 128>(x + (size_t)m * x_stride + kb * 128);
         simd<fp16, 128> su = block_load<fp16, 128>(suh + (size_t)g * Kdim + kb * 128);
@@ -377,7 +402,7 @@ struct HadInQ8Kernel {
         float amax = hmax<float>(mx);
         float sc = amax > 0.0f ? amax / 127.0f : 1.0f;
         float inv = 1.0f / sc;
-        sx[(size_t)g * Ms + m] = sc;
+        sx[(size_t)g * Ms + m] = sc * smul;
         for (int kb = 0; kb < kb_n; ++kb)
             block_store<int8_t, 128>(xq + ((size_t)g * Ms + m) * Kdim + kb * 128,
                                      convert<int8_t>(rnde<float>(blk(g, m, kb) * inv)));
@@ -390,6 +415,7 @@ template <typename TIn, int TPR, int NB>
 struct HadInQ8WgKernel {
     const TIn* x; const fp16* suh; int8_t* xq; float* sx;
     int M, Kdim, S, x_stride, Ms;
+    float smul = 1.0f;
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         slm_init<TPR * sizeof(float)>();
         int t = it.get_local_id(0);
@@ -418,7 +444,7 @@ struct HadInQ8WgKernel {
         float amax = hmax<float>(slm_block_load<float, TPR>(0));
         float sc = amax > 0.0f ? amax / 127.0f : 1.0f;
         float inv = 1.0f / sc;
-        if (t == 0) sx[(size_t)g * Ms + m] = sc;
+        if (t == 0) sx[(size_t)g * Ms + m] = sc * smul;
 #pragma unroll
         for (int j = 0; j < NB; ++j) {
             int kb = t + j * TPR;

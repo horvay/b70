@@ -29,7 +29,10 @@ Gated DeltaNet (48). No hyper-connection streams, no routed experts, no n-gram t
 
 16 k-heads, 48 v-heads, head dim 128, conv kernel 4: the same sizes as Flash-Next, so `q4ops::gdn_gates`, `gdn_conv` and
 `gdn_delta` serve unchanged. The one change is `output_gate_type: swish`: the output norm gates with `silu(z)` where
-Flash-Next uses `sigmoid(z)` (`HF` `Qwen3_5RMSNormGated`), `q35ops::gdn_norm`.
+Flash-Next uses `sigmoid(z)` (`HF` `Qwen3_5RMSNormGated`), `q35ops::gdn_norm`. Prompt rows take the chunked form
+instead of the per-token recurrence (`kernels/q35_gdn.h`, README "prompt reading"); decode rows keep the recurrence, with
+a lane per value column (`delta_lane_one`: a lane owns 32 key rows of its column, sums over k run over those rows then
+the 4 quarters in order; `Q35_DELTA=0`: a lane per key row, sub-group sums).
 
 ## 3. Attention
 
@@ -39,6 +42,10 @@ then rotated. Every key at or before the row's cache position is read: there is 
 `softmax(q k / 16) v * sigmoid(gate)`, then `o_proj`.
 
 KV cache: K (normed, rotated) and V, fp16 `[T, 4, 256]`, 4 KB per token and attention layer, 64 KB per token overall.
+Prompt rows run flash attention (`kernels/q35_fa.h`) over transposed copies of the current layer's K and V (README
+"prompt reading"); decode rows read the cache directly (`kernels/q35_dec.h`: ESIMD, a thread is one row x the 6 query
+heads of a KV head x a piece of that row's keys, K^T by transposed 2D loads into DPAS, P V by VNNI loads, the pieces
+merged by `attn_dec_combine` with the output gate).
 
 ## 4. mRoPE
 
@@ -107,18 +114,27 @@ without drafts, a seeded request gives the same tokens with MTP on or off.
 layer). A decode step reads slot A and writes slot B; its rows of one sequence run in order inside one kernel
 (`gdn_conv_seq`, `gdn_delta_seq`: the arithmetic of the one-row kernels, row after row, state in registers), and keep
 their inputs (qkv fp32, beta, g: 41 KB a row a layer). When row i is rejected, `restore()` replays the accepted rows
-from slot A into slot B with the same kernels (one recorded graph, 2.0 ms, no weights read). Attention K/V needs only
+from slot A into slot B with the same per-row code (`q35ops::gdn_replay`: every GDN layer's conv in one launch, every
+layer's delta rule in a second; a recorded graph, no weights read; `Q35_REPLAY=0`: the two kernels per layer). Attention K/V needs only
 the position moved back. Prompt checkpoints copy the live slot as before.
 
 **Exactness.** Token-identical output needs each row of a k-row step to be summed exactly as a one-row step:
 - EXL3 linears: with MTP all decode rows take the DPAS kernel in one 4-row block (1-4 rows, the same K split), so a
-  row's sums do not depend on the row count. (Without MTP the vector GEMV stays, now with a fixed K split and 4 tiles a
+  row's sums do not depend on the row count. Merged linears (gate + up, GDN qkv + z, attention q + k + v; README
+  "decode") split K by their merged width, the same for every row count. (Without MTP the vector GEMV stays, now with a fixed K split and 4 tiles a
   thread for one row: 47.4 ms a step against 50.1.)
-- Attention: rows of one sequence share a work-group (`attn_dec_grouped`, up to 4), each row's dot products, softmax and
-  value sums in the one-row kernel's order.
-- GDN as above. Checked: every greedy and seeded-sampled run in the README's MTP section gave the no-draft tokens.
+- Attention: a row's threads read nothing of the step's other rows (`kernels/q35_dec.h`). Its pieces come from its own
+  key count (blocks per piece = ceil(blocks / pieces)), its 2D surface ends at its own last key (loads past it read
+  zeros), and the combine merges its own pieces in order. So a verify row computes bit for bit what a one-row step at
+  its position does; `q35_gen decbench` checks it on random data (rows 1..4, 241 to 80K keys).
+- GDN as above; the replay's two launches run the per-row code of the step kernels (`q35_gen bench` compares the state
+  hashes of both replays). Checked: every greedy and seeded-sampled run in the README's MTP section gave the no-draft
+  tokens.
 
-**Draft head.** The MTP's argmax is taken over the first 65,536 vocabulary ids only (`Q35_MTP_HEAD`): the lm_head
-kernels compute that column prefix in place (`Exl3Linear::forward(..., n_cols)`), 1.8 ms a draft instead of 3.1 at 30K,
-with the same acceptance (the common tokens have low ids). A chain stops when the product of its drafts' MTP
-probabilities falls below `Q35_MTP_MIN_P`.
+**Draft head.** The MTP's argmax is taken over part of the vocabulary only. By default that is a set of 128-id blocks
+(`src/q35_blocks.h`, `Q35_MTP_BLOCKS=file`): the blocks of the ids the model emits most on game-master text, and the
+block of `<|im_end|>` / `<think>` / `</think>`. Their lm_head column tiles are gathered at load into a head of their own
+(the output Hadamard works on 128-column groups, so the gathered columns are exact). `Q35_MTP_HEAD=N` takes the first N
+ids instead (the lm_head kernels compute that column prefix in place, `Exl3Linear::forward(..., n_cols)`; 65,536 was
+the default before), 248320 = all. A chain stops when the product of its drafts' MTP probabilities falls below
+`Q35_MTP_MIN_P`.

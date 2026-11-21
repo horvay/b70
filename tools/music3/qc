@@ -1,0 +1,6 @@
+#!/bin/bash
+# qc: quality checks for generated music on the RTX 3080 + CPU (see qc.py). Never uses the B70.
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+export PYTHONPATH=$HOME/.cache/nethack-demucs/lib${PYTHONPATH:+:$PYTHONPATH}
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+exec nice -n 5 $HOME/.local/share/pipx/venvs/whisperx/bin/python "$HERE/qc.py" "$@"

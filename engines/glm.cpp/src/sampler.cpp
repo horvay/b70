@@ -1,5 +1,6 @@
 #include "sampler.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <immintrin.h>
 
@@ -137,6 +138,127 @@ int Sampler::sample(const half* logits) {
         if (r < acc) return idx_[i];
     }
     return idx_[n - 1];
+}
+
+long long Sampler::n_pool = 0, Sampler::n_full = 0, Sampler::n_rest = 0;
+
+// sample()'s penalty of an id seen before, the same float operations
+float Sampler::penalize(int id, float x) const {
+    if (p_.rep_p != 1.0f) x = x > 0 ? x / p_.rep_p : x * p_.rep_p;
+    x -= p_.pres_p + p_.freq_p * count_[id];
+    return x;
+}
+
+void Sampler::pool_row(PoolRow& pr, std::vector<PenEntry>& pen, const int* pending, int npending) const {
+    const bool greedy = p_.temperature <= 0.0f || p_.top_k == 1;
+    const bool penal = p_.rep_p != 1.0f || p_.pres_p != 0.0f || p_.freq_p != 0.0f;
+    pr.rep = p_.rep_p;
+    pr.pen_off = (int)pen.size();
+    if (penal) {
+        // the counts this row's sampling will see: the past, and the tokens sampled before it in this step
+        std::vector<std::pair<int, int>> extra;
+        for (int i = 0; i < npending; i++) {
+            const int id = pending[i];
+            if (id < 0 || id >= V_) continue;
+            auto e = std::find_if(extra.begin(), extra.end(), [&](auto& p) { return p.first == id; });
+            if (e == extra.end()) extra.push_back({id, 1});
+            else e->second++;
+        }
+        for (int v : past_) {
+            int c = count_[v];
+            for (auto& e : extra) if (e.first == v) { c += e.second; e.second = 0; }
+            pen.push_back({v, p_.pres_p + p_.freq_p * c});
+        }
+        for (auto& e : extra) if (e.second) pen.push_back({e.first, p_.pres_p + p_.freq_p * e.second});
+    }
+    pr.pen_n = (int)pen.size() - pr.pen_off;
+    if (greedy) {
+        // the ties at the top (0.01: GPU and host penalties may differ by an ulp)
+        pr.window = 0.01f;
+        pr.inv_t = 0.0f;
+        pr.log_floor = 0.0f;
+    } else {
+        const float lf = std::log(std::max(p_.min_p, 1e-9f));
+        pr.window = -lf * p_.temperature * 1.001f + 0.02f;     // every token above the floor, with room for roundings
+        pr.inv_t = 1.0f / p_.temperature;
+        pr.log_floor = lf;
+    }
+}
+
+int Sampler::sample_pool(const int* ids, const half* raw, int n, int rest_n, float rest_sum, float gmax) {
+    if (n <= 0) return -1;
+    const bool penal = p_.rep_p != 1.0f || p_.pres_p != 0.0f || p_.freq_p != 0.0f;
+    pv_.resize(n);
+    float xmin = INFINITY;
+    for (int i = 0; i < n; i++) {
+        float x = (float)raw[i];
+        if (penal && count_[ids[i]] > 0) x = penalize(ids[i], x);
+        pv_[i] = x;
+        xmin = std::min(xmin, x);
+    }
+    if (p_.temperature <= 0.0f || p_.top_k == 1) {
+        // top2's answer: the largest value, its lowest id
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (best < 0 || pv_[i] > pv_[best] || (pv_[i] == pv_[best] && ids[i] < ids[best])) best = i;
+        n_pool++;
+        return ids[best];
+    }
+    const bool complete = rest_n == 0;
+    const float inv_t = 1.0f / p_.temperature;
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) { pv_[i] *= inv_t; mx = std::max(mx, pv_[i]); }
+    const float floor_p = std::max(p_.min_p, 1e-9f);
+    const float log_floor = mx + std::log(floor_p);
+    pi_.clear();
+    for (int i = 0; i < n; i++)
+        if (pv_[i] >= log_floor) pi_.push_back(i);
+    // the k-th candidate must sit clear of the pool's edge, where a token left out could rank by a rounding
+    const float edge = xmin * inv_t;
+    std::vector<float> xs(n);
+    for (int i : pi_) { xs[i] = pv_[i]; pv_[i] = std::exp(pv_[i] - mx); }
+    auto cmp = [&](int a, int b) { return pv_[a] > pv_[b] || (pv_[a] == pv_[b] && ids[a] < ids[b]); };
+    size_t m = pi_.size();
+    if (p_.top_k > 0 && (size_t)p_.top_k < pi_.size()) {
+        std::partial_sort(pi_.begin(), pi_.begin() + p_.top_k, pi_.end(), cmp);
+        if (!complete && !(xs[pi_[p_.top_k - 1]] > edge + 1e-3f * std::max(1.0f, inv_t))) return -1;
+    } else {
+        if (!complete) {
+            if (p_.top_k > 0) return -1;              // fewer candidates in the pool than k: the k-th is outside
+            if (p_.top_p >= 1.0f) return -1;          // the whole window is a candidate
+        }
+        std::sort(pi_.begin(), pi_.end(), cmp);
+    }
+    if (p_.top_k > 0) m = std::min(m, (size_t)p_.top_k);
+    bool used_rest = false;
+    if (p_.top_p < 1.0f) {
+        double kept = 0, tot = 0;
+        for (size_t i = 0; i < m; i++) tot += pv_[pi_[i]];
+        if (!complete && p_.top_k <= 0) {
+            // the window's tokens past the pool, summed on the card, after the pool's own (they are all smaller)
+            tot += (double)rest_sum * std::exp((double)gmax * inv_t - (double)mx);
+            used_rest = true;
+        }
+        size_t c = 0;
+        bool cut = false;
+        for (; c < m; c++) {
+            kept += pv_[pi_[c]];
+            if (kept >= p_.top_p * tot) { c++; cut = true; break; }
+        }
+        if (!cut && !complete && p_.top_k <= 0) return -1;     // the cut lies past the pool
+        m = std::max<size_t>(1, c);
+    }
+    double tot = 0;
+    for (size_t i = 0; i < m; i++) tot += pv_[pi_[i]];
+    std::uniform_real_distribution<double> U(0.0, tot);
+    double r = U(rng_), acc = 0;
+    n_pool++;
+    if (used_rest) n_rest++;
+    for (size_t i = 0; i < m; i++) {
+        acc += pv_[pi_[i]];
+        if (r < acc) return ids[pi_[i]];
+    }
+    return ids[pi_[m - 1]];
 }
 
 }  // namespace glm

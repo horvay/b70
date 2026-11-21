@@ -1,0 +1,783 @@
+diff --git c/build_sycl.sh w/build_sycl.sh
+index fa8e13b..b949174 100755
+--- c/build_sycl.sh
++++ w/build_sycl.sh
+@@ -2,7 +2,7 @@
+ # Build sd-cli on ggml's SYCL backend (SYCL + oneMKL over Level Zero, no Vulkan) for the Arc Pro B70.
+ #   ONEAPI   DPC++ 2025.3 (the same libsycl.so.8 the native xpu_sdpa libraries use, so one SYCL runtime per process)
+ #   MKLROOT  oneMKL 2025.3.1 from Intel's apt repo, unpacked (no root): mkl-{core,core-devel,sycl-blas,sycl-include,...}
+-# Kernels are compiled ahead of time for BMG G31 (no JIT at startup). Build parallelism stays low (shared machine).
++# Kernels are compiled ahead of time for BMG G31 (no JIT at startup). Builds run at low priority (nice 10) with up to 28 jobs.
+ # Usage: ./build_sycl.sh [build-dir] (default build-sycl)
+ set -euo pipefail
+ HERE="$(cd "$(dirname "$0")" && pwd)"
+@@ -32,7 +32,14 @@ cmake -S "$HERE" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+   -DLEVEL_ZERO_DEV_INCLUDE_DIR="$ZE_INC" -DZE_LOADER_LIB=/usr/lib/libze_loader.so \
+   -DCMAKE_EXE_LINKER_FLAGS="-static-intel -Wl,--disable-new-dtags -L$UMF -Wl,--no-as-needed -lumf -Wl,--as-needed -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen \"-device bmg-g31\"" \
+   -DCMAKE_BUILD_RPATH="$CMPLR/lib;$UMF;$MKLROOT/lib;$ONEDNN/lib" -DCMAKE_INSTALL_RPATH="$CMPLR/lib;$UMF;$MKLROOT/lib;$ONEDNN/lib"
+-nice -n 10 cmake --build "$BUILD" --target sd-cli -j "${JOBS:-3}"
++# Low priority (nice 10), so it can use most cores: 28 compile jobs, capped at one per 2 GB of free memory (SYCL
++# compiles are memory-hungry). JOBS=N overrides.
++if [[ -z "${JOBS:-}" ]]; then
++  free_gb=$(awk '/MemAvailable/ { print int($2 / 1048576) }' /proc/meminfo)
++  JOBS=$(( free_gb / 2 < 28 ? free_gb / 2 : 28 )); (( JOBS >= 3 )) || JOBS=3
++fi
++echo "building with $JOBS jobs (nice 10)"
++nice -n 10 cmake --build "$BUILD" --target sd-cli -j "$JOBS"
+ ldd "$BUILD/bin/sd-cli" | grep -Ei 'vulkan|torch|c10' && { echo "unexpected Vulkan/torch dependency" >&2; exit 1; } || true
+ ldd "$BUILD/bin/sd-cli" | grep "not found" && { echo "missing shared libraries" >&2; exit 1; } || true
+ echo "built $BUILD/bin/sd-cli"
+diff --git c/ggml w/ggml
+--- c/ggml
++++ w/ggml
+@@ -1 +1 @@
+-Subproject commit 88818dd08f16878258a1037a6186937b6d1b17a9
++Subproject commit 88818dd08f16878258a1037a6186937b6d1b17a9-dirty
+diff --git c/src/conditioning/conditioner.hpp w/src/conditioning/conditioner.hpp
+index 91e52ca..2ea635a 100644
+--- c/src/conditioning/conditioner.hpp
++++ w/src/conditioning/conditioner.hpp
+@@ -2985,8 +2985,14 @@ struct LLMEmbedder : public Conditioner {
+         } else if (version == VERSION_MOSS_IMAGE) {
+             prompt_template_encode_start_idx = 0;
+             max_length                       = 4096;
+-            prompt                           = "<|im_start|>user\n" + conditioner_params.text + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+-            prompt_attn_range                = {0, 0};
++            prompt                           = "<|im_start|>user\n";
++
++            // Same as Qwen Image: parse (text:1.3) / [text] weights in the user text only.
++            prompt_attn_range.first = static_cast<int>(prompt.size());
++            prompt += conditioner_params.text;
++            prompt_attn_range.second = static_cast<int>(prompt.size());
++
++            prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+         } else if (version == VERSION_FLUX2_KLEIN) {
+             prompt_template_encode_start_idx = 0;
+             min_length                       = 512;
+diff --git c/src/core/ggml_extend.cpp w/src/core/ggml_extend.cpp
+index 660990b..d050b6d 100644
+--- c/src/core/ggml_extend.cpp
++++ w/src/core/ggml_extend.cpp
+@@ -694,15 +694,21 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+         }
+         k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+ 
+-        v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
+-        v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+-        if (pad_head) {
+-            v_in = ggml_pad(ctx, v_in, 64 - d_head, 0, 0, 0);
++        if (!pad_head && kv_scale == 1.0f) {
++            // one strided cast instead of a contiguous f32 copy followed by a cast
++            v_in = ggml_cast(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3), GGML_TYPE_F16);
++            v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
++        } else {
++            v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
++            v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
++            if (pad_head) {
++                v_in = ggml_pad(ctx, v_in, 64 - d_head, 0, 0, 0);
++            }
++            if (kv_scale != 1.0f) {
++                v_in = ggml_ext_scale(ctx, v_in, kv_scale);
++            }
++            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+         }
+-        if (kv_scale != 1.0f) {
+-            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+-        }
+-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+ 
+         if (mask_in != nullptr) {
+             // ggml_flash_attn_ext expects the mask as a contiguous F16 tensor shaped
+diff --git c/src/model/adapter/lora.hpp w/src/model/adapter/lora.hpp
+index e9d20a4..6491fd7 100644
+--- c/src/model/adapter/lora.hpp
++++ w/src/model/adapter/lora.hpp
+@@ -587,9 +587,12 @@ struct LoraModel : public GGMLRunner {
+                               ggml_tensor* x,
+                               ggml_tensor* model_weight,
+                               WeightAdapter::ForwardParams forward_params,
+-                              const std::string& model_tensor_name) {
++                              const std::string& model_tensor_name,
++                              std::vector<ggml_tensor*>* pieces = nullptr) {
+         ggml_tensor* out_diff = nullptr;
+         int index             = 0;
++        // the per-key diffs that out_diff concatenates along ne0 (linear only), for add_out_diff
++        std::vector<ggml_tensor*> linear_pieces;
+ 
+         std::vector<std::string> used_tensors;
+         bool is_conv2d = forward_params.op_type == WeightAdapter::ForwardParams::op_type_t::OP_CONV2D;
+@@ -676,7 +679,10 @@ struct LoraModel : public GGMLRunner {
+                 scale_value *= multiplier;
+ 
+                 auto curr_out_diff = ggml_ext_lokr_forward(ctx, backend, x, lokr_w1, lokr_w1_a, lokr_w1_b, lokr_w2, lokr_w2_a, lokr_w2_b, is_conv2d, forward_params.conv2d, scale_value);
+-                if (out_diff == nullptr) {
++                if (pieces != nullptr && !is_conv2d) {
++                    linear_pieces.push_back(curr_out_diff);
++                    out_diff = out_diff == nullptr ? curr_out_diff : out_diff;
++                } else if (out_diff == nullptr) {
+                     out_diff = curr_out_diff;
+                 } else {
+                     out_diff = ggml_concat(ctx, out_diff, curr_out_diff, 0);
+@@ -812,6 +818,8 @@ struct LoraModel : public GGMLRunner {
+                 if (lora_mid) {
+                     lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                 }
++                // scale the rank-r intermediate rather than the full-width output: same result, a fraction of the work
++                lx = ggml_ext_scale(ctx, lx, scale_value, true);
+                 lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+             } else {  // OP_CONV2D
+                 lx = ggml_ext_conv_2d(ctx,
+@@ -860,8 +868,12 @@ struct LoraModel : public GGMLRunner {
+                                       forward_params.conv2d.scale);
+             }
+ 
+-            auto curr_out_diff = ggml_ext_scale(ctx, lx, scale_value, true);
+-            if (out_diff == nullptr) {
++            auto curr_out_diff = is_conv2d ? ggml_ext_scale(ctx, lx, scale_value, true) : lx;
++            if (pieces != nullptr && !is_conv2d) {
++                // add_out_diff adds each piece into its slice of the output: no concat copies
++                linear_pieces.push_back(curr_out_diff);
++                out_diff = out_diff == nullptr ? curr_out_diff : out_diff;
++            } else if (out_diff == nullptr) {
+                 out_diff = curr_out_diff;
+             } else {
+                 out_diff = ggml_concat(ctx, out_diff, curr_out_diff, is_conv2d ? 2 : 0);
+@@ -884,6 +896,12 @@ struct LoraModel : public GGMLRunner {
+ 
+         int64_t expected_out_dim = is_conv2d ? model_weight->ne[3] : model_weight->ne[1];
+         int64_t actual_out_dim   = out_diff->ne[is_conv2d ? 2 : 0];
++        if (!linear_pieces.empty()) {
++            actual_out_dim = 0;
++            for (auto* piece : linear_pieces) {
++                actual_out_dim += piece->ne[0];
++            }
++        }
+ 
+         if (actual_out_dim != expected_out_dim) {
+             for (const auto& name : used_tensors) {
+@@ -900,9 +918,41 @@ struct LoraModel : public GGMLRunner {
+             applied_lora_tensors.insert(name);
+         }
+ 
++        if (pieces != nullptr) {
++            if (!linear_pieces.empty()) {
++                *pieces = linear_pieces;
++            } else {
++                *pieces = {out_diff};
++            }
++        }
+         return out_diff;
+     }
+ 
++    // out + this LoRA's output diff (out unchanged if it has none). A fused linear (e.g. qkv) whose LoRA comes in one
++    // piece per part gets each piece added into its slice of out in place, instead of concatenating the pieces into a
++    // full-width diff first.
++    ggml_tensor* add_out_diff(ggml_context* ctx,
++                              ggml_backend_t backend,
++                              ggml_tensor* x,
++                              ggml_tensor* model_weight,
++                              WeightAdapter::ForwardParams forward_params,
++                              const std::string& model_tensor_name,
++                              ggml_tensor* out) {
++        std::vector<ggml_tensor*> pieces;
++        if (get_out_diff(ctx, backend, x, model_weight, forward_params, model_tensor_name, &pieces) == nullptr) {
++            return out;
++        }
++        if (pieces.size() == 1) {
++            return ggml_add_inplace(ctx, out, pieces[0]);
++        }
++        size_t offset = 0;
++        for (auto* piece : pieces) {
++            out = ggml_acc_inplace(ctx, out, piece, out->nb[1], out->nb[2], out->nb[3], offset);
++            offset += piece->ne[0] * out->nb[0];
++        }
++        return out;
++    }
++
+     ggml_cgraph* build_lora_graph(const std::map<std::string, ggml_tensor*>& model_tensors,
+                                   const std::set<std::string>& model_tensor_names,
+                                   SDVersion version) {
+@@ -1069,11 +1119,7 @@ public:
+                                    forward_params.conv2d.scale);
+         }
+         for (auto& lora_model : lora_models) {
+-            ggml_tensor* out_diff = lora_model->get_out_diff(ctx, backend, x, w, forward_params, prefix + "weight");
+-            if (out_diff == nullptr) {
+-                continue;
+-            }
+-            out = ggml_add_inplace(ctx, out, out_diff);
++            out = lora_model->add_out_diff(ctx, backend, x, w, forward_params, prefix + "weight", out);
+         }
+         return out;
+     }
+@@ -1098,10 +1144,7 @@ public:
+                 output                = ggml_add_inplace(ctx, output, out_diff);
+             }
+ 
+-            ggml_tensor* out_diff = lora_model->get_out_diff(ctx, backend, x, w, forward_params, prefix + "weight");
+-            if (out_diff != nullptr) {
+-                output = ggml_add_inplace(ctx, output, out_diff);
+-            }
++            output = lora_model->add_out_diff(ctx, backend, x, w, forward_params, prefix + "weight", output);
+         }
+         return output;
+     }
+diff --git c/src/model/diffusion/moss_image.hpp w/src/model/diffusion/moss_image.hpp
+index bea3aa5..36af9cc 100644
+--- c/src/model/diffusion/moss_image.hpp
++++ w/src/model/diffusion/moss_image.hpp
+@@ -1,9 +1,14 @@
+ #ifndef __SD_MODEL_DIFFUSION_MOSS_IMAGE_HPP__
+ #define __SD_MODEL_DIFFUSION_MOSS_IMAGE_HPP__
+ 
++#include <dlfcn.h>
++
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cinttypes>
++#include <cstdio>
++#include <fstream>
+ 
+ #include "model/common/ggml_block.hpp"
+ #include "model/common/rope.hpp"
+@@ -61,6 +66,36 @@ namespace MOSSImage {
+         return ggml_mul(c, a, b);
+     }
+ 
++    // situ() / 100: the constant factors 4 and 25 are folded into the caller's output gate (ffn_down has no bias),
++    // which saves two full-size SCALE ops per block.
++    inline ggml_tensor* situ_unscaled(ggml_context* c, ggml_tensor* hidden, ggml_tensor* gate) {
++        auto a = ggml_mul(c, ggml_tanh(c, ggml_scale(c, gate, 0.25f)), ggml_sigmoid(c, gate));
++        return ggml_mul(c, a, ggml_tanh(c, ggml_scale(c, hidden, 1.f / 25.f)));
++    }
++
++    // Non-interleaved (rotate-half) RoPE on x = [d_head, n_head, L, N] in place, with per-token tables built once per
++    // forward from the same rotation matrices as Rope::apply_rope: rc, rs = [d_head, 1, L, 1], so that
++    // out = x * rc + swap_halves(x) * rs. Four ops instead of apply_rope's permute/repeat chain (three full copies of
++    // q and k per block).
++    inline ggml_tensor* rope_rotate_half(ggml_context* c, ggml_tensor* x, ggml_tensor* rc, ggml_tensor* rs) {
++        const int64_t hd = x->ne[0] / 2;
++        auto lo          = ggml_view_4d(c, x, hd, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], 0);
++        auto hi          = ggml_view_4d(c, x, hd, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], hd * x->nb[0]);
++        auto swapped     = ggml_concat(c, hi, lo, 0);
++        return ggml_add(c, ggml_mul(c, x, rc), ggml_mul(c, swapped, rs));
++    }
++
++    // A batch of N images is [C, L, N]. Run its linear layers as one [C, L * N] matmul, so the weights are read and
++    // dequantized once per batch instead of once per image. N == 1 takes the plain path.
++    inline ggml_tensor* linear_batched(GGMLRunnerContext* ctx, const std::shared_ptr<Linear>& linear, ggml_tensor* h) {
++        if (h->ne[2] <= 1 || h->ne[3] != 1 || !ggml_is_contiguous(h)) {
++            return linear->forward(ctx, h);
++        }
++        const int64_t L = h->ne[1], N = h->ne[2];
++        auto out        = linear->forward(ctx, ggml_reshape_2d(ctx->ggml_ctx, h, h->ne[0], L * N));
++        return ggml_reshape_3d(ctx->ggml_ctx, out, out->ne[0], L, N);
++    }
++
+     struct TextBlock : public GGMLBlock {
+         MOSSImageConfig config;
+ 
+@@ -114,36 +149,108 @@ namespace MOSSImage {
+             blocks["proj.ffn_down"]    = std::make_shared<Linear>(config.ffn_dim, config.dim, false);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::array<ggml_tensor*, 6>& mod) {
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* rc, ggml_tensor* rs, const std::array<ggml_tensor*, 6>& mod) {
+             auto c      = ctx->ggml_ctx;
+-            auto linear = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
++            auto linear = [&](const char* name, ggml_tensor* h) { return linear_batched(ctx, std::dynamic_pointer_cast<Linear>(blocks[name]), h); };
+             auto norm   = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<RMSNorm>(blocks[name])->forward(ctx, h); };
++            // mod holds shift, 1 + scale, gate for attention (0..2) and the FFN (3..5); the FFN gate is pre-scaled by
++            // 100 for situ_unscaled (see Model::forward)
+             auto part   = [&](int i) { return mod[i]; };
+             auto y      = norm("norm1", x);
+-            y           = ggml_add(c, ggml_add(c, y, ggml_mul(c, y, part(1))), part(0));
++            y           = ggml_add(c, ggml_mul(c, y, part(1)), part(0));
+             auto qkv    = linear("proj.qkv", y);
++            // q/k/v as strided [d_head, n_head, L, 1] views of the fused output: RMSNorm reads strides, and v is
++            // permuted into a contiguous copy inside the attention anyway, so the three slice copies are not needed
+             auto split  = [&](int i) {
+-                return ggml_reshape_4d(c, ggml_ext_slice(c, qkv, 0, i * config.dim, (i + 1) * config.dim), config.head_dim, config.dim / config.head_dim, x->ne[1], x->ne[2]);
++                return ggml_view_4d(c, qkv, config.head_dim, config.dim / config.head_dim, qkv->ne[1], qkv->ne[2],
++                                    config.head_dim * qkv->nb[0], qkv->nb[1], qkv->nb[2], i * config.dim * qkv->nb[0]);  // [d_head, n_head, L, N]
+             };
+-            auto q       = norm("q_norm", split(0));
+-            auto k       = norm("k_norm", split(1));
++            auto q       = rope_rotate_half(c, norm("q_norm", split(0)), rc, rs);  // [d_head, n_head, L, N]
++            auto k       = rope_rotate_half(c, norm("k_norm", split(1)), rc, rs);
+             auto v       = split(2);
+-            y            = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
++            // attention takes q/k as [d_head, L, n_head]: strided views, which the SYCL oneDNN SDPA reads directly
++            auto attend  = [&](ggml_tensor* qb, ggml_tensor* kb, ggml_tensor* vb) {
++                return ggml_ext_attention_ext(ctx, ggml_permute(c, qb, 0, 2, 1, 3), ggml_permute(c, kb, 0, 2, 1, 3), vb, qb->ne[1],
++                                              nullptr, true, ctx->flash_attn_enabled, 1.f);
++            };
++            const int64_t N = qkv->ne[2];
++            if (N == 1) {
++                y = attend(q, k, v);
++            } else {
++                // Attention has no weights to share, so a batch runs it image by image on the single-image path
++                // ([C, L, 1] each) and concatenates the results back into [C, L, N].
++                auto image = [&](ggml_tensor* t, int64_t b) {
++                    return ggml_view_4d(c, t, t->ne[0], t->ne[1], t->ne[2], 1, t->nb[1], t->nb[2], t->nb[3], b * t->nb[3]);
++                };
++                y = nullptr;
++                for (int64_t b = 0; b < N; ++b) {
++                    auto yb = attend(image(q, b), image(k, b), image(v, b));
++                    y       = y == nullptr ? yb : ggml_concat(c, y, yb, 2);
++                }
++            }
+             y            = linear("proj.o", y);
+             y            = ggml_mul(c, y, part(2));
+             x            = ggml_add(c, x, y);
+             y            = norm("norm2", x);
+-            y            = ggml_add(c, ggml_add(c, y, ggml_mul(c, y, part(4))), part(3));
++            y            = ggml_add(c, ggml_mul(c, y, part(4)), part(3));
+             auto up_gate = linear("proj.ffn_up_gate", y);
+-            y            = situ(c, ggml_ext_slice(c, up_gate, 0, 0, config.ffn_dim), ggml_ext_slice(c, up_gate, 0, config.ffn_dim, 2 * config.ffn_dim));
++            // up/gate as strided views of the fused output: situ's first ops (scale, sigmoid) read strides and write
++            // contiguous results, so no slice copies
++            y            = situ_unscaled(c, ggml_ext_slice(c, up_gate, 0, 0, config.ffn_dim, false),
++                                         ggml_ext_slice(c, up_gate, 0, config.ffn_dim, 2 * config.ffn_dim, false));
+             y            = linear("proj.ffn_down", y);
+             y            = ggml_mul(c, y, part(5));
+             return ggml_add(c, x, y);
+         }
+     };
+ 
++    using XpuMossBlocksFn = int (*)(const float*, int64_t, int64_t, int64_t, const float*, const float*, const float*, int64_t, int64_t,
++                                    const int32_t*, int64_t, float*, int);
++
++    // SD_XPU_MOSS_LIB=path/to/libxpu_moss.so runs the 42 transformer blocks natively on an Intel XPU
++    // (engines/sd.cpp/xpu_sdpa/xpu_moss.cpp) with its own int8 weights (SD_XPU_MOSS_WEIGHTS).
++    static XpuMossBlocksFn xpu_moss_blocks_fn() {
++        static const XpuMossBlocksFn fn = []() -> XpuMossBlocksFn {
++            const char* path = getenv("SD_XPU_MOSS_LIB");
++            if (path == nullptr || *path == '\0') {
++                return nullptr;
++            }
++            void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++            if (handle == nullptr) {
++                LOG_ERROR("SD_XPU_MOSS_LIB: dlopen failed: %s", dlerror());
++                return nullptr;
++            }
++            auto blocks = reinterpret_cast<XpuMossBlocksFn>(dlsym(handle, "xpu_moss_blocks"));
++            if (blocks == nullptr) {
++                LOG_ERROR("SD_XPU_MOSS_LIB: xpu_moss_blocks not found");
++                return nullptr;
++            }
++            LOG_INFO("MOSS-Image transformer blocks on XPU: %s", path);
++            // first lookup happens while the model is being created: load the XPU weights meanwhile
++            if (auto prefetch = reinterpret_cast<void (*)(int)>(dlsym(handle, "xpu_moss_prefetch"))) {
++                prefetch(getenv("SD_XPU_MOSS_VERBOSE") != nullptr ? 1 : 0);
++            }
++            return blocks;
++        }();
++        return fn;
++    }
++
++    struct XpuMossArgs {
++        int64_t heads    = 0;
++        int64_t head_dim = 0;
++        std::vector<int32_t> skip;
++    };
++
++    // SD_MOSS_DUMP=<dir> (ggml blocks only): the first model call writes the block inputs and the output of all 42
++    // blocks in the layout xpu_moss.cpp's self-test reads (SD_XPU_MOSS_SELFTEST=<dir>).
++    inline void moss_dump_file(const std::string& path, const ggml_tensor* t) {
++        std::ofstream f(path, std::ios::binary);
++        f.write(static_cast<const char*>(t->data), static_cast<std::streamsize>(ggml_nbytes(t)));
++    }
++
+     struct Model : public GGMLBlock {
+         MOSSImageConfig config;
++        XpuMossArgs xpu_args;
+ 
+         Model(const MOSSImageConfig& config)
+             : config(config) {
+@@ -156,17 +263,20 @@ namespace MOSSImage {
+             blocks["time_embedding.2"]        = std::make_shared<Linear>(config.dim, config.dim, true);
+             blocks["shared_block_modulation"] = std::make_shared<Linear>(config.dim, 6 * config.dim, true);
+             blocks["video_head_modulation"]   = std::make_shared<Linear>(config.dim, 2 * config.dim, true);
+-            for (int64_t i = 0; i < config.depth; ++i) {
++            // With SD_XPU_MOSS_LIB the blocks run (and keep their weights) on the XPU; skip the ggml copy.
++            for (int64_t i = 0; i < config.depth && xpu_moss_blocks_fn() == nullptr; ++i) {
+                 blocks["layers." + std::to_string(i)] = std::make_shared<Block>(config);
+             }
+             blocks["final_norm_video"]   = std::make_shared<RMSNorm>(config.dim, 1e-6f);
+             blocks["final_linear_video"] = std::make_shared<Linear>(config.dim, config.channels, false);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* time, ggml_tensor* text, ggml_tensor* pe, const std::vector<int>& skip) {
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* time, ggml_tensor* text, ggml_tensor* pe,
++                             ggml_tensor* rc, ggml_tensor* rs, const std::vector<int>& skip) {
+             auto c            = ctx->ggml_ctx;
+-            auto linear       = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
++            auto linear       = [&](const char* name, ggml_tensor* h) { return linear_batched(ctx, std::dynamic_pointer_cast<Linear>(blocks[name]), h); };
+             int64_t image_len = image->ne[0] * image->ne[1];
++            const int64_t N   = image->ne[3];
+             auto x            = linear("video_embedder", DiT::patchify(c, image, 1, 1));
+             text              = linear("text_embedder.proj", text);
+             auto text_pe      = ggml_ext_slice(c, pe, 3, image_len, image_len + text->ne[1]);
+@@ -179,22 +289,97 @@ namespace MOSSImage {
+             std::array<ggml_tensor*, 6> parts;
+             for (int i = 0; i < 6; ++i) {
+                 parts[i] = ggml_ext_slice(c, mod, 0, i * config.dim, (i + 1) * config.dim);
++                if (i == 1 || i == 4) {
++                    parts[i] = ggml_scale_bias(c, parts[i], 1.f, 1.f);  // 1 + scale, once per forward
++                } else if (i == 5) {
++                    parts[i] = ggml_scale(c, parts[i], 100.f);  // situ's 4 * 25, see situ_unscaled
++                }
+                 if (ctx->graph != nullptr) {
+                     ggml_build_forward_expand(ctx->graph, parts[i]);
+                 }
+             }
++            if (N > 1) {
++                // every image in a batch has the same prompt: embed it once, then repeat it per image
++                text = ggml_repeat(c, text, ggml_new_tensor_3d(c, text->type, text->ne[0], text->ne[1], N));
++            }
+             x         = ggml_concat(c, x, text, 1);
+-            for (int64_t i = 0; i < config.depth; ++i) {
+-                if (std::find(skip.begin(), skip.end(), i) == skip.end()) {
+-                    x = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)])->forward(ctx, x, pe, parts);
+-                    sd::ggml_graph_cut::mark_graph_cut(x, "moss_image.layers." + std::to_string(i), "x");
++            if (xpu_moss_blocks_fn() != nullptr) {
++                sd::ggml_graph_cut::mark_graph_cut(x, "moss_image.prelude", "x");
++                xpu_args.heads    = config.dim / config.head_dim;
++                xpu_args.head_dim = config.head_dim;
++                xpu_args.skip.assign(skip.begin(), skip.end());
++                ggml_tensor* args[4] = {ggml_cont(c, x), ggml_cont(c, mod), rc, rs};
++                auto op              = [](ggml_tensor* dst, int ith, int, void* userdata) {
++                    if (ith != 0) {
++                        return;
++                    }
++                    static const bool verbose = getenv("SD_XPU_MOSS_VERBOSE") != nullptr;
++                    auto* a                   = static_cast<XpuMossArgs*>(userdata);
++                    const auto* xx            = dst->src[0];
++                    GGML_ASSERT(dst->src[1]->ne[0] == 6 * xx->ne[0] && dst->src[2]->ne[2] == xx->ne[1] && ggml_is_contiguous(dst->src[2]));
++                    int rc = xpu_moss_blocks_fn()(static_cast<const float*>(xx->data), xx->ne[1], xx->ne[2], xx->ne[0],
++                                                  static_cast<const float*>(dst->src[1]->data), static_cast<const float*>(dst->src[2]->data),
++                                                  static_cast<const float*>(dst->src[3]->data), a->heads, a->head_dim, a->skip.data(),
++                                                  static_cast<int64_t>(a->skip.size()), static_cast<float*>(dst->data), verbose ? 1 : 0);
++                    GGML_ASSERT(rc == 0 && "xpu_moss_blocks failed");
++                };
++                x = ggml_custom_4d(c, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3], args, 4, op, 1, &xpu_args);
++            } else {
++                // 0: nothing written, 1: inputs of the first model call written, 2: its block output written too
++                static std::atomic<int> dump_state{0};
++                const bool dump = getenv("SD_MOSS_DUMP") != nullptr && skip.empty() && dump_state.load() < 2;
++                if (dump) {
++                    xpu_args.heads       = config.dim / config.head_dim;
++                    xpu_args.head_dim    = config.head_dim;
++                    ggml_tensor* args[4] = {ggml_cont(c, x), ggml_cont(c, mod), rc, rs};
++                    auto op              = [](ggml_tensor* dst, int ith, int, void* userdata) {
++                        if (ith != 0) {
++                            return;
++                        }
++                        const std::string dir = getenv("SD_MOSS_DUMP");
++                        const auto* a         = static_cast<XpuMossArgs*>(userdata);
++                        const auto* xx        = dst->src[0];
++                        memcpy(dst->data, xx->data, ggml_nbytes(xx));
++                        int expected = 0;
++                        if (!dump_state.compare_exchange_strong(expected, 1)) {
++                            return;
++                        }
++                        moss_dump_file(dir + "/x.f32", xx);
++                        moss_dump_file(dir + "/mod.f32", dst->src[1]);
++                        moss_dump_file(dir + "/rc.f32", dst->src[2]);
++                        moss_dump_file(dir + "/rs.f32", dst->src[3]);
++                        std::ofstream meta(dir + "/meta.txt");
++                        meta << "L " << xx->ne[1] << "\nN " << xx->ne[2] << "\nhidden " << xx->ne[0] << "\nheads " << a->heads << "\nhead_dim "
++                             << a->head_dim << "\n";
++                    };
++                    x = ggml_custom_4d(c, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3], args, 4, op, 1, &xpu_args);
++                }
++                for (int64_t i = 0; i < config.depth; ++i) {
++                    if (std::find(skip.begin(), skip.end(), i) == skip.end()) {
++                        x = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)])->forward(ctx, x, rc, rs, parts);
++                        sd::ggml_graph_cut::mark_graph_cut(x, "moss_image.layers." + std::to_string(i), "x");
++                    }
++                }
++                if (dump) {
++                    ggml_tensor* args[1] = {x};
++                    auto op              = [](ggml_tensor* dst, int ith, int, void*) {
++                        if (ith != 0) {
++                            return;
++                        }
++                        memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst->src[0]));
++                        int expected = 1;
++                        if (dump_state.compare_exchange_strong(expected, 2)) {
++                            moss_dump_file(std::string(getenv("SD_MOSS_DUMP")) + "/ref_out.f32", dst->src[0]);
++                        }
++                    };
++                    x = ggml_custom_4d(c, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3], args, 1, op, 1, nullptr);
+                 }
+             }
+             x          = ggml_ext_slice(c, x, 1, 0, image_len);
+             x          = std::dynamic_pointer_cast<RMSNorm>(blocks["final_norm_video"])->forward(ctx, x);
+             auto shift = ggml_ext_slice(c, head, 0, 0, config.dim);
+             auto scale = ggml_ext_slice(c, head, 0, config.dim, 2 * config.dim);
+-            x          = ggml_add(c, ggml_add(c, x, ggml_mul(c, x, scale)), shift);
++            x          = ggml_add(c, ggml_mul(c, x, ggml_scale_bias(c, scale, 1.f, 1.f)), shift);
+             x          = linear("final_linear_video", x);
+             return DiT::unpatchify(c, x, image->ne[1], image->ne[0], 1, 1);
+         }
+@@ -203,7 +388,7 @@ namespace MOSSImage {
+     struct MOSSImageRunner : public DiffusionModelRunner {
+         MOSSImageConfig config;
+         Model model;
+-        std::vector<float> pe_data, time_data;
++        std::vector<float> pe_data, time_data, rope_cos_data, rope_sin_data;
+ 
+         MOSSImageRunner(ggml_backend_t backend, const String2TensorStorage& weights, const std::string& prefix, std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+             : DiffusionModelRunner(backend, prefix, weight_manager), config(MOSSImageConfig::detect_from_weights(weights, prefix)), model(config) {
+@@ -230,7 +415,7 @@ namespace MOSSImage {
+                 auto gf   = new_graph_custom(65536);
+                 auto x    = make_input(*inputs.x);
+                 auto text = make_input(*inputs.context);
+-                GGML_ASSERT(x->ne[3] == 1 && x->ne[2] == config.channels && text->ne[0] == config.text_dim);
++                GGML_ASSERT(x->ne[2] == config.channels && text->ne[0] == config.text_dim && text->ne[2] == 1);
+                 int64_t h = x->ne[1], w = x->ne[0], nt = text->ne[1];
+                 Rope::Embedding embedding;
+                 embedding.positions.append_image(static_cast<int>(h), static_cast<int>(w));
+@@ -254,12 +439,30 @@ namespace MOSSImage {
+                     time_data[i]                       = float(std::cos(angle));
+                     time_data[i + config.freq_dim / 2] = float(std::sin(angle));
+                 }
++                // rotate-half tables for rope_rotate_half, read from the same 2x2 rotations: pe element (k, r, j, t) is
++                // pe_data[k + 2 r + 4 j + 2 d_head t]; out[r half][j] = sum_k P[r][k] x[k half][j]
++                const int64_t d = config.head_dim, hd = d / 2, L = h * w + nt;
++                rope_cos_data.resize(d * L);
++                rope_sin_data.resize(d * L);
++                for (int64_t t = 0; t < L; ++t) {
++                    for (int64_t j = 0; j < hd; ++j) {
++                        const float* P            = pe_data.data() + 4 * j + 2 * d * t;
++                        rope_cos_data[t * d + j]      = P[0];  // P[0][0] * x_lo
++                        rope_sin_data[t * d + j]      = P[1];  // P[0][1] * x_hi
++                        rope_cos_data[t * d + hd + j] = P[3];  // P[1][1] * x_hi
++                        rope_sin_data[t * d + hd + j] = P[2];  // P[1][0] * x_lo
++                    }
++                }
+                 auto pe   = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.head_dim / 2, h * w + nt);
++                auto rc   = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, d, 1, L, 1);
++                auto rs   = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, d, 1, L, 1);
+                 auto time = ggml_new_tensor_3d(compute_ctx, GGML_TYPE_F32, config.freq_dim, 1, 1);
+                 set_backend_tensor_data(pe, pe_data.data());
++                set_backend_tensor_data(rc, rope_cos_data.data());
++                set_backend_tensor_data(rs, rope_sin_data.data());
+                 set_backend_tensor_data(time, time_data.data());
+                 auto ctx = get_context(gf);
+-                ggml_build_forward_expand(gf, model.forward(&ctx, x, time, text, pe, skip));
++                ggml_build_forward_expand(gf, model.forward(&ctx, x, time, text, pe, rc, rs, skip));
+                 return gf;
+             };
+             return restore_trailing_singleton_dims(GGMLRunner::compute(graph, n_threads, false), inputs.x->dim());
+diff --git c/src/name_conversion.cpp w/src/name_conversion.cpp
+index 7413f96..0408026 100644
+--- c/src/name_conversion.cpp
++++ w/src/name_conversion.cpp
+@@ -1386,6 +1386,8 @@ std::string convert_sep_to_dot(std::string name) {
+         "cross_attn",
+         "output_proj",
+         "token_refiner",
++        "ffn_up_gate",
++        "ffn_down",
+     };
+ 
+     // record the positions of underscores that should NOT be replaced
+diff --git c/src/pipeline/image.cpp w/src/pipeline/image.cpp
+index d3d25c8..5dc5aa2 100644
+--- c/src/pipeline/image.cpp
++++ w/src/pipeline/image.cpp
+@@ -643,6 +643,54 @@ namespace sd::pipeline {
+         return result_images;
+     }
+ 
++    // How many images one sampling pass stacks along the batch axis (1 = one at a time, the default). Opt-in with
++    // SD_BATCH_SAMPLING=1: on the Arc Pro B70 one MOSS image at 768x1024 and up already keeps the GPU ~98% busy, so a
++    // batch of 2-4 measured no faster (2026-11-11) and delivers every image at the end. Only diffusion runners that
++    // accept a batch qualify, and only plain text-to-image: masks, control images and reference latents keep the
++    // single-image path. SD_MAX_BATCH caps a stack (default 4).
++    static int image_sampling_batch(StableDiffusionGGML* sd, const ImageGenerationLatents& latents) {
++        if (sd->version != VERSION_MOSS_IMAGE) {
++            return 1;
++        }
++        const char* on = getenv("SD_BATCH_SAMPLING");
++        if (on == nullptr || on[0] != '1') {
++            return 1;
++        }
++        // text-to-image carries an all-ones mask; like sample(), only a mask with a value below 1 counts
++        const auto& mask = latents.denoise_mask.values();
++        if (std::any_of(mask.begin(), mask.end(), [](float value) { return value != 1.f; }) ||
++            !latents.control_image.empty() || !latents.ref_latents.empty()) {
++            return 1;
++        }
++        const char* cap = getenv("SD_MAX_BATCH");
++        return std::max(1, cap != nullptr ? std::atoi(cap) : 4);
++    }
++
++    // Latents stacked along dim 3, the batch axis ([W, H, C, N]).
++    static sd::Tensor<float> stack_latents(std::vector<sd::Tensor<float>> parts) {
++        for (auto& part : parts) {
++            while (part.dim() < 4) {
++                part.unsqueeze_(part.dim());
++            }
++        }
++        sd::Tensor<float> out = std::move(parts[0]);
++        for (size_t i = 1; i < parts.size(); ++i) {
++            out = sd::ops::concat(out, parts[i], 3);
++        }
++        return out;
++    }
++
++    static std::vector<sd::Tensor<float>> unstack_latents(const sd::Tensor<float>& stacked, int count) {
++        if (count == 1) {
++            return {stacked};
++        }
++        std::vector<sd::Tensor<float>> out;
++        for (int i = 0; i < count; ++i) {
++            out.push_back(sd::ops::slice(stacked, 3, i, i + 1));
++        }
++        return out;
++    }
++
+     static sd::Tensor<float> upscale_hires_latent(StableDiffusionGGML* sd,
+                                                   const sd::Tensor<float>& latent,
+                                                   const GenerationRequest& request,
+@@ -848,7 +896,11 @@ namespace sd::pipeline {
+ 
+         std::vector<sd::Tensor<float>> final_latents;
+         int64_t denoise_start = ggml_time_ms();
+-        for (int b = 0; b < request.batch_count; b++) {
++        const int sampling_batch = image_sampling_batch(sd, latents);
++        if (sampling_batch > 1 && request.batch_count > 1) {
++            LOG_INFO("batched sampling: up to %d images per pass", sampling_batch);
++        }
++        for (int b = 0; b < request.batch_count;) {
+             sd_cancel_mode_t cancel = sd->get_cancel_flag();
+             if (cancel == SD_CANCEL_ALL) {
+                 LOG_ERROR("cancelling generation");
+@@ -861,17 +913,24 @@ namespace sd::pipeline {
+                 break;
+             }
+ 
++            // Each image keeps its own seed and noise, so a batch renders the same images as one at a time.
++            const int count        = std::min(sampling_batch, request.batch_count - b);
+             int64_t sampling_start = ggml_time_ms();
+-            int64_t cur_seed       = request.seed + b;
+-            LOG_INFO("generating image: %i/%i - seed %" PRId64, b + 1, request.batch_count, cur_seed);
+-
+-            sd->rng->manual_seed(cur_seed);
+-            sd->sampler_rng->manual_seed(cur_seed);
+-            sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd->rng);
++            std::vector<sd::Tensor<float>> noises, inits;
++            for (int i = 0; i < count; ++i) {
++                int64_t cur_seed = request.seed + b + i;
++                LOG_INFO("generating image: %i/%i - seed %" PRId64, b + i + 1, request.batch_count, cur_seed);
++                sd->rng->manual_seed(cur_seed);
++                noises.push_back(sd::randn_like<float>(latents.init_latent, sd->rng));
++                inits.push_back(latents.init_latent);
++            }
++            sd->sampler_rng->manual_seed(request.seed + b);
++            sd::Tensor<float> noise = count == 1 ? std::move(noises[0]) : stack_latents(std::move(noises));
++            sd::Tensor<float> init  = count == 1 ? latents.init_latent : stack_latents(std::move(inits));
+ 
+             sd::Tensor<float> x_0 = sd->sample(sd->diffusion_model,
+                                                true,
+-                                               latents.init_latent,
++                                               init,
+                                                std::move(noise),
+                                                embeds.cond,
+                                                embeds.uncond,
+@@ -896,8 +955,16 @@ namespace sd::pipeline {
+                                                true);
+             int64_t sampling_end  = ggml_time_ms();
+             if (!x_0.empty()) {
+-                LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+-                final_latents.push_back(std::move(x_0));
++                if (count > 1) {
++                    LOG_INFO("sampling completed for images %d-%d (one batch), taking %.2fs", b + 1, b + count,
++                             (sampling_end - sampling_start) * 1.0f / 1000);
++                } else {
++                    LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
++                }
++                for (auto& latent : unstack_latents(x_0, count)) {
++                    final_latents.push_back(std::move(latent));
++                }
++                b += count;
+                 continue;
+             }
+ 
+@@ -961,24 +1028,30 @@ namespace sd::pipeline {
+ 
+             std::vector<sd::Tensor<float>> hires_final_latents;
+             int64_t hires_denoise_start = ggml_time_ms();
+-            for (int b = 0; b < (int)final_latents.size(); b++) {
++            const int total = static_cast<int>(final_latents.size());
++            for (int b = 0; b < total;) {
+                 if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                     LOG_ERROR("cancelling generation during hires fix");
+                     return false;
+                 }
+-                int64_t cur_seed = request.seed + b;
+-                sd->rng->manual_seed(cur_seed);
+-                sd->sampler_rng->manual_seed(cur_seed);
+-
+-                sd::Tensor<float> upscaled = upscale_hires_latent(sd,
+-                                                                  final_latents[b],
+-                                                                  request,
+-                                                                  hires_upscaler.get());
+-                if (upscaled.empty()) {
+-                    return false;
++                const int count = std::min(sampling_batch, total - b);
++                std::vector<sd::Tensor<float>> upscaled_parts, noises;
++                for (int i = 0; i < count; ++i) {
++                    int64_t cur_seed = request.seed + b + i;
++                    sd->rng->manual_seed(cur_seed);
++                    sd::Tensor<float> upscaled = upscale_hires_latent(sd,
++                                                                      final_latents[b + i],
++                                                                      request,
++                                                                      hires_upscaler.get());
++                    if (upscaled.empty()) {
++                        return false;
++                    }
++                    noises.push_back(sd::randn_like<float>(upscaled, sd->rng));
++                    upscaled_parts.push_back(std::move(upscaled));
+                 }
+-
+-                sd::Tensor<float> noise = sd::randn_like<float>(upscaled, sd->rng);
++                sd->sampler_rng->manual_seed(request.seed + b);
++                sd::Tensor<float> upscaled = count == 1 ? std::move(upscaled_parts[0]) : stack_latents(std::move(upscaled_parts));
++                sd::Tensor<float> noise    = count == 1 ? std::move(noises[0]) : stack_latents(std::move(noises));
+ 
+                 sd::Tensor<float> hires_denoise_mask;
+                 if (!latents.denoise_mask.empty()) {
+@@ -1018,17 +1091,22 @@ namespace sd::pipeline {
+                                                         false);
+                 int64_t hires_sample_end   = ggml_time_ms();
+                 if (!x_0.empty()) {
+-                    LOG_INFO("hires sampling %d/%d completed, taking %.2fs",
++                    LOG_INFO("hires sampling %d-%d/%d completed, taking %.2fs",
+                              b + 1,
+-                             (int)final_latents.size(),
++                             b + count,
++                             total,
+                              (hires_sample_end - hires_sample_start) * 1.0f / 1000);
+-                    hires_final_latents.push_back(std::move(x_0));
++                    for (auto& latent : unstack_latents(x_0, count)) {
++                        hires_final_latents.push_back(std::move(latent));
++                    }
++                    b += count;
+                     continue;
+                 }
+ 
+-                LOG_ERROR("hires sampling for image %d/%d failed after %.2fs",
++                LOG_ERROR("hires sampling for images %d-%d/%d failed after %.2fs",
+                           b + 1,
+-                          (int)final_latents.size(),
++                          b + count,
++                          total,
+                           (hires_sample_end - hires_sample_start) * 1.0f / 1000);
+                 return false;
+             }

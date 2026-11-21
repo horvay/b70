@@ -26,6 +26,7 @@ constexpr int CH = 128;                                 // keys per piece of the
 
 struct Q35Attn {
     Exl3Linear q, k, v, o;
+    Exl3Linear qkv;                  // q, k, v merged (Exl3Linear::merge; then q, k, v are empty), or empty
     Tensor qn, kn;                   // fp32 (1 + w) [256]
 };
 
@@ -36,6 +37,7 @@ struct Q35Block {
     std::unique_ptr<Q4Gdn> gdn;
     std::unique_ptr<Q35Attn> att;
     Exl3Linear g, u, d;              // mlp gate, up, down
+    Exl3Linear gu, gdn_in;           // merged: gate + up, GDN in_proj_qkv + in_proj_z (or empty)
 };
 
 // K (normed, roped), V fp16 [seqs, T, 4, 256]
@@ -90,7 +92,11 @@ public:
                     std::vector<std::vector<int>>& out) override;
     bool has_mtp() const { return (bool)mtp; }
     float mtp_min_p = 0.25f;         // a chain ends where its drafts' probability product falls below this (Q35_MTP_MIN_P)
-    int mtp_head = 65536;            // drafts from the lm_head's first this many columns (Q35_MTP_HEAD, multiple of 128)
+    // the draft head: by default the lm_head's 128-id blocks in mtp_blocks (the ids the model emits most, and the block of
+    // <|im_end|> / <think> / </think>), gathered into a head of their own; Q35_MTP_HEAD=N: the first N ids instead (the
+    // old head, 65536), 248320 = all; Q35_MTP_BLOCKS=file: block numbers from a file
+    int mtp_head = 65536;            // prefix mode: columns (a multiple of 128); 0: block mode
+    std::vector<int> mtp_blocks;     // block mode: block numbers, ascending
     long long mtp_rows = 0;          // MTP rows run (catch-up + drafts), for the tests
 
     // The selected sequence's images for its next prompt, in prompt order; reset() keeps them, the next set_images
@@ -99,7 +105,23 @@ public:
     const SafeTensors& tensors() const { return *st; }
 
     int prefill_chunk = 2048;        // rows per attention / GDN / MLP piece of a prompt
+    // prompt kernels (Q35_PF_ATTN, Q35_PF_GDN; q35_gen kl compares them): attention 0 = the per-row decode kernel,
+    // else a q35ops::attn_prompt variant (5: kernels/q35_fa.h); GDN 1 = the chunked delta rule (kernels/q35_gdn.h) and
+    // the all-rows conv, 0 = the recurrent kernels
+    int pf_attn = 15, pf_gdn = 1;
+    // decode / verify attention (Q35_DEC_ATTN): 1 the ESIMD kernel (kernels/q35_dec.h) over dec_ns pieces of each row's
+    // keys (Q35_DEC_NS), 0 the plain SYCL kernel (attn_core); set at load (the partials are sized for it)
+    int dec_attn = 1, dec_ns = 32;
+    // attention 13 and 15 read K^T from ktp, the selected sequence's keys of one layer pair-transposed
+    // [4][128][TS][2], 15 also V from vtp [4][TS / 2][256][2] (2 KB a token each, TS = max_tokens rounded up to 16):
+    // filled from the cache at a layer's first piece of a prefill call, then appended piece by piece
+    Tensor ktp, vtp;
+    const void* kt_cache = nullptr;  // the layer (its cache) ktp holds, for kt_seq, keys below kt_valid
+    int kt_seq = -1, kt_valid = 0;
     std::vector<float>* dump = nullptr;   // debug: row 0's streams after each layer
+    // a rejected draft's GDN replay (Q35_REPLAY): 1 every layer in two launches (q35ops::gdn_replay), 0 two per layer
+    int replay_mode = 1;
+    uint64_t state_hash();           // test: a hash of the selected sequence's live GDN state (conv windows, recurrent)
 
 private:
     std::unique_ptr<SafeTensors> st;
@@ -150,11 +172,16 @@ private:
     void rows_host(Seq& s, const int* tokens, int n, float* dst, int* pid);
 
     // prompt rows (in order, over the selected sequence): pdev null; decode rows: pdev, sdev per row
-    void gdn_forward(const Q4Gdn& g, Q35GdnState& s, const half* y, int rows, float* out, const int* sdev);
+    void gdn_forward(const Q4Gdn& g, const Exl3Linear& gin, Q35GdnState& s, const half* y, int rows, float* out,
+                     const int* sdev);
     void attn_forward(const Q35Attn& a, Q35Cache& c, const half* y, int rows, int p0, const int* pid, float* out,
                       const int* pdev, const int* sdev);
-    void block_forward(Q35Block& b, float* Xd, int rows, int p0, const int* pid, const int* pdev, const int* sdev);
+    void block_forward(Q35Block& b, float* Xd, int rows, int p0, const int* pid, const int* pdev, const int* sdev,
+                       bool add_first = false, bool defer_last = false);
     void forward_dev(int Q);
+    // linears that read the same input become one call (Q35_MERGE, default 1): fewer, larger launches
+    void merge_linears(Q35Block& b);
+    int merge_mask = 7;              // Q35_MERGE: 1 gate + up, 2 GDN qkv + z, 4 attention q + k + v (0: none)
     void grab(const float* p, int n);
 
     Checkpoint& new_checkpoint(Seq& s, int at);
@@ -169,13 +196,18 @@ private:
     int* desc_h = nullptr;           // pinned [qmax][3]: this step's row groups (gdn_conv_seq)
     int* rdesc_h = nullptr;          // pinned [qmax][3]: a replay's
     int win_Q = 0;                   // rows of the step the windows belong to
-    std::vector<std::unique_ptr<ExecGraph>> rep_graphs;    // by row count
+    std::vector<std::unique_ptr<ExecGraph>> rep_graphs;    // by replay_mode and row count
+    Tensor rep_layers, rep_cv;       // gdn_replay's per-layer pointers, its conv outputs
+    int rep_nl = 0;
     sycl::event rep_ev;
     void replay_dev(int Q);
     bool restore_window(Seq& s, int upto);
 
     // MTP
     std::unique_ptr<Q35Mtp> mtp;
+    Exl3Linear draft_head;           // block mode: the lm_head's columns of mtp_blocks
+    void build_draft_head();
+    int draft_id(int col) const { return mtp_head ? col : mtp_blocks[col / 128] * 128 + col % 128; }
     Tensor hring;                    // fp16 [seqs, RING, D]: post-norm hidden of the positions in ring_pos
     Tensor hfin;                     // fp16 [prefill_chunk + 1, D]: a prompt piece's hidden states, the one before first
     Tensor mx, mhin, mh16, mlog, mbest, mpos_dev, mseq_dev, mpid_dev, msrc_dev;

@@ -1,0 +1,3 @@
+#!/bin/bash
+# music3 batch: many MiniMax Music 3 songs on the B70 in queue-sized chunks (see batch.py). Run under b70q.
+exec python3 "$(dirname "$(readlink -f "$0")")/batch.py" "$@"

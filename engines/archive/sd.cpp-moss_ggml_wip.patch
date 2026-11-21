@@ -1,0 +1,341 @@
+diff --git c/src/ggml-sycl/backend.hpp w/src/ggml-sycl/backend.hpp
+index ab80a2a3..24b0aefb 100644
+--- c/src/ggml-sycl/backend.hpp
++++ w/src/ggml-sycl/backend.hpp
+@@ -27,6 +27,7 @@
+ #include "element_wise.hpp"
+ #include "fattn.hpp"
+ #include "fusion.hpp"
++#include "dit-fusion.hpp"
+ #include "gated_delta_net.hpp"
+ #include "gla.hpp"
+ #include "im2col.hpp"
+diff --git c/src/ggml-sycl/conv2d.cpp w/src/ggml-sycl/conv2d.cpp
+index 3b3b49d0..37299e24 100644
+--- c/src/ggml-sycl/conv2d.cpp
++++ w/src/ggml-sycl/conv2d.cpp
+@@ -1,6 +1,90 @@
+ #include "conv2d.hpp"
+ #include "convert.hpp"
+ 
++#if GGML_SYCL_DNNL
++#include "dnnl.hpp"
++#include "dnnl_sycl.hpp"
++
++extern int g_ggml_sycl_enable_dnn;
++
++// CONV_2D as one oneDNN convolution (nchw activations, oihw weights: ggml's own layouts), as conv3d.cpp does for
++// CONV_3D. The generic kernel below runs one work-item per output over all IC*KH*KW taps without the matrix engines;
++// image VAE decoders (FLUX.2's for MOSS-Image) spend most of their time in it. f16 weights round the activations to
++// f16, as the im2col path does; f32 accumulation and output. Returns false if it does not apply;
++// GGML_SYCL_CONV2D_NAIVE=1 forces the generic path.
++static bool ggml_sycl_conv_2d_dnnl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    static const bool naive = getenv("GGML_SYCL_CONV2D_NAIVE") != nullptr;
++    const ggml_tensor * w = dst->src[0];
++    const ggml_tensor * x = dst->src[1];
++    if (naive || !g_ggml_sycl_enable_dnn || !ggml_is_contiguous(x) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    using dt  = dnnl::memory::data_type;
++    using tag = dnnl::memory::format_tag;
++    const int32_t * o = (const int32_t *) dst->op_params;
++    const int64_t s[2] = {o[1], o[0]};  // h, w
++    const int64_t p[2] = {o[3], o[2]};
++    const int64_t d[2] = {o[5], o[4]};
++    const int64_t N = x->ne[3], C = x->ne[2], OC = w->ne[3];
++    const int64_t in[2]  = {x->ne[1], x->ne[0]};
++    const int64_t k[2]   = {w->ne[1], w->ne[0]};
++    const int64_t out[2] = {dst->ne[1], dst->ne[0]};
++    dnnl::memory::dims strides, pad_l, pad_r, dil;
++    for (int i = 0; i < 2; i++) {
++        strides.push_back(s[i]);
++        pad_l.push_back(p[i]);
++        // right padding that gives ggml's output size (ggml pads p on both sides and drops a partial last stride)
++        pad_r.push_back((out[i] - 1) * s[i] + (k[i] - 1) * d[i] + 1 - in[i] - p[i]);
++        dil.push_back(d[i] - 1);
++    }
++    const bool f16 = w->type == GGML_TYPE_F16;
++    const dt   ct  = f16 ? dt::f16 : dt::f32;
++    const dnnl::memory::desc x_plain({N, C, in[0], in[1]}, dt::f32, tag::nchw);
++    const dnnl::memory::desc w_plain({OC, C, k[0], k[1]}, ct, tag::oihw);
++    const dnnl::memory::desc y_plain({N, OC, out[0], out[1]}, dt::f32, tag::nchw);
++
++    queue_ptr q   = ctx.stream();
++    auto      eng = ctx.engine_dnnl(q);
++    auto      stm = ctx.stream_dnnl(q);
++    dnnl::primitive_attr attr;
++    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++    dnnl::convolution_forward::primitive_desc pd;
++    try {
++        pd = dnnl::convolution_forward::primitive_desc(
++            eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct,
++            dnnl::memory::desc(x_plain.get_dims(), ct, tag::any), dnnl::memory::desc(w_plain.get_dims(), ct, tag::any),
++            dnnl::memory::desc(y_plain.get_dims(), dt::f32, tag::any), strides, dil, pad_l, pad_r, attr);
++    } catch (const dnnl::error &) {
++        return false;
++    }
++
++    ggml_sycl_pool_alloc<uint8_t> x_buf(ctx.pool()), w_buf(ctx.pool()), y_buf(ctx.pool()), scratch(ctx.pool());
++    auto prepare = [&](const dnnl::memory::desc & plain, const dnnl::memory::desc & want, void * data,
++                       ggml_sycl_pool_alloc<uint8_t> & buf) {
++        dnnl::memory src(plain, eng, data);
++        if (plain == want) {
++            return src;
++        }
++        dnnl::memory dst_mem(want, eng, buf.alloc(want.get_size()));
++        dnnl::reorder(src, dst_mem).execute(stm, src, dst_mem);
++        return dst_mem;
++    };
++    dnnl::memory x_mem = prepare(x_plain, pd.src_desc(), x->data, x_buf);
++    dnnl::memory w_mem = prepare(w_plain, pd.weights_desc(), w->data, w_buf);
++    dnnl::memory y_plain_mem(y_plain, eng, dst->data);
++    const bool   y_direct = pd.dst_desc() == y_plain;
++    dnnl::memory y_mem = y_direct ? y_plain_mem : dnnl::memory(pd.dst_desc(), eng, y_buf.alloc(pd.dst_desc().get_size()));
++    const auto scratch_md = pd.scratchpad_desc();
++    void * scratch_ptr = scratch_md.get_size() > 0 ? scratch.alloc(scratch_md.get_size()) : nullptr;
++    dnnl::convolution_forward(pd).execute(stm, {{DNNL_ARG_SRC, x_mem}, {DNNL_ARG_WEIGHTS, w_mem}, {DNNL_ARG_DST, y_mem},
++                                                {DNNL_ARG_SCRATCHPAD, dnnl::memory(scratch_md, eng, scratch_ptr)}});
++    if (!y_direct) {
++        dnnl::reorder(y_mem, y_plain_mem).execute(stm, y_mem, y_plain_mem);
++    }
++    return true;
++}
++#endif
++
+ struct conv2d_params {
+     const int64_t IW, IH;
+     const int64_t OW, OH;
+@@ -129,6 +213,12 @@ void ggml_sycl_op_conv2d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     // no cwhn layout support
+     GGML_ASSERT(p[6] == 0);
+ 
++#if GGML_SYCL_DNNL
++    if (ggml_sycl_conv_2d_dnnl(ctx, dst)) {
++        return;
++    }
++#endif
++
+     const int IW = input->ne[0];
+     const int IH = input->ne[1];
+     const int OW = dst->ne[0];
+diff --git c/src/ggml-sycl/element_wise.cpp w/src/ggml-sycl/element_wise.cpp
+index 2e926abe..4ffc34c6 100644
+--- c/src/ggml-sycl/element_wise.cpp
++++ w/src/ggml-sycl/element_wise.cpp
+@@ -969,6 +969,29 @@ static inline void ggml_sycl_op_acc(ggml_backend_sycl_context & ctx, ggml_tensor
+     const int64_t s3     = (int64_t) ((const int32_t *) dst->op_params)[2] / (int64_t) sizeof(float);
+     const int64_t offset = (int64_t) ((const int32_t *) dst->op_params)[3] / (int64_t) sizeof(float);
+ 
++    if (dst_d == (const float *) src0_d && src1->nb[0] == sizeof(float)) {
++        // in place (e.g. a LoRA diff added into its slice of a fused projection): only src1's region changes, so walk
++        // src1 instead of the whole of dst, one launch dim per tensor dim (no div/mod per element)
++        const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
++        const size_t  nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
++        constexpr int64_t WG      = 256;
++        const int64_t     ne0_pad = (ne10 + WG - 1) / WG * WG;
++        float *           base    = dst_d + offset;
++        stream->parallel_for(
++            sycl::nd_range<3>(sycl::range<3>(ne12 * ne13, ne11, ne0_pad), sycl::range<3>(1, 1, WG)),
++            [=](sycl::nd_item<3> it) {
++                const int64_t i0 = it.get_global_id(2);
++                if (i0 >= ne10) {
++                    return;
++                }
++                const int64_t i1 = it.get_global_id(1), i23 = it.get_global_id(0);
++                const int64_t i2 = ne13 == 1 ? i23 : i23 % ne12;
++                const int64_t i3 = ne13 == 1 ? 0 : i23 / ne12;
++                base[i3 * s3 + i2 * s2 + i1 * s1 + i0] += ((const float *) (src1_d + i1 * nb11 + i2 * nb12 + i3 * nb13))[i0];
++            });
++        return;
++    }
++
+     ggml_sycl_detail::acc_f32_sycl(src0_d, src1_d, dst_d, ggml_nelements(dst),
+         dst->ne[0], dst->ne[1], dst->ne[2],
+         src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+diff --git c/src/ggml-sycl/fattn-onednn.cpp w/src/ggml-sycl/fattn-onednn.cpp
+index 4349363a..69305dcf 100644
+--- c/src/ggml-sycl/fattn-onednn.cpp
++++ w/src/ggml-sycl/fattn-onednn.cpp
+@@ -85,9 +85,10 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+     // gate for the following cases
+     // 1. if the oneDNN graph Add node has no input --> skip
+     // 2. types other than f16 need different logical_tensor declaration
+-    // 3. the mask must be shape [1, 1, q, seq]
++    // 3. the mask, if any, must be shape [1, 1, q, seq]; no mask (image DiTs such as MOSS-Image) builds
++    //    the graph without the Add node
+     // 4. sinks: excludes attention sink (Xiao et al., 2024) that can't be modeled by oneDNN graph
+-    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || sinks) {
++    if (sinks || (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1))) {
+         return false;
+     }
+     float max_bias = 0.0f, logit_softcap = 0.0f;
+@@ -163,8 +164,10 @@ struct sdpa_partition {
+ 
+ // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
+ // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
++// has_mask=false drops the Add node (MatMul->Divide->SoftMax->MatMul) for unmasked attention.
+ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d,
+-                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
++                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str,
++                                 bool has_mask) try {
+     using ltype = logical_tensor::layout_type;
+     using dt    = logical_tensor::data_type;
+     using ldims = logical_tensor::dims;
+@@ -197,7 +200,7 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int
+     auto smax   = op(id++, op::kind::SoftMax, "softmax");
+     smax.set_attr<int64_t>(op::attr::axis, -1);
+     smax.set_attr<std::string>(op::attr::mode, "inf_as_zero");
+-    smax.add_inputs({masked}); smax.add_outputs({probs});
++    smax.add_inputs({has_mask ? masked : scaled}); smax.add_outputs({probs});
+ 
+     auto value  = logical_tensor(id++, t,  kv_sz, v_st);
+     // f16 output is REQUIRED to hit sdp_primitive_kernel_t (the systolic micro-kernel); an f32 output
+@@ -208,7 +211,11 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int
+     bmm2.add_inputs({probs, value}); bmm2.add_outputs({output});
+ 
+     dnnl::graph::graph g(eng.get_kind());
+-    g.add_op(bmm1); g.add_op(sdiv); g.add_op(madd); g.add_op(smax); g.add_op(bmm2);
++    g.add_op(bmm1); g.add_op(sdiv);
++    if (has_mask) {
++        g.add_op(madd);
++    }
++    g.add_op(smax); g.add_op(bmm2);
+     g.finalize();
+ 
+     auto parts = g.get_partitions();
+@@ -221,7 +228,7 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int
+     E.cp       = parts[0].compile(E.ins, {E.out}, eng);
+     E.out      = E.cp.query_logical_tensor(E.out.get_id());
+     E.id_q     = query.get_id(); E.id_k = key.get_id(); E.id_v = value.get_id();
+-    E.id_scale = scale.get_id(); E.id_mask = mask.get_id();
++    E.id_scale = scale.get_id(); E.id_mask = has_mask ? mask.get_id() : SIZE_MAX;
+     E.ok       = true;
+     return E;
+ }
+@@ -400,13 +407,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
+     static std::unordered_map<std::string, sdpa_partition> cache;
+     char keyb[256];
+-    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
++    const bool has_mask = mask != nullptr;
++    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%d", ggml_sycl_get_device(),
+              (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
+              (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
+-             (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
++             (long long) v_str[0], (long long) v_str[1], (long long) v_str[3], (int) has_mask);
+     auto it = cache.find(keyb);
+     if (it == cache.end()) {
+-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
++        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str,
++                                            has_mask)).first;
+     }
+     sdpa_partition & E = it->second;
+     if (!E.ok) {
+@@ -420,7 +429,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+         if (r == E.id_k)     return K_ptr;
+         if (r == E.id_v)     return V_ptr;
+         if (r == E.id_scale) return scale_dev;
+-        if (r == E.id_mask)  return (void *) mask->data;
++        if (has_mask && r == E.id_mask) return (void *) mask->data;
+         return nullptr;
+     };
+     std::vector<tensor> ti;
+diff --git c/src/ggml-sycl/ggml-sycl.cpp w/src/ggml-sycl/ggml-sycl.cpp
+index e11835d9..4be18ce0 100644
+--- c/src/ggml-sycl/ggml-sycl.cpp
++++ w/src/ggml-sycl/ggml-sycl.cpp
+@@ -3447,7 +3447,36 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_tensor * ds
+     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+     memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
+ 
+-    scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(dst->src[0]), main_stream);
++    const ggml_tensor * src0 = dst->src[0];
++    if (ggml_is_contiguous(src0)) {
++        scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0), main_stream);
++    } else {
++        // strided src (e.g. one half of a fused [up|gate] matmul output) -> contiguous dst; the flat kernel above
++        // would read the wrong elements
++        // one launch dim per tensor dim (ne2*ne3 folded into the slowest), so the per-element index math is a multiply
++        // and add: a 1-D range with div/mod per element ran at a third of the contiguous kernel's bandwidth
++        GGML_ASSERT(ggml_is_contiguous(dst));
++        GGML_ASSERT(src0->nb[0] == sizeof(float));
++        const int64_t ne0 = src0->ne[0], ne1 = src0->ne[1], ne2 = src0->ne[2], ne3 = src0->ne[3];
++        const size_t  nb1 = src0->nb[1], nb2 = src0->nb[2], nb3 = src0->nb[3];
++        const char *  src = (const char *) src0->data;
++        constexpr int64_t WG = 256;
++        const int64_t ne0_pad = (ne0 + WG - 1) / WG * WG;
++        main_stream->parallel_for(
++            sycl::nd_range<3>(sycl::range<3>(ne2 * ne3, ne1, ne0_pad), sycl::range<3>(1, 1, WG)),
++            [=](sycl::nd_item<3> it) {
++                const int64_t i0 = it.get_global_id(2);
++                if (i0 >= ne0) {
++                    return;
++                }
++                const int64_t i1  = it.get_global_id(1);
++                const int64_t i23 = it.get_global_id(0);
++                const int64_t i2  = ne3 == 1 ? i23 : i23 % ne2;
++                const int64_t i3  = ne3 == 1 ? 0 : i23 / ne2;
++                const float * row = (const float *) (src + i1 * nb1 + i2 * nb2 + i3 * nb3);
++                dst_dd[((i3 * ne2 + i2) * ne1 + i1) * ne0 + i0] = scale * row[i0] + bias;
++            });
++    }
+     /*
+     DPCT1010:87: SYCL uses exceptions to report errors and does not use the
+     error codes. The call was replaced with 0. You need to rewrite this code.
+@@ -6303,6 +6332,12 @@ static void ggml_sycl_profile_end(ggml_backend_sycl_context & ctx, const ggml_te
+     e.n++;
+     e.us += us;
+ }
++static void ggml_sycl_profile_end_label(ggml_backend_sycl_context & ctx, const char * label, int64_t t0) {
++    ctx.stream()->wait();
++    auto & e = ggml_sycl_profile_table()[label];
++    e.n++;
++    e.us += ggml_time_us() - t0;
++}
+ static void ggml_sycl_profile_graph_done() {
+     if (!ggml_sycl_profile_enabled()) return;
+     static int every = std::max(1, atoi(getenv("GGML_SYCL_PROFILE")) > 0 ? atoi(getenv("GGML_SYCL_PROFILE")) : 200);
+@@ -6315,6 +6350,23 @@ static void ggml_sycl_profile_graph_done() {
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+     ggml_sycl_check_graph(sycl_ctx->device, cgraph);
++    // GGML_SYCL_DUMP_GRAPH (debug): print one graph's node list with src indices, for writing fusion patterns
++    // GGML_SYCL_DUMP_GRAPH=k: the k-th graph of more than 100 nodes (1 = the first)
++    static int dump_left = getenv("GGML_SYCL_DUMP_GRAPH") ? std::max(1, atoi(getenv("GGML_SYCL_DUMP_GRAPH"))) : 0;
++    if (dump_left > 0 && cgraph->n_nodes > 100 && --dump_left == 0) {
++        std::map<const ggml_tensor *, int> idx;
++        for (int i = 0; i < cgraph->n_nodes; i++) {
++            const ggml_tensor * n = cgraph->nodes[i];
++            idx[n] = i;
++            std::string srcs;
++            for (int j = 0; j < GGML_MAX_SRC && n->src[j]; j++) {
++                auto it = idx.find(n->src[j]);
++                srcs += " " + (it != idx.end() ? std::to_string(it->second) : std::string("leaf:") + n->src[j]->name);
++            }
++            GGML_LOG_INFO("[graph] %5d %-14s %-24.24s [%lld %lld %lld %lld]%s ->%s\n", i, ggml_op_desc(n), n->name, (long long) n->ne[0],
++                          (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3], ggml_is_contiguous(n) ? "" : "(s)", srcs.c_str());
++        }
++    }
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -6330,6 +6382,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             i += nodes_to_skip;
+             continue;
+         }
++        {
++            // MOSS-Image style DiT element-wise chains (dit-fusion.hpp)
++            const char * label  = nullptr;
++            const auto   dit_t0 = ggml_sycl_profile_enabled() ? ggml_sycl_profile_begin(*sycl_ctx) : 0;
++            const int    dit_skip = ggml_sycl_try_dit_fusion(*sycl_ctx, cgraph, i, &label);
++            if (dit_skip != 0) {
++                if (dit_t0) {
++                    ggml_sycl_profile_end_label(*sycl_ctx, label, dit_t0);
++                }
++                i += dit_skip > 0 ? dit_skip : 0;  // -1: node i alone
++                continue;
++            }
++        }
+ #ifndef NDEBUG
+         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+         for (int j = 0; j < GGML_MAX_SRC; j++) {

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <sys/mman.h>
+#include <thread>
 #include "g4_ops.h"
 #include "json.h"
 #include "ops.h"
@@ -93,12 +94,10 @@ G4Model::G4Model(const std::string& dir, int max_tok, const std::string& drafter
     const StTensor& et = st->at(P + "embed_tokens.weight");
     GLM_CHECK(et.dt == DType::BF16 && et.shape[0] == V && et.shape[1] == D, "embedding: expected bf16 [V, D]");
     embed = static_cast<const bf16*>(et.data);
-    // its pages in now (it is read a few rows a token, each new row a page fault in the decode loop: ~2 ms an 8-game step)
-    {
-        const size_t page = 4096;
-        uintptr_t b0 = reinterpret_cast<uintptr_t>(et.data) & ~(page - 1);
-        madvise(reinterpret_cast<void*>(b0), et.bytes + (reinterpret_cast<uintptr_t>(et.data) - b0), MADV_POPULATE_READ);
-    }
+    // its pages in now (it is read a few rows a token, each new row a page fault in the decode loop: ~2 ms an 8-game
+    // step), beside the weights' reading; the weights are read in one parallel pass after the layers (SafeTensors::flush)
+    std::thread embed_in([p = et.data, n = et.bytes] { SafeTensors::populate(p, n, 4); });
+    st->defer(true);
     head_exl3 = Exl3Linear::present(*st, "lm_head");
     if (head_exl3) head_q = Exl3Linear::load(*st, "lm_head");
     else {
@@ -144,6 +143,9 @@ G4Model::G4Model(const std::string& dir, int max_tok, const std::string& drafter
         load_progress("loaded layer %d/%d (%.2f GiB VRAM)", li + 1, L, Dev::get().vram_used / 1073741824.0);
     }
     load_progress_end();
+    st->flush();
+    st->defer(false);
+    embed_in.join();
     if (head_exl3) need(head_q);
     // experiment: G4_RAM_GIB of trellis in pinned host memory, the kernels reading it in place (from the last layer down)
     if (getenv("G4_RAM_GIB")) {

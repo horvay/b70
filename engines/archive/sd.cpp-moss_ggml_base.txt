@@ -1,0 +1,1 @@
+88818dd08f16878258a1037a6186937b6d1b17a9 ggml-sycl: CONV_3D through one oneDNN convolution; single-launch contiguous CONCAT

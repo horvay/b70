@@ -19,15 +19,17 @@ endif
 # fast math only for the ESIMD kernel files (as the PyTorch stack builds them); the rest masks with -inf, which
 # -ffinite-math-only would compile away
 MKLROOT ?= $(HOME)/opt/onemkl-2025.3-deb/opt/intel/oneapi/mkl/2025.3
+# oneDNN (SYCL runtime) for the EXL3 int8 prompt GEMMs (src/exl3.cpp)
+ONEDNN ?= $(HOME)/opt/onednn-sycl
 CXXFLAGS := -fsycl $(TGT) -fsycl-device-code-split=per_kernel -O3 -std=c++20 -Wall -fPIC -MMD -MP -DMKL_ILP64 \
             -I$(MKLROOT)/include
-RPATH := -Wl,--disable-new-dtags,-rpath,$(CMPLR)/lib:$(UMF):$(MKLROOT)/lib:'$$ORIGIN'
+RPATH := -Wl,--disable-new-dtags,-rpath,$(CMPLR)/lib:$(UMF):$(MKLROOT)/lib:$(ONEDNN)/lib:'$$ORIGIN'
 LDFLAGS := -fsycl -static-intel $(RPATH) -L$(UMF) -lumf
 
 ESIMD := $(B)/exl3.o $(B)/moe.o
 # the 256-register library; Gemma's prompt attention masks with -inf: no fast math for it
-PF := $(B)/moe_prefill.o $(B)/g4_fa.o $(B)/rp_fa.o $(B)/e0_dpas.o
-CORE := $(B)/rt.o $(B)/progress.o $(B)/st.o $(B)/ops.o $(B)/kda.o $(B)/mla.o $(B)/moe_align.o $(B)/tier.o $(B)/lora.o $(B)/sampler.o $(B)/model.o $(B)/engine.o $(B)/http.o $(B)/q35.o $(B)/q35_ops.o $(B)/q35v.o $(B)/q4.o $(B)/q4_ops.o $(B)/gguf.o $(B)/e0.o $(B)/e0_ops.o $(B)/g4.o $(B)/g4_ops.o $(B)/g4_engine.o $(B)/rp.o $(B)/rp_ops.o
+PF := $(B)/moe_prefill.o $(B)/g4_fa.o $(B)/rp_fa.o $(B)/e0_dpas.o $(B)/q35_pf.o
+CORE := $(B)/rt.o $(B)/progress.o $(B)/st.o $(B)/ops.o $(B)/kda.o $(B)/mla.o $(B)/moe_align.o $(B)/tier.o $(B)/lora.o $(B)/sampler.o $(B)/sample_gpu.o $(B)/model.o $(B)/engine.o $(B)/http.o $(B)/q35.o $(B)/q35_ops.o $(B)/q35v.o $(B)/q4.o $(B)/q4_ops.o $(B)/gguf.o $(B)/e0.o $(B)/e0_ops.o $(B)/g4.o $(B)/g4_ops.o $(B)/g4_engine.o $(B)/rp.o $(B)/rp_ops.o
 # host-only text code (tokenizer, chat template; PCRE2): no kernels, no libglm, linked into the programs that use it
 HOST := $(B)/tokenizer.o $(B)/chat.o $(B)/chat_qwen.o $(B)/chat_gemma.o $(B)/chat_ripple.o $(B)/image.o
 MKL := -L$(MKLROOT)/lib -lmkl_sycl_blas -lmkl_intel_ilp64 -lmkl_sequential -lmkl_core
@@ -37,6 +39,7 @@ all: $(B)/prio $(B)/exl3_check $(B)/decode_check $(B)/acts_check $(B)/moe_bench 
      $(B)/glm_server $(B)/linear_bench $(B)/launch_bench $(B)/prefill_bench $(B)/q4_gen $(B)/e0_gen $(B)/e0_check $(B)/g4_gen $(B)/rp_gen
 
 $(ESIMD) $(B)/moe_prefill.o: CXXFLAGS += -ffast-math
+$(B)/exl3.o: CXXFLAGS += -I$(ONEDNN)/include
 $(B)/tier.o: CXXFLAGS += -mavx2 -I$(HOME)/opt/onednn-src/third_party/level_zero
 $(B)/rt.o: CXXFLAGS += -I$(HOME)/opt/onednn-src/third_party/level_zero
 $(B)/sampler.o: CXXFLAGS += -mavx2 -mf16c
@@ -49,7 +52,7 @@ $(B)/t_%.o: tests/%.cpp | $(B)
 $(B)/libglm_moe_pf.so: $(PF)
 	$(CXX) -fsycl $(TGT) $(BE_PF) -shared $^ -o $@ $(LDFLAGS)
 $(B)/libglm_esimd.so: $(ESIMD) $(B)/libglm_moe_pf.so
-	$(CXX) -fsycl $(TGT) $(BE_ESIMD) -shared $(ESIMD) -o $@ $(LDFLAGS) -L$(B) -lglm_moe_pf $(MKL)
+	$(CXX) -fsycl $(TGT) $(BE_ESIMD) -shared $(ESIMD) -o $@ $(LDFLAGS) -L$(B) -lglm_moe_pf $(MKL) -L$(ONEDNN)/lib -ldnnl
 $(B)/libglm.so: $(CORE) $(B)/libglm_esimd.so
 	$(CXX) -fsycl $(TGT) $(BE_SYCL) -shared $(CORE) -o $@ $(LDFLAGS) -L$(B) -lglm_esimd -lglm_moe_pf $(MKL) -lze_loader
 
@@ -90,6 +93,10 @@ ZEINC := $(HOME)/opt/onednn-src/third_party/level_zero
 $(B)/x_udmabuf_test.o: CXXFLAGS += -I$(ZEINC)
 $(B)/udmabuf_test: $(B)/x_udmabuf_test.o $(B)/libglm.so
 	$(CXX) -fsycl $(TGT) $(BE_SYCL) $< -o $@ $(LDFLAGS) $(LIBS) -lze_loader
+$(B)/i8_eval: $(B)/x_i8_eval.o $(HOST) $(B)/libglm.so
+	$(CXX) -fsycl $(TGT) $(BE_SYCL) $(B)/x_i8_eval.o $(HOST) -o $@ $(LDFLAGS) $(LIBS) -lpcre2-8 -lutf8proc -lze_loader
+$(B)/exl3_i8_check: $(B)/t_exl3_i8_check.o $(B)/libglm.so
+	$(CXX) -fsycl $(TGT) $(BE_SYCL) $< -o $@ $(LDFLAGS) $(LIBS)
 $(B)/moe_bench: $(B)/t_moe_bench.o $(B)/libglm.so
 	$(CXX) -fsycl $(TGT) $(BE_SYCL) $< -o $@ $(LDFLAGS) $(LIBS)
 $(B)/tok_check: $(B)/t_tok_check.o $(HOST)

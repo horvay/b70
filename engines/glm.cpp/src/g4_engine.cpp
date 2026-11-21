@@ -199,7 +199,24 @@ void G4Engine::step() {
     std::vector<int> p0(R);
     for (int a = 0; a < R; a++) p0[a] = m_.position_of(act[a]);
     const half* lg = m_.forward_rows(rg.data(), rt.data(), Q);
-    q.memcpy(logits_h_, lg, (size_t)Q * V * sizeof(half)).wait();
+    // sampling: by default each row's pool comes back (sample_gpu.h), not its logits
+    static const bool gpu_sample = !(getenv("GLM_SAMPLE_GPU") && atoi(getenv("GLM_SAMPLE_GPU")) == 0);
+    static const bool check = getenv("GLM_SAMPLE_CHECK") && atoi(getenv("GLM_SAMPLE_CHECK")) != 0;
+    if (gpu_sample) {
+        if (!pool_) pool_ = std::make_unique<GpuPool>(V, g4::QMAX);
+        pool_rows_.assign(Q, PoolRow());
+        pool_pen_.clear();
+        for (int a = 0; a < R; a++) {
+            const int rows = (a + 1 < R ? first[a + 1] : Q) - first[a];
+            // row i is sampled only when rows 0 .. i - 1 gave its drafts: those are the tokens it sees beyond the past
+            for (int i = 0; i < rows; i++)
+                games_[act[a]].sm->pool_row(pool_rows_[first[a] + i], pool_pen_, rt.data() + first[a] + 1, i);
+        }
+        pool_->run(q, lg, Q, pool_rows_, pool_pen_);
+        if (check) q.memcpy(logits_h_, lg, (size_t)Q * V * sizeof(half)).wait();
+    } else {
+        q.memcpy(logits_h_, lg, (size_t)Q * V * sizeof(half)).wait();
+    }
 
     const double tn = now_s();
     for (int a = 0; a < R; a++) {
@@ -212,7 +229,30 @@ void G4Engine::step() {
         for (int i = 0; i < rows; i++) {
             const int row = first[a] + i;
             G.seq.push_back(rt[row]);
-            int next = G.sm->sample(logits_h_ + (size_t)row * V);
+            int next;
+            if (gpu_sample) {
+                std::unique_ptr<Sampler> ref;
+                if (check) ref = std::make_unique<Sampler>(*G.sm);
+                next = G.sm->sample_pool(pool_->ids(row), pool_->raw(row), pool_->n(row), pool_->rest_n(row),
+                                         pool_->rest_sum(row), pool_->gmax(row));
+                if (next < 0) {
+                    // the pool could not settle it: the whole row, on the host
+                    if (!check) q.memcpy(logits_h_ + (size_t)row * V, lg + (size_t)row * V, (size_t)V * sizeof(half)).wait();
+                    next = G.sm->sample(logits_h_ + (size_t)row * V);
+                    Sampler::n_full++;
+                }
+                if (check) {
+                    const int want = ref->sample(logits_h_ + (size_t)row * V);
+                    check_rows_++;
+                    if (want != next) {
+                        check_diff_++;
+                        fprintf(stderr, "sample check: row %d gave %d, the host sampler %d (%lld of %lld rows differ)\n", row, next,
+                                want, check_diff_, check_rows_);
+                    }
+                }
+            } else {
+                next = G.sm->sample(logits_h_ + (size_t)row * V);
+            }
             G.sm->seen(next);
             if (std::find(G.r.stop_ids.begin(), G.r.stop_ids.end(), next) != G.r.stop_ids.end()) {
                 G.res.finish = "stop";

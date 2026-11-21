@@ -1,0 +1,475 @@
+diff --git c/build_sycl.sh w/build_sycl.sh
+index b949174..e8bae8c 100755
+--- c/build_sycl.sh
++++ w/build_sycl.sh
+@@ -40,6 +40,13 @@ if [[ -z "${JOBS:-}" ]]; then
+ fi
+ echo "building with $JOBS jobs (nice 10)"
+ nice -n 10 cmake --build "$BUILD" --target sd-cli -j "$JOBS"
++# Jobs run the installed copy $HERE/bin/sd-cli (tools/b70-image.sh), replaced by a rename only once the build is done:
++# a relink deletes $BUILD/bin/sd-cli for minutes (2026-11-18: a prop series failed every H3 call meanwhile).
++# NO_INSTALL=1: build only (a change still being checked; the jobs keep the installed copy).
++if [[ -z "${NO_INSTALL:-}" ]]; then
++  mkdir -p "$HERE/bin"
++  cp "$BUILD/bin/sd-cli" "$HERE/bin/.sd-cli.tmp" && mv -f "$HERE/bin/.sd-cli.tmp" "$HERE/bin/sd-cli"
++fi
+ ldd "$BUILD/bin/sd-cli" | grep -Ei 'vulkan|torch|c10' && { echo "unexpected Vulkan/torch dependency" >&2; exit 1; } || true
+ ldd "$BUILD/bin/sd-cli" | grep "not found" && { echo "missing shared libraries" >&2; exit 1; } || true
+ echo "built $BUILD/bin/sd-cli"
+diff --git c/examples/cli/main.cpp w/examples/cli/main.cpp
+index a29fd70..755846f 100644
+--- c/examples/cli/main.cpp
++++ w/examples/cli/main.cpp
+@@ -21,6 +21,9 @@
+ #include "common/media_io.h"
+ #include "common/resource_owners.hpp"
+ #include "image_metadata.h"
++#include "json.hpp"
++#include <chrono>
++#include <fstream>
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -60,6 +63,7 @@ struct SDCliParams {
+ 
+     std::string imatrix_out;
+     std::vector<std::string> imatrix_in;
++    std::string multi_jobs_path;
+ 
+     bool normal_exit = false;
+ 
+@@ -68,6 +72,7 @@ struct SDCliParams {
+ 
+         options.string_options = {
+             {"", "--input-frames", "directory of ordered RGB frames for vid_upscale (use -i for a single image)", 0, &input_frames},
++            {"", "--multi-jobs", "img_gen: run several stills in one context; FILE has one JSON array of extra arguments per line", 0, &multi_jobs_path},
+             {"-o",
+              "--output",
+              "path to write result image to. you can use printf-style %d format specifiers for image sequences (default: ./output.png) (eg. output_%03d.png). Single-file video outputs support .avi, .webm, and animated .webp",
+@@ -633,6 +638,188 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
+     return true;
+ }
+ 
++// --multi-jobs FILE (img_gen): one context (the H3 blocks in libxpu_h3, text encoder and VAE load once), then each
++// line, a JSON array of extra arguments, is parsed together with this command line as a separate run would parse it,
++// generated and saved. Inputs are loaded right before each job and freed after it; a failed job is logged and skipped.
++static int run_multi_jobs(int argc, const char* argv[], const SDCliParams& base_cli, SDContextParams& base_ctx) {
++    using clock = std::chrono::steady_clock;
++    auto secs   = [](clock::time_point t) { return std::chrono::duration<double>(clock::now() - t).count(); };
++    if (base_cli.mode != IMG_GEN) {
++        LOG_ERROR("--multi-jobs needs -M img_gen");
++        return 1;
++    }
++    std::vector<std::string> base_args;
++    for (int i = 0; i < argc; ++i) {
++        if (std::string(argv[i]) == "--multi-jobs") {
++            ++i;
++            continue;
++        }
++        base_args.push_back(argv[i]);
++    }
++    std::ifstream file(base_cli.multi_jobs_path);
++    if (!file) {
++        LOG_ERROR("cannot open --multi-jobs file '%s'", base_cli.multi_jobs_path.c_str());
++        return 1;
++    }
++    struct Job {
++        SDCliParams cli;
++        SDContextParams ctx;
++        SDGenerationParams gen;
++    };
++    std::vector<std::vector<std::string>> lines;
++    std::string line;
++    int line_no = 0;
++    while (std::getline(file, line)) {
++        ++line_no;
++        const size_t first = line.find_first_not_of(" \t\r");
++        if (first == std::string::npos || line[first] == '#') {
++            continue;
++        }
++        std::vector<std::string> args = base_args;
++        try {
++            auto parsed = nlohmann::json::parse(line);
++            if (!parsed.is_array()) {
++                throw std::runtime_error("not a JSON array");
++            }
++            for (const auto& item : parsed) {
++                args.push_back(item.get<std::string>());
++            }
++        } catch (const std::exception& e) {
++            LOG_ERROR("--multi-jobs line %d: %s", line_no, e.what());
++            return 1;
++        }
++        lines.push_back(std::move(args));
++    }
++    if (lines.empty()) {
++        LOG_ERROR("--multi-jobs file '%s' has no jobs", base_cli.multi_jobs_path.c_str());
++        return 1;
++    }
++    // Phase batching (default; SD_MULTI_PHASES=0: one image after another as before): pass 1 runs every job up to its
++    // conditioning (text encoder, reference VAE encodes; both cached in the context), pass 2 runs every job again from
++    // the caches, so the offloaded text encoder visits the card once a batch and the DiT blocks stay resident between
++    // images instead of being reloaded for each (SD_XPU_H3_KEEP). Same seeds, same maths: the images are the same.
++    const char* ph   = std::getenv("SD_MULTI_PHASES");
++    const bool phases = ph == nullptr || std::string(ph) != "0";
++    if (phases) {
++        const int want = static_cast<int>(lines.size()) * 3 + 4;  // cond, uncond and image-uncond entries per job
++        base_ctx.conditioning_cache_size = std::max(base_ctx.conditioning_cache_size.value_or(4), want);
++    }
++    const auto load_start = clock::now();
++    SDOptPtr sd_ctx_params = base_ctx.to_context_opt();
++    SDCtxPtr sd_ctx(create_sd_context(sd_ctx_params));
++    if (sd_ctx == nullptr) {
++        LOG_ERROR("sd_ctx_create failed");
++        return 1;
++    }
++    LOG_INFO("[multi] context ready in %.2fs; %zu image jobs%s", secs(load_start), lines.size(), phases ? " (phase batching)" : "");
++    // SD_MULTI_STOP_FILE: when that file exists, stop before the next job (a standby worker steps aside for another
++    // job after the image in progress); the jobs not run are reported, the exit code is 3.
++    const char* stop_file = std::getenv("SD_MULTI_STOP_FILE");
++    auto stop_now         = [&] { return stop_file != nullptr && fs::exists(stop_file); };
++
++    // parse a job line and load its inputs; nullptr (logged) when it cannot run
++    auto prepare = [&](size_t i) -> std::unique_ptr<Job> {
++        auto job = std::make_unique<Job>();
++        std::vector<const char*> job_argv;
++        for (const auto& a : lines[i]) {
++            job_argv.push_back(a.c_str());
++        }
++        std::vector<ArgOptions> options = {job->cli.get_options(), job->ctx.get_options(), job->gen.get_options()};
++        if (!parse_options(static_cast<int>(job_argv.size()), job_argv.data(), options) || !job->cli.resolve_and_validate() ||
++            !job->ctx.resolve_and_validate(job->cli.mode) ||
++            !job->gen.resolve_and_validate(job->cli.mode, job->ctx.lora_model_dir, job->ctx.hires_upscalers_dir)) {
++            LOG_ERROR("[multi] job %zu: invalid arguments", i + 1);
++            return nullptr;
++        }
++        SDGenerationParams& gen = job->gen;
++        bool ok                 = true;
++        auto load               = [&](const std::string& path, SDImageOwner& image, int channels) {
++            if (!load_sd_image_from_file(image.put(), path.c_str(), 0, 0, channels)) {
++                LOG_ERROR("[multi] job %zu: load image from '%s' failed", i + 1, path.c_str());
++                ok = false;
++                return;
++            }
++            gen.set_width_and_height_if_unset(image.get().width, image.get().height);
++        };
++        if (!gen.init_image_path.empty()) {
++            load(gen.init_image_path, gen.init_image, 0);
++        }
++        gen.ref_images.clear();
++        for (const auto& path : gen.ref_image_paths) {
++            SDImageOwner ref({0, 0, 0, nullptr});
++            load(path, ref, 0);
++            gen.ref_images.push_back(std::move(ref));
++        }
++        if (ok && !gen.mask_image_path.empty() && !load_sd_image_from_file(gen.mask_image.put(), gen.mask_image_path.c_str(), 0, 0, 1)) {
++            LOG_ERROR("[multi] job %zu: load mask '%s' failed", i + 1, gen.mask_image_path.c_str());
++            ok = false;
++        }
++        return ok ? std::move(job) : nullptr;
++    };
++
++    std::vector<std::unique_ptr<Job>> jobs(lines.size());
++    size_t stopped_at = lines.size();
++    const auto t0     = clock::now();
++    if (phases) {
++        // pass 1: conditioning of every job, the text encoder staged on the card once for all of them
++        // (SD_MULTI_TE_KEEP=0: staged and released per job as before)
++        const char* tk     = std::getenv("SD_MULTI_TE_KEEP");
++        const bool te_keep = tk == nullptr || std::string(tk) != "0";
++        sd_set_condition_only(sd_ctx.get(), true);
++        sd_set_retain_staged_weights(sd_ctx.get(), te_keep);
++        for (size_t i = 0; i < lines.size(); ++i) {  // never stopped: short, and pass 2 needs it to make anything
++            const auto js = clock::now();
++            jobs[i]       = prepare(i);
++            if (jobs[i] != nullptr) {
++                sd_result_t* generated = nullptr;
++                generate_sd_image(sd_ctx.get(), jobs[i]->gen.to_image_opt(), &generated);
++                sd_result_free(generated);
++            }
++            LOG_INFO("[multi] job %zu/%zu conditioned in %.2fs", i + 1, lines.size(), secs(js));
++        }
++        sd_set_condition_only(sd_ctx.get(), false);
++        sd_set_retain_staged_weights(sd_ctx.get(), false);
++        LOG_INFO("[multi] conditioning pass: %.2fs", secs(t0));
++        if (std::getenv("SD_XPU_H3_KEEP") == nullptr) {
++            setenv("SD_XPU_H3_KEEP", "1", 1);  // keep the blocks between the images of pass 2
++        }
++    }
++    int saved = 0;
++    for (size_t i = 0; i < lines.size() && stopped_at == lines.size(); ++i) {
++        if (saved > 0 && stop_now()) {  // at least one image a turn, so a worker that loaded the models makes progress
++            LOG_INFO("[multi] %s exists: stopping before job %zu/%zu", stop_file, i + 1, lines.size());
++            stopped_at = i;
++            break;
++        }
++        const auto job_start = clock::now();
++        std::unique_ptr<Job> job = phases ? std::move(jobs[i]) : prepare(i);
++        const std::string out    = job ? job->cli.output_path : std::string("?");
++        bool ok                  = job != nullptr;
++        if (ok) {
++            SDImageVec results;
++            sd_result_t* generated = nullptr;
++            generate_sd_image(sd_ctx.get(), job->gen.to_image_opt(), &generated);
++            results.adopt(generated, job->ctx.lora_model_dir);
++            const int n = results.count();
++            ok          = results && save_results(job->cli, job->ctx, job->gen, results, n, nullptr, "");
++        }
++        job.reset();
++        if (ok) {
++            ++saved;
++            LOG_INFO("[multi] job %zu/%zu saved %s in %.2fs", i + 1, lines.size(), out.c_str(), secs(job_start));
++        } else {
++            LOG_ERROR("[multi] job %zu/%zu (%s) failed after %.2fs", i + 1, lines.size(), out.c_str(), secs(job_start));
++        }
++    }
++    sd_clear_phase_caches(sd_ctx.get());
++    LOG_INFO("[multi] %d/%zu jobs saved in %.2fs (plus %.2fs context load)", saved, stopped_at, secs(t0),
++             std::chrono::duration<double>(t0 - load_start).count());
++    if (stopped_at < lines.size()) {
++        return saved == static_cast<int>(stopped_at) ? 3 : 1;
++    }
++    return saved == static_cast<int>(lines.size()) ? 0 : 1;
++}
++
+ int main(int argc, const char* argv[]) {
+     if (argc > 1 && std::string(argv[1]) == "--version") {
+         std::cout << version_string() << "\n";
+@@ -816,6 +1003,10 @@ int main(int argc, const char* argv[]) {
+         }
+     }
+ 
++    if (!cli_params.multi_jobs_path.empty()) {
++        return run_multi_jobs(argc, argv, cli_params, ctx_params);
++    }
++
+     auto load_image_and_update_size = [&](const std::string& path,
+                                           SDImageOwner& image,
+                                           int expected_channel = 3) -> bool {
+diff --git c/include/stable-diffusion.h w/include/stable-diffusion.h
+index c5a25c6..d616521 100644
+--- c/include/stable-diffusion.h
++++ w/include/stable-diffusion.h
+@@ -281,6 +281,13 @@ SD_API sd_preview_info_t sd_get_preview_info();
+ typedef bool (*sd_prompt_image_cb_t)(const char* source, void* data, const sd_tensor_t** image_out);
+ SD_API void sd_set_prompt_image_callback(sd_ctx_t* ctx, sd_prompt_image_cb_t cb, void* data);
+ 
++// Phase batching: with condition_only on, image generation stops after the conditioning and the reference latents,
++// which stay cached in the context (conditioning cache, reference latent cache) for a second, normal pass.
++SD_API void sd_set_condition_only(sd_ctx_t* ctx, bool on);
++SD_API void sd_clear_phase_caches(sd_ctx_t* ctx);
++// Keep model weights staged on the compute device between generations (on), or release them now (off).
++SD_API void sd_set_retain_staged_weights(sd_ctx_t* ctx, bool on);
++
+ struct ggml_tensor;
+ 
+ typedef bool (*sd_graph_eval_callback_t)(struct ggml_tensor* t, bool ask, void* user_data);
+diff --git c/src/api/api.cpp w/src/api/api.cpp
+index 72cd6d4..cd1389d 100644
+--- c/src/api/api.cpp
++++ w/src/api/api.cpp
+@@ -69,6 +69,30 @@ sd_status_t sd_set_preview_callback(sd_preview_cb_t cb, const char* mode, int in
+     return SD_STATUS_OK;
+ }
+ 
++void sd_set_condition_only(sd_ctx_t* ctx, bool on) {
++    if (ctx == nullptr || ctx->sd == nullptr) {
++        return;
++    }
++    std::lock_guard<std::recursive_mutex> lock(ctx->sd->execution_mutex);
++    ctx->sd->condition_only = on;
++}
++
++void sd_set_retain_staged_weights(sd_ctx_t* ctx, bool on) {
++    if (ctx == nullptr || ctx->sd == nullptr || ctx->sd->model_manager == nullptr) {
++        return;
++    }
++    std::lock_guard<std::recursive_mutex> lock(ctx->sd->execution_mutex);
++    ctx->sd->model_manager->set_retain_staged(on);
++}
++
++void sd_clear_phase_caches(sd_ctx_t* ctx) {
++    if (ctx == nullptr || ctx->sd == nullptr) {
++        return;
++    }
++    std::lock_guard<std::recursive_mutex> lock(ctx->sd->execution_mutex);
++    ctx->sd->ref_latent_cache.clear();
++}
++
+ void sd_set_prompt_image_callback(sd_ctx_t* ctx, sd_prompt_image_cb_t cb, void* data) {
+     if (ctx == nullptr || ctx->sd == nullptr) {
+         return;
+diff --git c/src/model/vae/minimax_h3_vae.hpp w/src/model/vae/minimax_h3_vae.hpp
+index 3010cb8..7290d1d 100644
+--- c/src/model/vae/minimax_h3_vae.hpp
++++ w/src/model/vae/minimax_h3_vae.hpp
+@@ -103,6 +103,22 @@ namespace MiniMaxH3VAE {
+             x                = reflect_pad(x, 0, std::get<2>(temporal_padding));
+             x                = reflect_pad(x, 1, std::get<1>(temporal_padding));
+             int temporal_pad = std::get<0>(temporal_padding) * 2;
++            // A single frame (a still): the causal padding puts kt - 1 zero frames in front, so only the kernel's
++            // last temporal tap meets data. A 2D convolution with that slice gives the same output for 1 / kt of
++            // the work (the reference encode of an H3-Image edit: 11-18 s per picture as a 3D convolution).
++            const int kt = std::get<0>(kernel_size);
++            if (x->ne[2] == 1 && kt > 1 && temporal_pad == kt - 1 && std::get<0>(dilation) == 1 && x->ne[3] == in_channels &&
++                ctx->weight_adapter == nullptr) {
++                ggml_tensor* w = params["weight"];
++                ggml_tensor* last = ggml_view_4d(ctx->ggml_ctx, w, w->ne[0], w->ne[1], 1, w->ne[3], w->nb[1], w->nb[2], w->nb[3],
++                                                 static_cast<size_t>(kt - 1) * w->nb[2]);
++                last = ggml_cont(ctx->ggml_ctx, last);
++                return ggml_ext_conv_3d(ctx, x, last, bias ? params["bias"] : nullptr, in_channels,
++                                        std::get<2>(stride), std::get<1>(stride), 1,
++                                        std::get<2>(padding), std::get<1>(padding), 0,
++                                        std::get<2>(dilation), std::get<1>(dilation), 1,
++                                        force_prec_f32, false, 1.f, true);
++            }
+             if (temporal_pad > 0) {
+                 x = ggml_ext_pad_ext(ctx,
+                                      x,
+diff --git c/src/model_manager.cpp w/src/model_manager.cpp
+index 74ca7a3..0b2aea4 100644
+--- c/src/model_manager.cpp
++++ w/src/model_manager.cpp
+@@ -1657,8 +1657,15 @@ void ModelManager::release_compute_backend_params(const std::vector<ggml_tensor*
+     finish_compute_backend_usage(required_states);
+ }
+ 
++void ModelManager::set_retain_staged(bool retain) {
++    retain_staged_ = retain;
++    if (!retain) {
++        release_compute_staging_blocks(false);
++    }
++}
++
+ void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
+-    if (tensors.empty()) {
++    if (retain_staged_ || tensors.empty()) {
+         return;
+     }
+     std::unordered_set<TensorState*> target_states;
+diff --git c/src/model_manager.h w/src/model_manager.h
+index bcc7489..05b39a8 100644
+--- c/src/model_manager.h
++++ w/src/model_manager.h
+@@ -117,6 +117,7 @@ private:
+     bool writable_mmap_              = false;
+     bool segmented_compute_disabled_ = false;
+     bool prefetch_disabled_          = false;
++    bool retain_staged_              = false;
+ 
+     void finish_compute_backend_usage(const std::vector<TensorState*>& states);
+     void release_all();
+@@ -280,6 +281,10 @@ public:
+     bool prefetch_enabled() const override { return !prefetch_disabled_; }
+     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
++    // Keep weights staged on the compute device when their runner's session ends (they stay evictable when another
++    // allocation needs the room); off releases every unpinned staged block. A phase-batched run conditions all its jobs
++    // with the text encoder staged once instead of once per job (16 GB, 8-25 s each for MiniMax-H3's Qwen3-VL-32B).
++    void set_retain_staged(bool retain);
+     WeightResidencyInfo inspect_compute_backend_params(
+         const std::vector<ggml_tensor*>& tensors) const override;
+     void update_runtime_residency(uintptr_t owner_id,
+diff --git c/src/pipeline/diffusion_engine.h w/src/pipeline/diffusion_engine.h
+index ae05dc9..1607152 100644
+--- c/src/pipeline/diffusion_engine.h
++++ w/src/pipeline/diffusion_engine.h
+@@ -86,6 +86,11 @@ public:
+     sd::Tensor<float> ip_adapter_tokens;
+     sd_prompt_image_cb_t prompt_image_callback = nullptr;
+     void* prompt_image_callback_data           = nullptr;
++    // Phase batching (sd-cli --multi-jobs): with condition_only, generate_image stops after the conditioning and the
++    // reference latents (both cached), so a batch encodes every job with the text encoder on the card once, then
++    // samples every job with the DiT on the card. ref_latent_cache: VAE encodes of reference pictures by content.
++    bool condition_only = false;
++    std::unordered_map<std::string, sd::Tensor<float>> ref_latent_cache;
+     sd::Tensor<float> ip_adapter_uncond_tokens;
+     float ip_adapter_strength = 1.0f;
+     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
+diff --git c/src/pipeline/image.cpp w/src/pipeline/image.cpp
+index 2a733cb..597eb1c 100644
+--- c/src/pipeline/image.cpp
++++ w/src/pipeline/image.cpp
+@@ -1,4 +1,5 @@
+ #include <dlfcn.h>
++#include <cstring>
+ #include "api/result.h"
+ #include "core/option_types.h"
+ #include "generation.h"
+@@ -175,9 +176,9 @@ namespace sd::pipeline {
+         return packed;
+     }
+ 
+-    static sd::Tensor<float> resize_h3_image_reference(const sd::Tensor<float>& image, int64_t max_short_edge) {
++    static sd::Tensor<float> resize_h3_image_reference(const sd::Tensor<float>& image, int64_t max_short_edge, int64_t min_short_edge = 1024) {
+         const int64_t short_edge = std::min(image.shape()[0], image.shape()[1]);
+-        const double scale       = static_cast<double>(std::clamp<int64_t>(short_edge, 1024, max_short_edge)) / short_edge;
++        const double scale       = static_cast<double>(std::clamp<int64_t>(short_edge, min_short_edge, max_short_edge)) / short_edge;
+         const int64_t width      = std::max<int64_t>(32, static_cast<int64_t>(std::nearbyint(image.shape()[0] * scale / 32)) * 32);
+         const int64_t height     = std::max<int64_t>(32, static_cast<int64_t>(std::nearbyint(image.shape()[1] * scale / 32)) * 32);
+         if (width == image.shape()[0] && height == image.shape()[1]) {
+@@ -369,7 +370,28 @@ namespace sd::pipeline {
+             }
+             sd::Tensor<float> ref_latent;
+             if (sd->version == VERSION_MINIMAX_H3_IMAGE) {
+-                ref_latent = sd->encode_first_stage(resize_h3_image_reference(ref_images[i], 2048));
++                {
++                    // the VAE encode of a reference depends only on the picture: kept for the batch's second pass
++                    sd::Tensor<float> resized = resize_h3_image_reference(ref_images[i], 2048);
++                    std::string key           = std::to_string(resized.numel());
++                    for (auto d : resized.shape()) key += "x" + std::to_string(d);
++                    uint64_t h = 1469598103934665603ull;
++                    for (float v : resized.values()) {
++                        uint32_t u;
++                        std::memcpy(&u, &v, 4);
++                        h = (h ^ u) * 1099511628211ull;
++                    }
++                    key += ":" + std::to_string(h);
++                    auto it = sd->ref_latent_cache.find(key);
++                    if (it != sd->ref_latent_cache.end()) {
++                        ref_latent = it->second;
++                    } else {
++                        ref_latent = sd->encode_first_stage(resized);
++                        if (!ref_latent.empty()) {
++                            sd->ref_latent_cache[key] = ref_latent;
++                        }
++                    }
++                }
+                 if (!ref_latent.empty()) {
+                     const int64_t width    = ref_latent.shape()[0];
+                     const int64_t height   = ref_latent.shape()[1];
+@@ -521,8 +543,21 @@ namespace sd::pipeline {
+             for (size_t i = 0; i < ref_latents.size(); ++i) {
+                 latents.minimax_reference_blocks.push_back({MiniMaxH3ReferenceKind::IMAGE, static_cast<int32_t>(i), -1});
+             }
+-            for (auto& image : ref_images) {
+-                image = sd->version == VERSION_P_H3_IMAGE ? resize_ph3_reference(image, 1000000) : resize_h3_image_reference(image, 1024);
++            // SD_H3_REF_SHORT=1024,512: the short edge of each <Picture N> in order (default 1024, upstream's size). A
++            // layout-only reference (a panel template) needs fewer tokens than one whose details are copied.
++            std::vector<int64_t> ref_short;
++            if (const char* rs = std::getenv("SD_H3_REF_SHORT")) {
++                for (const char* p = rs; *p != 0;) {
++                    ref_short.push_back(std::max<int64_t>(256, std::strtol(p, const_cast<char**>(&p), 10)));
++                    while (*p == ',' || *p == ' ') {
++                        ++p;
++                    }
++                }
++            }
++            for (size_t i = 0; i < ref_images.size(); ++i) {
++                const int64_t edge = i < ref_short.size() ? ref_short[i] : 1024;
++                ref_images[i]      = sd->version == VERSION_P_H3_IMAGE ? resize_ph3_reference(ref_images[i], 1000000)
++                                                                       : resize_h3_image_reference(ref_images[i], edge, edge);
+             }
+         }
+         latents.init_latent              = std::move(init_latent);
+@@ -986,6 +1021,10 @@ namespace sd::pipeline {
+             return false;
+         }
+         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
++        if (sd->condition_only) {
++            LOG_INFO("conditioning done (condition-only pass), %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
++            return true;
++        }
+         std::vector<sd::Tensor<float>> final_latents;
+         const char* xpu_h3_lib = getenv("SD_XPU_H3_LIB");
+         const bool xpu_h3      = xpu_h3_lib != nullptr && *xpu_h3_lib != '\0' && sd->version == VERSION_MINIMAX_H3_IMAGE;

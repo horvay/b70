@@ -90,6 +90,9 @@ int main(int argc, char** argv) {
             r.max_new = max_new;
             r.stop_ids = {1, 106, 50};
             r.sampling.temperature = getenv("G4_TEMP") ? (float)atof(getenv("G4_TEMP")) : 0.0f;
+            r.sampling.top_p = getenv("G4_TOPP") ? (float)atof(getenv("G4_TOPP")) : 1.0f;
+            r.sampling.top_k = getenv("G4_TOPK") ? atoi(getenv("G4_TOPK")) : 0;
+            if (getenv("G4_SEED")) { r.sampling.has_seed = true; r.sampling.seed = strtoull(getenv("G4_SEED"), nullptr, 10) + g; }
             r.on_token = [&out, &tot, g](int id) { out[g] += std::to_string(id) + " "; tot++; return true; };
             e.submit(std::move(r), [&res, g](const GenResult& x) { res[g] = x; });
         }
@@ -106,6 +109,8 @@ int main(int argc, char** argv) {
                    res[g].finish.c_str(), res[g].prompt_s, res[g].decode_tok_s, res[g].drafted, res[g].accepted);
         }
         printf("total: %d tokens, %.2f tok/s decoding (%.1f s in all)\n", tot, (tot - tot0) / std::max(1e-9, t2 - td), t2 - t1);
+        printf("sampling: %lld rows from GPU pools (%lld with the GPU's top-p rest), %lld whole rows; check %lld rows, %lld differ\n",
+               Sampler::n_pool, Sampler::n_rest, Sampler::n_full, e.check_rows_, e.check_diff_);
         return 0;
     }
     if (mode == "lat") {     // g4_gen <dir> lat n...: seconds to read a prompt of n tokens (the second try of each)

@@ -7,6 +7,7 @@
 #include <vector>
 #include "engine.h"
 #include "g4.h"
+#include "sample_gpu.h"
 #include "sampler.h"
 
 namespace glm {
@@ -50,6 +51,12 @@ private:
     std::vector<Game> games_;
     uint64_t clock_ = 0;
     half* logits_h_ = nullptr;
+    std::unique_ptr<GpuPool> pool_;              // sampling's selection on the card (GLM_SAMPLE_GPU=0: whole rows)
+    std::vector<PoolRow> pool_rows_;
+    std::vector<PenEntry> pool_pen_;
+public:
+    long long check_rows_ = 0, check_diff_ = 0;  // GLM_SAMPLE_CHECK=1: rows compared with the host sampler, differing
+private:
     std::vector<std::vector<int>> drafts_;
     void finish(int g);
 };

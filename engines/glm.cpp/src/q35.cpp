@@ -3,8 +3,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <sstream>
+#include <sys/mman.h>
+#include <thread>
 #include "json.h"
 #include "ops.h"
+#include "q35_blocks.h"
 #include "q35_ops.h"
 #include "q4_ops.h"
 #include "progress.h"
@@ -88,12 +92,22 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
     L = (int)tc.get_i("num_hidden_layers", 0);
     GLM_CHECK((int)tc["layer_types"].size() >= L, "%s: layer_types has fewer than %d entries", dir.c_str(), L);
     st = std::make_unique<SafeTensors>(dir);
+    st->defer(true);                    // weights are read below in one parallel pass (SafeTensors::flush)
     auto& q = Dev::get().q;
+    if (getenv("Q35_PF_ATTN")) pf_attn = atoi(getenv("Q35_PF_ATTN"));
+    if (getenv("Q35_PF_GDN")) pf_gdn = atoi(getenv("Q35_PF_GDN"));
+    if (getenv("Q35_DEC_ATTN")) dec_attn = atoi(getenv("Q35_DEC_ATTN"));
+    if (getenv("Q35_REPLAY")) replay_mode = atoi(getenv("Q35_REPLAY"));
+    if (getenv("Q35_DELTA")) q35ops::gdn_delta_variant = atoi(getenv("Q35_DELTA"));
+    if (getenv("Q35_DEC_NS")) dec_ns = std::max(1, std::min(256, atoi(getenv("Q35_DEC_NS"))));
     if (getenv("GLM_PREFILL_CHUNK")) prefill_chunk = std::max(64, std::min(2048, atoi(getenv("GLM_PREFILL_CHUNK"))));
 
     const StTensor& et = st->at(P + "embed_tokens.weight");
     GLM_CHECK(et.dt == DType::BF16 && et.shape[0] == V && et.shape[1] == D, "embedding: expected bf16 [V, D]");
     embed = static_cast<const bf16*>(et.data);
+    // its pages in now (as G4Model does), beside the weights' reading: a token's row is read on the host, and a row not
+    // yet touched is a page fault (a file read on a cold page cache) inside the decode loop
+    std::thread embed_in([p = et.data, n = et.bytes] { SafeTensors::populate(p, n, 4); });
     lm_head = Exl3Linear::load(*st, "lm_head");
     norm_w = norm1p(*st, P + "norm.weight");
 
@@ -103,8 +117,18 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
     if (want > 0 && !use_mtp) fprintf(stderr, "no MTP layer in %s: no drafts\n", dir.c_str());
     nslot = use_mtp ? 2 : 1;
     if (getenv("Q35_MTP_MIN_P")) mtp_min_p = (float)atof(getenv("Q35_MTP_MIN_P"));
+    mtp_blocks = q35_draft_blocks();
+    if (getenv("Q35_MTP_BLOCKS")) {
+        mtp_blocks.clear();
+        std::stringstream ss(read_file(getenv("Q35_MTP_BLOCKS")));
+        for (int b; ss >> b;) if (b >= 0 && b < V / 128) mtp_blocks.push_back(b);
+        GLM_CHECK(!mtp_blocks.empty(), "Q35_MTP_BLOCKS: no blocks in %s", getenv("Q35_MTP_BLOCKS"));
+    }
+    std::sort(mtp_blocks.begin(), mtp_blocks.end());
+    mtp_blocks.erase(std::unique(mtp_blocks.begin(), mtp_blocks.end()), mtp_blocks.end());
     if (getenv("Q35_MTP_HEAD")) mtp_head = atoi(getenv("Q35_MTP_HEAD"));
-    mtp_head = mtp_head <= 0 || mtp_head > V ? V : mtp_head / 128 * 128;
+    else if (!mtp_blocks.empty()) mtp_head = 0;
+    if (mtp_head != 0) mtp_head = mtp_head < 0 || mtp_head > V ? V : mtp_head / 128 * 128;
 
     blocks.resize(L);
     gst.resize(L);
@@ -151,8 +175,15 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
         b.d = Exl3Linear::load(*st, p + "mlp.down_proj");
         load_progress("loaded layer %d/%d (%.2f GiB VRAM)", li + 1, L, Dev::get().vram_used / 1073741824.0);
     }
+    if (use_mtp) load_mtp();
+    st->flush();
+    st->defer(false);
+    embed_in.join();
+    merge_mask = getenv("Q35_MERGE") ? atoi(getenv("Q35_MERGE")) : 7;
+    for (auto& b : blocks) merge_linears(b);
+    if (mtp) merge_linears(mtp->blk);
     if (use_mtp) {
-        load_mtp();
+        if (mtp_head == 0) build_draft_head();
         draft_tokens = std::min(want, qmax - 1);
         fprintf(stderr, "MTP: %d drafts a step (Q35_MTP; 0 = off)\n", draft_tokens);
     }
@@ -162,14 +193,14 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
     size_t lw = lm_head.ws_bytes(qmax);
     auto need = [&](const Exl3Linear& l) { lw = std::max({lw, l.ws_bytes(C), l.ws_bytes(qmax)}); };
     for (auto& b : blocks) {
-        need(b.g); need(b.u); need(b.d);
-        if (b.att) { need(b.att->q); need(b.att->k); need(b.att->v); need(b.att->o); }
-        if (b.gdn) { need(b.gdn->qkv); need(b.gdn->z); need(b.gdn->o); }
+        need(b.g); need(b.u); need(b.d); need(b.gu);
+        if (b.att) { need(b.att->q); need(b.att->k); need(b.att->v); need(b.att->o); need(b.att->qkv); }
+        if (b.gdn) { need(b.gdn->qkv); need(b.gdn->z); need(b.gdn->o); need(b.gdn_in); }
     }
     if (mtp) {
         const Q35Block& b = mtp->blk;
-        need(mtp->fc); need(b.g); need(b.u); need(b.d);
-        need(b.att->q); need(b.att->k); need(b.att->v); need(b.att->o);
+        need(mtp->fc); need(b.g); need(b.u); need(b.d); need(b.gu);
+        need(b.att->q); need(b.att->k); need(b.att->v); need(b.att->o); need(b.att->qkv);
     }
     lin.init(lw + ((size_t)1 << 20));
     act.init((size_t)C * 120 * 1024 + ((size_t)64 << 20));
@@ -181,8 +212,11 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
     a16 = Tensor::empty({C, I}, DType::F16);
     fin16 = Tensor::empty({qmax, D}, DType::F16);
     logits = Tensor::empty({qmax, V}, DType::F16);
-    // softmax partials: pieces of a prompt's rows are cut to fit, a decode step needs its one row at full context
-    size_t part_floats = std::max<size_t>((size_t)192 << 20, q35ops::attn_part_floats(qmax, max_tokens / CH + 1));
+    // softmax partials of decode steps (Q35_DEC_ATTN 0: the plain kernel's, every row at full context); prompts read with
+    // the plain kernel (Q35_PF_ATTN=0 at load) get 768 MB so their pieces of rows run in few calls (a later switch to it,
+    // as q35_gen kl does, cuts its rows to fit what is there)
+    size_t part_floats = dec_attn ? q35ops::dec_part_floats(qmax, dec_ns) : q35ops::attn_part_floats(qmax, max_tokens / CH + 1);
+    if (pf_attn == 0) part_floats = std::max<size_t>(part_floats, (size_t)192 << 20);
     part = Tensor::empty({(int64_t)part_floats}, DType::F32);
     pid_dev = Tensor::empty({(int64_t)8 * C, 3}, DType::I32);
     pos_dev = Tensor::zeros({qmax}, DType::I32);
@@ -199,7 +233,21 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
     desc_h = sycl::malloc_host<int>(qmax * 3, q);
     rdesc_h = sycl::malloc_host<int>(qmax * 3, q);
     GLM_CHECK(desc_h && rdesc_h, "pinned upload buffers");
-    rep_graphs.resize(qmax + 1);
+    rep_graphs.resize(2 * (qmax + 1));
+    if (mtp) {
+        // gdn_replay's table of every GDN layer's state and saved step inputs
+        std::vector<q35ops::GdnReplayLayer> t;
+        for (int li = 0; li < L; li++) {
+            if (blocks[li].attn) continue;
+            Q35GdnState& g = gst[li];
+            t.push_back({g.kq.ptr<float>(), g.kb.ptr<float>(), g.kg.ptr<float>(), g.conv.ptr<bf16>(),
+                         blocks[li].gdn->conv_w.ptr<bf16>(), g.rec.ptr<float>()});
+        }
+        rep_nl = (int)t.size();
+        rep_layers = Tensor::empty({(int64_t)(t.size() * sizeof(t[0]))}, DType::U8);
+        upload(rep_layers.p, t.data(), t.size() * sizeof(t[0]));
+        rep_cv = Tensor::empty({(int64_t)rep_nl * qmax * q4::GQKV}, DType::BF16);
+    }
     if (mtp) {
         MQ = qmax;
         hring = Tensor::zeros({games(), RING, D}, DType::F16);
@@ -226,6 +274,9 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
     // for each row whatever the count): 50.1 / 51.4 / 52.9 / 53.3 ms for 1 / 2 / 3 / 4 rows, against the vector
     // kernel's 47.4 / 51.3 / 63.5 / 66.5 (GLM_EXL3_VECMAX overrides)
     if (mtp) exl3_vec_max = 0;
+    // a layer's decoded int8 weights stay for the rest of its prompt pieces (the largest set: the MTP layer's 8 linears,
+    // ~424 MB; a GDN layer's 6 ~383 MB, an attention layer's 7 ~372 MB)
+    exl3_i8_cache_mb = 448;
     q.wait();
     if (!getenv("Q35_WARMUP") || atoi(getenv("Q35_WARMUP")) != 0) {
         auto tw = std::chrono::steady_clock::now();
@@ -248,6 +299,14 @@ Q35Model::Q35Model(const std::string& dir, int max_tok, int seqs) : max_tokens(m
         fprintf(stderr, "warm-up %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count());
     }
     fprintf(stderr, "model ready: %.2f GiB VRAM\n", Dev::get().vram_used / 1073741824.0);
+}
+
+void Q35Model::merge_linears(Q35Block& b) {
+    if ((merge_mask & 1) && Exl3Linear::can_merge({&b.g, &b.u})) b.gu = Exl3Linear::merge({&b.g, &b.u});
+    if ((merge_mask & 4) && b.att && Exl3Linear::can_merge({&b.att->q, &b.att->k, &b.att->v}))
+        b.att->qkv = Exl3Linear::merge({&b.att->q, &b.att->k, &b.att->v});
+    if ((merge_mask & 2) && b.gdn && Exl3Linear::can_merge({&b.gdn->qkv, &b.gdn->z}))
+        b.gdn_in = Exl3Linear::merge({&b.gdn->qkv, &b.gdn->z});
 }
 
 Q35Model::~Q35Model() {
@@ -306,7 +365,8 @@ void Q35Model::rows_host(Seq& se, const int* tokens, int n, float* dst, int* pid
     }
 }
 
-void Q35Model::gdn_forward(const Q4Gdn& g, Q35GdnState& s, const half* y, int rows, float* out, const int* desc) {
+void Q35Model::gdn_forward(const Q4Gdn& g, const Exl3Linear& gin, Q35GdnState& s, const half* y, int rows, float* out,
+                           const int* desc) {
     using namespace q4;
     auto& q = Dev::get().q;
     act.reset();
@@ -319,8 +379,13 @@ void Q35Model::gdn_forward(const Q4Gdn& g, Q35GdnState& s, const half* y, int ro
     bf16* cv = act.take<bf16>((size_t)rows * GQKV);
     bf16* core = act.take<bf16>((size_t)rows * GV * GDV);
     half* nrm = act.take<half>((size_t)rows * GV * GDV);
-    g.qkv.forward(q, lin, y, rows, qkv, DType::F32);
-    g.z.forward(q, lin, y, rows, z, DType::F32);
+    if (gin.S > 1) {
+        void* ys[2] = {qkv, z};
+        gin.forward_split(q, lin, y, rows, ys, DType::F32);
+    } else {
+        g.qkv.forward(q, lin, y, rows, qkv, DType::F32);
+        g.z.forward(q, lin, y, rows, z, DType::F32);
+    }
     prof_point("GDN: qkv, z");
     ops::gemv_f16<float>(q, y, rows, q35::D, g.ab.ptr<half>(), 2 * GV, ab);
     q4ops::gdn_gates(q, ab, g.neg_a.ptr<float>(), g.dt_bias.ptr<float>(), beta, gg, rows);
@@ -330,9 +395,13 @@ void Q35Model::gdn_forward(const Q4Gdn& g, Q35GdnState& s, const half* y, int ro
         q35ops::gdn_delta_seq(q, cv, beta, gg, s.rec.ptr<float>(), core, rows, desc);
     } else {
         const size_t sl = cslot(cur_);
-        q4ops::gdn_conv(q, qkv, s.conv.ptr<bf16>() + sl * GQKV * (GCONV - 1), g.conv_w.ptr<bf16>(), cv, rows);
+        bf16* cst = s.conv.ptr<bf16>() + sl * GQKV * (GCONV - 1);
+        if (pf_gdn) q35ops::gdn_conv_prompt(q, qkv, cst, g.conv_w.ptr<bf16>(), cv, rows);
+        else q4ops::gdn_conv(q, qkv, cst, g.conv_w.ptr<bf16>(), cv, rows);
         prof_point("GDN: a b gates conv");
-        q4ops::gdn_delta(q, cv, beta, gg, s.rec.ptr<float>() + sl * GV * GDK * GDV, core, rows);
+        float* rec = s.rec.ptr<float>() + sl * GV * GDK * GDV;
+        if (pf_gdn) q35ops::gdn_chunked(q, cv, beta, gg, rec, core, rows, act.take<char>(q35ops::gdn_chunk_bytes(rows)));
+        else q4ops::gdn_delta(q, cv, beta, gg, rec, core, rows);
     }
     prof_point("GDN: delta rule");
     q35ops::gdn_norm(q, core, z, g.norm_w.ptr<float>(), nrm, rows);
@@ -349,9 +418,14 @@ void Q35Model::attn_forward(const Q35Attn& a, Q35Cache& c, const half* y, int ro
     half* v = act.take<half>((size_t)rows * AKV * AD);
     half* qn16 = act.take<half>((size_t)rows * AH * AD);
     half* o16 = act.take<half>((size_t)rows * AH * AD);
-    a.q.forward(q, lin, y, rows, qg, DType::F16);
-    a.k.forward(q, lin, y, rows, k, DType::F16);
-    a.v.forward(q, lin, y, rows, v, DType::F16);
+    if (a.qkv.S > 1) {
+        void* ys[3] = {qg, k, v};
+        a.qkv.forward_split(q, lin, y, rows, ys, DType::F16);
+    } else {
+        a.q.forward(q, lin, y, rows, qg, DType::F16);
+        a.k.forward(q, lin, y, rows, k, DType::F16);
+        a.v.forward(q, lin, y, rows, v, DType::F16);
+    }
     prof_point("attn: projections");
     // a prompt's rows go to the selected sequence's cache; decode rows find theirs through sdev
     const size_t base = pdev ? 0 : (size_t)cur_ * max_tokens * AKV * AD;
@@ -360,8 +434,33 @@ void Q35Model::attn_forward(const Q35Attn& a, Q35Cache& c, const half* y, int ro
     q35ops::attn_prep(q, qg, k, v, a.qn.ptr<float>(), a.kn.ptr<float>(), rows, p0, pid, qn16, Kc, Vc, pdev, sdev, max_tokens);
     float* pt = part.ptr<float>();
     size_t cap = (size_t)part.numel();
-    if (pdev) {
+    if (pdev && dec_attn) {
+        q35ops::attn_dec(q, qn16, Kc, Vc, rows, pdev, sdev, max_tokens, pt, dec_ns);
+        q35ops::attn_dec_combine(q, pt, rows, dec_ns, qg, o16);
+    } else if (pdev) {
         q35ops::attn_core(q, qn16, Kc, Vc, qg, rows, p0, max_tokens / CH + 1, pt, o16, pdev, sdev, max_tokens);
+    } else if (pf_attn) {
+        half* kt = nullptr;
+        half* vt = nullptr;
+        const int TS = (max_tokens + 15) / 16 * 16;          // a 2D surface's pitch: a multiple of 64 bytes
+        if (pf_attn == 13 || pf_attn == 15) {
+            const bool v2 = pf_attn == 15;
+            if (!ktp.p) ktp = Tensor::empty({(int64_t)AKV * AD * TS}, DType::F16);
+            if (v2 && !vtp.p) vtp = Tensor::empty({(int64_t)AKV * AD * TS}, DType::F16);
+            kt = ktp.ptr<half>();
+            vt = v2 ? vtp.ptr<half>() : nullptr;
+            if (kt_cache != &c || kt_seq != cur_ || kt_valid != p0) {
+                q35ops::kt_fill(q, Kc, kt, TS, 0, p0);
+                if (v2) q35ops::vt_fill(q, Vc, vt, TS, 0, p0);
+            }
+            q35ops::kt_fill(q, Kc, kt, TS, p0, p0 + rows);
+            if (v2) q35ops::vt_fill(q, Vc, vt, TS, p0, p0 + rows);
+            kt_cache = &c;
+            kt_seq = cur_;
+            kt_valid = p0 + rows;
+        }
+        q35ops::attn_prompt(q, qn16, Kc, Vc, rows, p0, o16, pf_attn, kt, TS, vt);
+        q35ops::attn_gate(q, qg, o16, rows);
     } else {
         for (int r0 = 0; r0 < rows;) {
             int nch = (p0 + rows - 1) / CH + 1, nr = rows - r0;
@@ -376,18 +475,26 @@ void Q35Model::attn_forward(const Q35Attn& a, Q35Cache& c, const half* y, int ro
     prof_point("attn: o_proj");
 }
 
-void Q35Model::block_forward(Q35Block& b, float* Xd, int rows, int p0, const int* pid, const int* pdev, const int* sdev) {
+void Q35Model::block_forward(Q35Block& b, float* Xd, int rows, int p0, const int* pid, const int* pdev, const int* sdev,
+                             bool add_first, bool defer_last) {
     auto& q = Dev::get().q;
-    q35ops::norm16(q, Xd, b.w1.ptr<float>(), y16.ptr<half>(), rows);
+    // add_first: sub holds the block before's MLP output, not yet added (decode steps fold that add into this norm)
+    if (add_first) q35ops::add_norm16(q, Xd, sub.ptr<float>(), b.w1.ptr<float>(), y16.ptr<half>(), rows);
+    else q35ops::norm16(q, Xd, b.w1.ptr<float>(), y16.ptr<half>(), rows);
     if (b.att) attn_forward(*b.att, kv[b.layer], y16.ptr<half>(), rows, p0, pid, sub.ptr<float>(), pdev, sdev);
-    else gdn_forward(*b.gdn, gst[b.layer], y16.ptr<half>(), rows, sub.ptr<float>(), pdev ? desc_dev.ptr<int>() : nullptr);
-    q35ops::add(q, Xd, sub.ptr<float>(), rows);
-    q35ops::norm16(q, Xd, b.w2.ptr<float>(), y16.ptr<half>(), rows);
-    b.g.forward(q, lin, y16.ptr<half>(), rows, g16.p, DType::F16);
-    b.u.forward(q, lin, y16.ptr<half>(), rows, u16.p, DType::F16);
+    else gdn_forward(*b.gdn, b.gdn_in, gst[b.layer], y16.ptr<half>(), rows, sub.ptr<float>(), pdev ? desc_dev.ptr<int>() : nullptr);
+    q35ops::add_norm16(q, Xd, sub.ptr<float>(), b.w2.ptr<float>(), y16.ptr<half>(), rows);
+    if (b.gu.S > 1) {
+        void* ys[2] = {g16.p, u16.p};
+        b.gu.forward_split(q, lin, y16.ptr<half>(), rows, ys, DType::F16);
+    } else {
+        b.g.forward(q, lin, y16.ptr<half>(), rows, g16.p, DType::F16);
+        b.u.forward(q, lin, y16.ptr<half>(), rows, u16.p, DType::F16);
+    }
     q4ops::swiglu(q, g16.ptr<half>(), u16.ptr<half>(), a16.ptr<half>(), (size_t)rows * I);
     b.d.forward(q, lin, a16.ptr<half>(), rows, sub.p, DType::F32);
-    q35ops::add(q, Xd, sub.ptr<float>(), rows);
+    // defer_last: the residual add is left to the next norm (add_norm16), the output stays in sub
+    if (!defer_last || dump) q35ops::add(q, Xd, sub.ptr<float>(), rows);
     prof_point("MLP");
     if (b.layer < L) grab(Xd, D);
 }
@@ -400,8 +507,12 @@ void Q35Model::forward_dev(int Q) {
     q.memcpy(pos_dev.p, pos_h, (size_t)Q * sizeof(int));
     q.memcpy(seq_dev.p, seq_h, (size_t)Q * sizeof(int));
     q.memcpy(desc_dev.p, desc_h, (size_t)Q * 3 * sizeof(int));
-    for (auto& b : blocks) block_forward(b, Xd, Q, 0, pid_dev.ptr<int>(), pos_dev.ptr<int>(), seq_dev.ptr<int>());
-    q35ops::norm16(q, Xd, norm_w.ptr<float>(), fin16.ptr<half>(), Q);
+    // each block's MLP output is added by the next norm (one launch for add + norm)
+    const bool fold = !dump;
+    for (auto& b : blocks)
+        block_forward(b, Xd, Q, 0, pid_dev.ptr<int>(), pos_dev.ptr<int>(), seq_dev.ptr<int>(), fold && b.layer > 0, fold);
+    if (fold) q35ops::add_norm16(q, Xd, sub.ptr<float>(), norm_w.ptr<float>(), fin16.ptr<half>(), Q);
+    else q35ops::norm16(q, Xd, norm_w.ptr<float>(), fin16.ptr<half>(), Q);
     lm_head.forward(q, lin, fin16.ptr<half>(), Q, logits.p, DType::F16);
     if (mtp) q35ops::put_rows(q, fin16.ptr<half>(), Q, hring.ptr<half>(), pos_dev.ptr<int>(), seq_dev.ptr<int>(), RING);
     prof_point("norm + lm_head");
@@ -487,6 +598,7 @@ void Q35Model::prefill(const int* tokens, int n, int ckpt_at) {
     dec_ev.wait();
     rep_ev.wait();
     se.win_p0 = -1;
+    kt_cache = nullptr;                 // decode steps may have written keys since: the pair-transposed copy starts over
     if (mtp) {
         // MTP K/V of decoded positions no draft caught up (the last step's rows), then the prompt's own below
         if (se.mtp_done < se.pos) {
@@ -655,10 +767,34 @@ bool Q35Model::restore(int upto) {
 
 // ------------------------------------------------------------------------------------------------ verify windows
 
+uint64_t Q35Model::state_hash() {
+    auto& q = Dev::get().q;
+    dec_ev.wait();
+    rep_ev.wait();
+    q.wait();
+    const size_t cb = conv_slot_bytes(), rb = rec_slot_bytes(), sl = cslot(cur_);
+    std::vector<uint64_t> buf(rb / 8);
+    uint64_t h = 1469598103934665603ull;
+    for (int li = 0; li < L; li++) {
+        if (blocks[li].attn) continue;
+        q.memcpy(buf.data(), static_cast<char*>(gst[li].conv.p) + cb * sl, cb).wait();
+        for (size_t i = 0; i < cb / 8; i++) h = (h ^ buf[i]) * 1099511628211ull;
+        q.memcpy(buf.data(), static_cast<char*>(gst[li].rec.p) + rb * sl, rb).wait();
+        for (size_t i = 0; i < rb / 8; i++) h = (h ^ buf[i]) * 1099511628211ull;
+    }
+    return h;
+}
+
 void Q35Model::replay_dev(int Q) {
     using namespace q4;
     auto& q = Dev::get().q;
     q.memcpy(rdesc_dev.p, rdesc_h, (size_t)Q * 3 * sizeof(int));
+    if (replay_mode) {
+        // every GDN layer in two launches (the per-layer pair was 144 launches, 2.0 ms)
+        q35ops::gdn_replay(q, static_cast<const q35ops::GdnReplayLayer*>(rep_layers.p), rep_nl, rep_cv.ptr<bf16>(), Q,
+                           rdesc_dev.ptr<int>());
+        return;
+    }
     act.reset();
     bf16* cv = act.take<bf16>((size_t)Q * GQKV);
     bf16* core = act.take<bf16>((size_t)Q * GV * GDV);
@@ -683,14 +819,15 @@ bool Q35Model::restore_window(Seq& se, int upto) {
     rdesc_h[se.win_first * 3 + 2] = cslot(s);
     if (graphs_on && !dump) {
         namespace ex = sycl::ext::oneapi::experimental;
-        if (!rep_graphs[Q]) {
+        auto& rg = rep_graphs[(replay_mode ? qmax + 1 : 0) + Q];
+        if (!rg) {
             ex::command_graph<ex::graph_state::modifiable> g{q.get_context(), q.get_device()};
             g.begin_recording(q);
             replay_dev(Q);
             g.end_recording(q);
-            rep_graphs[Q] = std::make_unique<ExecGraph>(g.finalize());
+            rg = std::make_unique<ExecGraph>(g.finalize());
         }
-        rep_ev = q.ext_oneapi_graph(*rep_graphs[Q]);
+        rep_ev = q.ext_oneapi_graph(*rg);
     } else {
         replay_dev(Q);
         q.wait();
@@ -735,6 +872,33 @@ void Q35Model::load_mtp() {
     kv[L].init(games(), max_tokens);
     mtp = std::move(m);
     fprintf(stderr, "MTP layer loaded: %.2f GiB VRAM\n", Dev::get().vram_used / 1073741824.0);
+}
+
+void Q35Model::build_draft_head() {
+    // the lm_head's column tiles of each block (8 tiles of 16 columns), its output scales; the input side is the same
+    auto& q = Dev::get().q;
+    const int nb = (int)mtp_blocks.size(), tn = nb * 8, rows_t = lm_head.in / 16, src_tn = lm_head.out / 16;
+    const int words = (int)lm_head.trellis.size(2);
+    std::vector<int> map(tn);
+    for (int j = 0; j < tn; j++) map[j] = mtp_blocks[j / 8] * 8 + j % 8;
+    Tensor mdev = Tensor::empty({tn}, DType::I32);
+    upload(mdev.p, map.data(), map.size() * 4);
+    Exl3Linear& h = draft_head;
+    h.trellis = Tensor::empty({rows_t, tn, words}, DType::I16);
+    q35ops::gather_col_tiles(q, lm_head.trellis.ptr<uint16_t>(), h.trellis.ptr<uint16_t>(), rows_t, src_tn, tn, words,
+                             mdev.ptr<int>());
+    h.suh = Tensor::empty({lm_head.in}, DType::F16);
+    q.memcpy(h.suh.p, lm_head.suh.p, (size_t)lm_head.in * 2);
+    h.svh = Tensor::empty({tn * 16}, DType::F16);
+    for (int b = 0; b < nb; b++)
+        q.memcpy(h.svh.ptr<half>() + (size_t)b * 128, lm_head.svh.ptr<half>() + (size_t)mtp_blocks[b] * 128, 256);
+    h.sonb = Tensor::zeros({nb}, DType::I32);
+    h.K = lm_head.K;
+    h.cb = lm_head.cb;
+    h.in = lm_head.in;
+    h.out = tn * 16;
+    q.wait();
+    fprintf(stderr, "MTP draft head: %d blocks of 128 ids (%d columns, %.0f MB)\n", nb, h.out, h.trellis.bytes() / 1048576.0);
 }
 
 void Q35Model::emb_row(int token, float* dst) const {
@@ -783,12 +947,21 @@ void Q35Model::mtp_pass_dev(int n, int nhead) {
     q35ops::norm_rows<float>(q, xm, m.pe.ptr<float>(), cat, 2 * D, n);
     q35ops::norm_rows<half>(q, hin, m.ph.ptr<float>(), cat + D, 2 * D, n);
     m.fc.forward(q, lin, cat, n, xm, DType::F32);
-    block_forward(mtp->blk, xm, n, 0, mpid_dev.ptr<int>(), mpos_dev.ptr<int>(), mseq_dev.ptr<int>());
+    // the block's MLP output is added to the head rows only, by their norm (the other rows' streams are not read again)
+    const bool fold = !dump;
+    block_forward(mtp->blk, xm, n, 0, mpid_dev.ptr<int>(), mpos_dev.ptr<int>(), mseq_dev.ptr<int>(), false, fold);
     if (nhead > 0) {
-        q35ops::norm16(q, xm + (size_t)(n - nhead) * D, m.fn.ptr<float>(), mh16.ptr<half>(), nhead);
-        // drafts from the head's first mtp_head columns (low ids: the common tokens); the rest are never proposed
-        lm_head.forward(q, lin, mh16.ptr<half>(), nhead, mlog.p, DType::F16, -1, mtp_head);
-        q35ops::argmax_rows(q, mlog.ptr<half>(), nhead, mtp_head, mbest.ptr<int>());
+        const size_t o = (size_t)(n - nhead) * D;
+        if (fold) q35ops::add_norm16(q, xm + o, sub.ptr<float>() + o, m.fn.ptr<float>(), mh16.ptr<half>(), nhead);
+        else q35ops::norm16(q, xm + o, m.fn.ptr<float>(), mh16.ptr<half>(), nhead);
+        // drafts from the gathered head's blocks, or the head's first mtp_head columns; the rest are never proposed
+        if (mtp_head) {
+            lm_head.forward(q, lin, mh16.ptr<half>(), nhead, mlog.p, DType::F16, -1, mtp_head);
+            q35ops::argmax_rows(q, mlog.ptr<half>(), nhead, mtp_head, mbest.ptr<int>());
+        } else {
+            draft_head.forward(q, lin, mh16.ptr<half>(), nhead, mlog.p, DType::F16);
+            q35ops::argmax_rows(q, mlog.ptr<half>(), nhead, draft_head.out, mbest.ptr<int>());
+        }
         q.memcpy(mbest_h, mbest.p, (size_t)nhead * 2 * 4);
     }
 }
@@ -881,7 +1054,7 @@ void Q35Model::draft_rows(const int* seq, const int* tok, const int* row, const 
         std::vector<MRow> cr;
         for (int j = 0; j < (int)live.size(); j++) {
             const int i = live[j];
-            const int id = mbest_h[2 * j];
+            const int id = draft_id(mbest_h[2 * j]);
             const float pr = sycl::bit_cast<float>(mbest_h[2 * j + 1]);
             // a chain ends where the product of its drafts' probabilities falls below mtp_min_p
             cum[i] *= pr;

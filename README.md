@@ -26,11 +26,11 @@ tts/                Fish S2 Pro and Qwen3-TTS on torch-XPU (older projects)
 
 | Job | Command | Engine |
 |---|---|---|
-| MiniMax H3 video (Ref2VA, guides, ControlNet, multi-shot batches) | `tools/h3-ref2va` | `engines/sd.cpp/build-sycl/bin/sd-cli` + `xpu_sdpa/libxpu_h3.so`, `libxpu_h3vae.so` |
+| MiniMax H3 video (Ref2VA, guides, ControlNet, multi-shot batches) | `tools/h3-ref2va` | `engines/sd.cpp/build-sycl/bin/sd-cli` + `xpu_sdpa/libxpu_h3.so` (int8 W8A8 blocks, int8 attention by default since 2026-11-19: `SD_XPU_H3_SDPA=graph` for bf16; since 2026-11-20 the LoRA term of qkv / fc1 inside their consumer kernels, `libxpu_h3_esimd.so`, -3% a step: `SD_XPU_H3_LORA_FUSE=0` for the old pass), `libxpu_h3vae.so` |
 | Qwen Image 2.1 stills (Noct Q Anime) | `tools/b70-image.sh -m qwen --xpu`, `--batch` | sd-cli + `xpu_sdpa/libxpu_qwen21.so` |
 | MOSS-Image stills (Base, Dirty-Moss; Turbo LoRA, 1.5x hires; `(word:1.3)` prompt weights) | `tools/b70-image.sh -m moss\|dirty-moss [--turbo] [--hires] [--xpu]`, `--batch` | `engines/sd.cpp-moss` sd-cli (upstream MOSS support, branch `moss-merge`); `--xpu`: + `xpu_sdpa/libxpu_moss.so` |
-| MiniMax-H3-Image stills and edits (33B, 6 steps, 4-16 MP, up to 16 `<Picture N>` references) | `tools/b70-image.sh -m h3`, `--batch` (one process: `sd-cli --multi-jobs`) | `engines/sd.cpp-h3img` sd-cli (upstream master with H3-Image, branch `h3-image`; its ggml on branch `b70-sycl` carries the B70 SYCL patches that still apply, the pool-cache release and the oneDNN f16 matmul) + `xpu_sdpa/libxpu_h3.so` int8 blocks. 4 MP ~1.2 s/step, 16 MP ~7.8 s/step; ~1.5 / 2.3 min per image with loading, text encoder and VAE; `--batch` encodes every prompt and reference first, then samples and decodes with the blocks resident (product shots 62 -> 46 s each), an edit's reference encode runs as 2D convolutions (11.5 -> 3.8 s a picture: the causal 3D convolutions of one frame only ever met zero padding with two of their three taps), and the text encoder's 16 GB stay staged on the card for the whole conditioning pass instead of being copied for each job (`SD_MULTI_TE_KEEP=0` turns that off) |
-| MiniMax Music 3 songs | `engines/sd.cpp/xpu_sdpa/xpu_music3` | standalone SYCL + oneDNN |
+| MiniMax-H3-Image stills and edits (33B, 6 steps, 4-16 MP, up to 16 `<Picture N>` references) | `tools/b70-image.sh -m h3`, `--batch` (one process: `sd-cli --multi-jobs`) | `engines/sd.cpp-h3img` sd-cli (upstream master with H3-Image, branch `h3-image`; its ggml on branch `b70-sycl` carries the B70 SYCL patches that still apply, the pool-cache release and the oneDNN f16 matmul) + `xpu_sdpa/libxpu_h3.so` int8 blocks (int8 attention since 2026-11-19: 2048x2048 product shots 2.81 -> 2.44 s a step; it moves details, `SD_XPU_H3_SDPA=graph` gives the old pictures bit for bit). 4 MP ~1.2 s/step, 16 MP ~7.8 s/step; ~1.5 / 2.3 min per image with loading, text encoder and VAE; `--batch` encodes every prompt and reference first, then samples and decodes with the blocks resident (product shots 62 -> 46 s each), an edit's reference encode runs as 2D convolutions (11.5 -> 3.8 s a picture: the causal 3D convolutions of one frame only ever met zero padding with two of their three taps), and the text encoder's 16 GB stay staged on the card for the whole conditioning pass instead of being copied for each job (`SD_MULTI_TE_KEEP=0` turns that off) |
+| MiniMax Music 3 songs | `engines/sd.cpp/xpu_sdpa/xpu_music3` (one song), `tools/music3/batch JOBS.jsonl --out DIR --one-chunk` (8 songs a queue chunk); prompting and instrumentals: `engines/sd.cpp/xpu_sdpa/MUSIC3_PROMPTING.md`; vocal/clipping/duplicate checks on the 3080: `tools/music3/qc` | standalone SYCL + oneDNN |
 | Fish Audio Drama 3 voice | `tools/drama3_clone <jobs.tsv> --out DIR [--submit]` | `engines/audio.cpp/.../drama3_batch` |
 | Pixal3D image -> 3D mesh (GLB, per-vertex colour) | `tools/pixal3d IMAGE -o OUT.glb [--res 512\|1024\|1536] [--seed N] [--fov RAD] [--decimate FACES] [--no-tex]` | `engines/sd.cpp/xpu_sdpa/xpu_pixal3d` (SYCL + oneDNN) |
 | CG-MLLM 4B image -> 3D mesh (GLB, shape only) | `tools/cgmllm IMAGE -o OUT.glb [--seed N] [--steps N] [--cfg X] [--octree N] [--decimate FACES]` | `engines/sd.cpp/xpu_sdpa/xpu_cgmllm` (SYCL + oneDNN) |
@@ -73,7 +73,10 @@ every prop of a list in one process, stage by stage, so the shape DiT, the decod
 the UV unwraps run on a CPU thread meanwhile: 2.1 props 58 s each instead of 72 s, 2mv base + paint 15 steps 64 s,
 turbo + paint 10 steps about 39 s, 37.7 s with `--attn8 field,paint` (int8 attention, the MOSS kernel at head
 dim 64: `xpu_hy_fa.cpp`, `hunyuan3d/hy_attn8.hpp`; paint steps 13.8 -> 11.5 s, texture PSNR vs f16 44-48 dB where two
-f16 runs differ by 48-51; field SDF 0.2-0.6%; `xpu_hunyuan3d --attn8-test` checks the kernel). The 2mv DiT stays f16:
+f16 runs differ by 48-51; field SDF 0.2-0.6%; `xpu_hunyuan3d --attn8-test` checks the kernel). Since 2026-11-20 the paint stage runs ~19% faster (GroupNorm without
+per-element 64-bit divisions, Real-ESRGAN's LeakyReLU and residual adds inside its convolutions, the UNet's residual adds
+folded into its GEMMs): 26.4-27.5 -> 21.8 s a prop, textures within run-to-run noise; `HY_GN_V2=0` / `HY_ESRGAN_FUSED=0`
+switch the first two off ([survey](docs/speed-survey-nonllm.md)). The 2mv DiT stays f16:
 int8 attention there changed the SDF 1-5% for 0.3 s a prop. `--field-pre 4 --field-margin 2` runs the field's coarse pass only near the surface a 129^3 pre-pass finds: 8.5-10.9 -> 2.3-5.9 s, marching-cubes face counts within 0.005% on 12 props with thin poles and rings (a part thinner than ~2% of the object lying wholly between pre-pass nodes could be missed). Keep `--octree 512` (coarse to fine, 11 s); 384 runs dense (28 s). Against upstream's code on torch XPU (same views and noise): single model calls
 1e-3 relative at the ends of the schedule, 1-3% in the middle (a few very large activation channels), the 128^3 field
 3.1% (base, 50 steps) and 1.8% (turbo) after the whole chain. Weights used as published (fp16 safetensors, 4.9 GB a
@@ -96,7 +99,8 @@ by 1.8-6.3 levels (of 255) mean per image (2026-11-18, 8 turnaround sheets). The
 fine texture move. The noise and the reference latents are deterministic (the reference VAE encode samples with a
 fixed `MT19937RNG(42)`), so the spread most likely comes from GPU reductions whose order varies (atomics, split-K
 GEMMs). Not chased. To check that a change keeps H3's output, compare it with a second run of the old path, not with
-a zero difference.
+a zero difference. (2026-11-20: product shots, 2048x2048, are byte-identical run to run again after the int8
+attention's float-atomic K / V sums were made ordered; sheets not re-measured. See `docs/speed-survey-nonllm.md`.)
 
 ## How much faster it got
 
@@ -106,10 +110,10 @@ then tuned on the card. The table compares that starting point with today; the l
 
 | Engine | Starting point on the B70 | Now | Gain |
 |---|---|---|---|
-| **MiniMax H3** video, Ref2VA ([notes](https://github.com/horvay/stable-diffusion.cpp/blob/master/docs/b70_xpu.md)) | stock sd.cpp on Vulkan: "device lost" on the first step. First working Vulkan port: ~570 s per denoising step at 1344x768 and 107 frames, 42 min per clip | ~71 s per step and ~9 min per clip with the transformer blocks on the XPU; the XPU video decoder and int8 blocks then took a shot from 238.7 s to 133.0 s | **8x** per step, **4.7x** per clip, then **1.8x** more |
+| **MiniMax H3** video, Ref2VA ([notes](https://github.com/horvay/stable-diffusion.cpp/blob/master/docs/b70_xpu.md)) | stock sd.cpp on Vulkan: "device lost" on the first step. First working Vulkan port: ~570 s per denoising step at 1344x768 and 107 frames, 42 min per clip | ~71 s per step and ~9 min per clip with the transformer blocks on the XPU; the XPU video decoder and int8 blocks then took a shot from 238.7 s to 133.0 s; int8 attention, the in-place LoRA term, scratch caches and a cache-friendly tile merge then took a 1920x1088x73 shot's step from 60.3 to 36.7 s and its VAE decode from 90.8 to 38.0 s ([survey](docs/speed-survey-nonllm.md)) | **8x** per step, **4.7x** per clip, then **1.8x** and **1.6x** more |
 | **Qwen Image 2.1** stills ([notes](https://github.com/horvay/stable-diffusion.cpp/blob/master/docs/b70_xpu.md)) | sd.cpp on Vulkan: 8.4 s per step, 226 s per 1024x1536 image (25 steps, CFG 3) | 1.4 s per step, ~43 s per image | **5.3x** |
 | **MOSS-Image** stills ([notes](https://github.com/horvay/stable-diffusion.cpp/blob/master/docs/b70_xpu.md)) | upstream sd.cpp on ggml SYCL, Q8_0: 2.26 s per step, 64 s per 1024x1536 image (25 steps, CFG 3) | 1.03 s per step, 31 s per image, int8 blocks and int8 attention on the XPU (`--xpu`) | **2.2x** (1.8x with Turbo + LoRA + hires) |
-| **MiniMax Music 3** songs | ran only on an RTX 3080 Ti, through ComfyUI and torch | 70 s of stereo 44.1 kHz audio in 97 s, native SYCL + oneDNN | new on the B70; no like-for-like baseline |
+| **MiniMax Music 3** songs ([notes](engines/sd.cpp/xpu_sdpa/MUSIC3_PROMPTING.md)) | ran only on an RTX 3080 Ti, through ComfyUI and torch | one song: 1.4 s/s; 8 songs batched (int8 KV, rewritten decode attention, batched + fused DiT, 25 % window overlap, CFG on 2/3 of the steps): 0.47 s/s, ~58 two-minute songs an hour | new on the B70; **3x** over one at a time, **1.9x** over the first batched version (0.88 s/s) |
 | **Fish Audio Drama 3** voice cloning ([notes](bench/drama3/OPTIMIZE.md)) | stock audio.cpp CLI on Vulkan, one line at a time: 0.875 s/s | 0.132 s/s, 16 lines at a time on SYCL | **6.6x** |
 | **Fish S2 Pro** voice cloning ([notes](tts/README.md)) | stock fish-speech, bf16: 4.32 s/s (an RTX 3080 Ti: ~3.0) | 0.21 s/s, 32 lines at a time | **21x** (14x the 3080 Ti) |
 | **Qwen3-TTS 1.7B** ([notes](tts/README.md)) | stock qwen-tts: 2.33 s/s one line at a time, 0.39 at batch 8 | 0.050 s/s, 32 lines at a time | **47x** (8x stock's batch 8) |
@@ -153,7 +157,7 @@ compile kernels ahead of time for BMG G31. They run on the CPU only; keep parall
 ```sh
 git submodule update --init --recursive engines/sd.cpp engines/audio.cpp
 engines/sd.cpp/build_sycl.sh                 # sd-cli -> engines/sd.cpp/build-sycl/bin/sd-cli
-engines/sd.cpp/xpu_sdpa/build_native.sh      # libxpu_h3.so, libxpu_h3vae.so, libxpu_qwen21.so, xpu_selftest
+engines/sd.cpp/xpu_sdpa/build_native.sh      # libxpu_h3.so (+ libxpu_moss_fa.so, libxpu_h3_esimd.so), libxpu_h3vae.so, libxpu_qwen21.so, xpu_selftest
 engines/sd.cpp/xpu_sdpa/build_music3.sh      # xpu_music3 (after sd-cli)
 engines/sd.cpp/xpu_sdpa/build_pixal3d.sh     # xpu_pixal3d (weights: xpu_sdpa/pixal3d/fetch_models.sh [--tex])
 engines/sd.cpp/xpu_sdpa/build_cgmllm.sh      # xpu_cgmllm (weights: xpu_sdpa/cgmllm/fetch_models.sh)
